@@ -340,8 +340,8 @@ public:
     virtual StreamState getStatus() const;
     bool                isFinished() const;  // Returns true if stream is finished
     // Complete a Decode stream owned by the RPC handler, before scheduler enqueue.
-    bool                finishWithoutGenerate();
-    bool                isActive() const;    // Returns true if stream is active (no error and not finished)
+    bool finishWithoutGenerate();
+    bool isActive() const;  // Returns true if stream is active (no error and not finished)
 
     // A response consumer may observe GenerateDone before the scheduler has
     // committed RUNNING -> FINISHED. Preserve that successful completion and
@@ -409,6 +409,7 @@ public:
     torch::Tensor generateContextPositionIds();
 
     void generateNextPositionId(int32_t* now_pos);
+    void generateNextPositionId(int32_t* now_pos, int sequence_length);
 
     torch::Tensor getContextPositionIds() const {
         return context_position_ids_.has_value() ? context_position_ids_.value() : torch::Tensor();

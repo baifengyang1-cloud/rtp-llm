@@ -224,13 +224,20 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     py_attn_inputs.sequence_lengths = normalize_i32(inputs.sequence_lengths);
     py_attn_inputs.input_lengths    = normalize_i32(inputs.input_lengths);
 #if !USING_CUDA
-    // Non-CUDA platforms only support the host metadata pipeline (the device
-    // branch below needs the CUDA-only metadata kernel), so lift any
-    // CUDA-resident lengths (e.g. from the MTP device-state fast path) back
-    // to host before branching.
-    for (auto* t : {&py_attn_inputs.prefix_lengths, &py_attn_inputs.sequence_lengths, &py_attn_inputs.input_lengths}) {
-        if (t->defined() && t->is_cuda()) {
-            *t = normalize_i32(t->cpu());
+    // ROCm decode metadata uses only ATen device operations. Keep it on
+    // device so the next forward can be queued before the previous one ends.
+    // Prefill still needs the CUDA-only metadata kernel or the host fallback.
+#if USING_ROCM
+    const bool device_decode_metadata = inputs.prefix_lengths.numel() == 0 && inputs.sequence_lengths.numel() > 0;
+#else
+    const bool device_decode_metadata = false;
+#endif
+    if (!device_decode_metadata) {
+        for (auto* t :
+             {&py_attn_inputs.prefix_lengths, &py_attn_inputs.sequence_lengths, &py_attn_inputs.input_lengths}) {
+            if (t->defined() && t->is_cuda()) {
+                *t = normalize_i32(t->cpu());
+            }
         }
     }
 #endif
@@ -464,16 +471,27 @@ torch_ext::BertEmbeddingInputs PyWrappedModel::buildBertEmbeddingInputs(const Gp
     DevicePerfWrapper              wrapper(enable_device_perf_, "py model buildBertEmbeddingInputs");
     torch_ext::BertEmbeddingInputs bert_embedding_inputs;
 
+    auto to_device = [this](const torch::Tensor& tensor) {
+        if (tensor.is_cuda()) {
+            return tensor;
+        }
+        // This builder also sees mRoPE position IDs on ordinary decode.
+        // A blocking copy here drains the previous graph before replay prep.
+        auto host = tensor.is_pinned() ? tensor : tensor.pin_memory();
+        buffer_holder_.hold_host(host);
+        return host.to(torch::kCUDA, /*non_blocking=*/true);
+    };
+
     // Convert combo_position_ids from Buffer to torch::Tensor
     if (inputs.combo_position_ids.defined()) {
-        bert_embedding_inputs.combo_position_ids = inputs.combo_position_ids.cuda();
+        bert_embedding_inputs.combo_position_ids = to_device(inputs.combo_position_ids);
     }
 
     // Convert combo_tokens_type_ids from Buffer to torch::Tensor
     if (inputs.combo_tokens_type_ids.defined()) {
         {
             DevicePerfWrapper wrapper(enable_device_perf_, "py model combo_tokens.cuda()");
-            bert_embedding_inputs.combo_tokens_type_ids = inputs.combo_tokens_type_ids.cuda();
+            bert_embedding_inputs.combo_tokens_type_ids = to_device(inputs.combo_tokens_type_ids);
         }
     }
 
@@ -616,7 +634,7 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
                                               bert_embedding_inputs});
     }
 
-    const bool has_cache_store_work = !inputs.warmup && inputs.pd_separation;
+    const bool                has_cache_store_work = !inputs.warmup && inputs.pd_separation;
     CacheStoreWriteCycleGuard cache_store_write_cycle(
         cache_store_async_writer_, has_cache_store_work, track_cache_store_completion_);
 
@@ -887,7 +905,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 }
             }
         }
-        const bool has_cache_store_work = !inputs.warmup && inputs.pd_separation;
+        const bool                has_cache_store_work = !inputs.warmup && inputs.pd_separation;
         CacheStoreWriteCycleGuard cache_store_write_cycle(
             cache_store_async_writer_, has_cache_store_work, track_cache_store_completion_);
 
@@ -1309,11 +1327,10 @@ PyWrappedModel::splitInputsIntoMicroBatches(const GptModelInputs& inputs, const 
     size_t                      prefill_batch_idx      = 0;
     // TODO(async): micro-batch token slicing still computes CPU scalar sums.
     // Convert explicitly and keep all sliced GptModelInputs device-resident.
-    const auto input_lengths_host = inputs.input_lengths.defined() && inputs.input_lengths.is_cuda() ?
-                                        inputs.input_lengths.cpu().pin_memory() :
-                                        inputs.input_lengths;
-    const auto* input_lengths_ptr =
-        input_lengths_host.defined() ? input_lengths_host.data_ptr<int32_t>() : nullptr;
+    const auto  input_lengths_host = inputs.input_lengths.defined() && inputs.input_lengths.is_cuda() ?
+                                         inputs.input_lengths.cpu().pin_memory() :
+                                         inputs.input_lengths;
+    const auto* input_lengths_ptr  = input_lengths_host.defined() ? input_lengths_host.data_ptr<int32_t>() : nullptr;
 
     if (!micro_batch_plan.enable) {
         RTP_LLM_LOG_DEBUG("micro batch disable when enable is false, use fake");

@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "rtp_llm/cpp/models/Sampler.h"
@@ -34,7 +35,6 @@ public:
 private:
     int previous_device_ = 0;
 };
-
 std::vector<at::Generator> makeGenerators(int64_t batch_size, uint64_t first_seed) {
     std::vector<at::Generator> generators;
     generators.reserve(batch_size);
@@ -354,4 +354,28 @@ TEST(RocmSamplerOpTest, RunsProductionSamplerOnNonzeroDevice) {
     expectSampleMatchesReturnedProbability(output);
 }
 
+TEST(RocmSamplerOpTest, PinnedInputsRemainValidAcrossQueuedForwards) {
+    Sampler                    sampler(SamplerInitParams{2, true});
+    std::vector<SamplerInputs> inputs;
+    for (int step = 0; step < 8; ++step) {
+        auto input      = makeSamplerInputs(2, 1, 1.0f, 1234);
+        input.token_ids = torch::full({2, 3}, step, torch::TensorOptions(torch::kInt32).pinned_memory(true));
+        input.step      = 2;
+        input.temperature.fill_(0.7f);
+        input.cum_log_probs = torch::Tensor();
+        input.all_probs     = torch::Tensor();
+        inputs.push_back(std::move(input));
+    }
+    std::vector<SamplerOutput> outputs;
+    for (auto& input : inputs) {
+        outputs.push_back(sampler.forward(input));
+        // Release caller-owned staging before the copy necessarily completes.
+        input = SamplerInputs{};
+    }
+    for (int step = 0; step < outputs.size(); ++step) {
+        auto tokens = outputs[step].token_ids.cpu();
+        EXPECT_TRUE(tokens.slice(1, 0, 2).eq(step).all().item<bool>());
+        EXPECT_TRUE(tokens.select(1, 2).eq(7).all().item<bool>());
+    }
+}
 }  // namespace

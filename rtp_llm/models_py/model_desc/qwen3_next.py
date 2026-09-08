@@ -242,6 +242,21 @@ class _QwenGdnGraphDelegate:
     def __getattr__(self, name):
         return getattr(self.delegate, name)
 
+    @property
+    def supports_device_metadata_replay(self):
+        """Opt in only when the wrapped FMHA callback owns a device-only path.
+
+        The generic graph runner queries this attribute before deciding whether
+        it may skip all CPU mirror refreshes.  ``__getattr__`` used to expose
+        the delegate's value implicitly, but this wrapper still consumed those
+        stale CPU mirrors for GDN validation.  Make the contract explicit and
+        use the same device metadata as the captured GDN index kernel.
+        """
+        return (
+            self.delegate is not None
+            and getattr(self.delegate, "supports_device_metadata_replay", False) is True
+        )
+
     @staticmethod
     def _key(lengths):
         return (lengths.data_ptr(), tuple(lengths.shape), lengths.stride())
@@ -275,6 +290,14 @@ class _QwenGdnGraphDelegate:
         self._buckets[self._key(anchor_lengths)] = (anchor_lengths, registrations)
 
     def prepare_cuda_graph(self, inputs):
+        if self.supports_device_metadata_replay:
+            # The graph runner has already queued the live sequence lengths and
+            # every tagged block table on the replay stream.  The captured GDN
+            # index kernel validates those device values and maps padding or an
+            # invalid row to AITER's -1 skip sentinel, so reading host mirrors
+            # here would both observe stale data and force a device sync.
+            self.delegate.prepare_cuda_graph(inputs)
+            return
         if self.bounds_by_tag:
             key = self._key(inputs.sequence_lengths)
             if key not in self._buckets:

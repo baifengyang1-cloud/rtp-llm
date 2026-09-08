@@ -23,6 +23,26 @@ from rtp_llm.models_py.model_desc.qwen3_next import (
 
 
 class QwenGdnGraphReplayTest(unittest.TestCase):
+    def test_device_metadata_delegate_does_not_read_stale_host_mirrors(self):
+        class DeviceDelegate:
+            supports_device_metadata_replay = True
+
+            def __init__(self):
+                self.inputs = None
+
+            def prepare_cuda_graph(self, inputs):
+                self.inputs = inputs
+
+        delegate = DeviceDelegate()
+        replay = _QwenGdnGraphDelegate({"linear": [(4, 8)]}, "full", delegate)
+        inputs = SimpleNamespace(sequence_lengths=torch.ones(1, dtype=torch.int32))
+
+        self.assertTrue(replay.supports_device_metadata_replay)
+        # No bucket is registered and the host block table is intentionally
+        # absent: device-only replay must go straight to the FMHA callback.
+        replay.prepare_cuda_graph(inputs)
+        self.assertIs(delegate.inputs, inputs)
+
     def test_decode_reuses_indices_per_shared_layout_not_per_layer(self):
         decode = object.__new__(Qwen3NextGatedDeltaNetDecode)
         torch.nn.Module.__init__(decode)

@@ -42,6 +42,7 @@ cc_test(
     copts = copts(),
     deps = test_deps + [
         "//rtp_llm/cpp/models:models",
+        "//rtp_llm/cpp/models:logits_processor",
         "//rtp_llm/models_py/bindings/rocm/kernels/sampling:sampling",
     ],
     tags = ["rocm"],
