@@ -160,11 +160,12 @@ message MMPreprocessConfigPB {
     int32 height = 2;
     int32 min_pixels = 3;
     int32 max_pixels = 4;
-    int32 fps = 5;
+    float fps = 5;
     int32 min_frames = 6;
     int32 max_frames = 7;
     repeated float crop_positions = 8;
     int32 mm_timeout_ms = 9;
+    int32 max_long_side_pixel = 11;
 }
 
 message MultimodalInputPB {
@@ -178,6 +179,9 @@ message MultimodalInputsPB {
     repeated MultimodalInputPB multimodal_inputs = 1;
     // LLM can receive the output through GPUDirect RDMA.
     bool support_rdma = 2;
+    // Globally unique RTP-LLM request id. Propagated to the VIT worker for
+    // access logging and downstream data-inspection correlation.
+    int64 request_id = 3;
 }
 
 enum TensorDataTypePB {
@@ -229,6 +233,8 @@ message MultimodalOutputPB {
     repeated int32 split_size = 4;
     // Non-empty means fields 1/2/3 are stored in these slots; split_size remains inline.
     repeated MMRdmaSlotPB output_rdma_slots = 5;
+    TensorPB multimodal_feature_hash = 7;
+    uint32 feature_hash_version = 8;
 }
 
 message ReleaseLeasePB {
@@ -934,6 +940,8 @@ service RpcService {
 // Response type intentionally changed as part of multimodal refactoring — not a rolling-upgrade concern
 // because VIT proxy and LLM backend are always deployed together in this service.
 service MultimodalRpcService {
+    rpc AsyncSubmitEmbedding(MultimodalInputsPB) returns (EmptyPB);
+    rpc WaitGreenNetVerdict(MultimodalInputsPB) returns (EmptyPB);
     rpc GetWorkerStatus(StatusVersionPB) returns (WorkerStatusPB);
     rpc GetCacheStatus(CacheVersionPB) returns (CacheStatusPB);
     rpc RemoteMultimodalEmbedding(MultimodalInputsPB) returns (MultimodalOutputPB);

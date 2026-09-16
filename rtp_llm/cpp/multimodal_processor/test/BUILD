@@ -1,3 +1,4 @@
+load("//bazel:device_defs.bzl", "device_impl_target", "device_test_envs")
 load("//:def.bzl", "cc_test_wrapper", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
@@ -25,10 +26,9 @@ cc_test(
         "FakeMultimodalProcessor.h",
     ]),
     copts = test_copts,
-    deps = torch_deps() + [
+    deps = device_impl_target() + torch_deps() + [
         "//rtp_llm/cpp/testing:device_test_utils",
 
-        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
         "//rtp_llm/cpp/config:config_modules",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
@@ -36,9 +36,7 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
     ],
-    env = {
-        "TEST_USING_DEVICE": "CUDA",
-    },
+    env = device_test_envs(),
     exec_properties = {'gpu':'A10'},
 )
 
@@ -67,6 +65,7 @@ cc_test(
     copts = test_copts,
     deps = torch_deps() + cuda13_torch_link_deps + [
         "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_cc_proto",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "//rtp_llm/cpp/multimodal_processor/transport:mm_remote_output_transport_core",
@@ -75,6 +74,7 @@ cc_test(
         "//rtp_llm/cpp/rdma_transport:rdma_transport",
         # Building inline receipts for the real terminal. Lean target, no engine behind it.
         "//rtp_llm/cpp/model_rpc:tensor_pb_convert",
+        "//rtp_llm/cpp/model_rpc:multimodal_pb_converter",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
     ],

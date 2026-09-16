@@ -20,6 +20,7 @@ class ResponseCopyTest {
                     "role": "PREFILL", "server_ip": "127.0.0.1",
                     "http_port": 8000, "grpc_port": 8001, "dp_rank": 2,
                     "prefill_time": 3, "group": "group-a", "request_id": 42,
+                    "worker_instance": "vit-worker-generation-1",
                     "success": true, "code": 201, "message": "accepted",
                     "debug_info": {
                       "running_batch_size": 4, "queue_size": 5, "waiting_time_ms": 6,

@@ -382,7 +382,7 @@ struct MMControlConfig {
 };
 
 struct MMTransportConfig {
-    std::string     mode = kMMTransportModeGrpc;
+    std::string     mode = kMMTransportModeAuto;
     MMControlConfig control;
     RdmaConfig      rdma;
     // LLM-to-ViT RPC budget when no request input sets mm_timeout_ms.

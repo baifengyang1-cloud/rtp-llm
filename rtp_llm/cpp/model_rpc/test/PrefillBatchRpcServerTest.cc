@@ -301,13 +301,17 @@ class VitTraceProcessor: public MultimodalProcessor {
 public:
     VitTraceProcessor(): MultimodalProcessor(py::object(), MMModelConfig{true, {{1}}, false}, 100) {}
 
-    ErrorCode result_code = ErrorCode::NONE_ERROR;
-    bool      throws      = false;
-    int       calls       = 0;
+    ErrorCode            result_code      = ErrorCode::NONE_ERROR;
+    bool                 throws           = false;
+    int                  calls            = 0;
+    grpc::ServerContext* received_context = nullptr;
 
 private:
     ErrorResult<MultimodalOutput> MultimodalEmbedding(const std::vector<MultimodalInput> inputs,
-                                                      std::string = "") override {
+                                                      std::string                  = "",
+                                                      int64_t                      = 0,
+                                                      grpc::ServerContext* context = nullptr) override {
+        received_context = context;
         ++calls;
         if (throws) {
             throw std::runtime_error("embedding failed");
@@ -1478,7 +1482,9 @@ TEST_F(PrefillBatchTraceTest, VitCoversFusionPreparationIncludingTokenExpansion)
     server.mm_processor_                  = processor;
     auto                           parent = telemetry::startRpcServerSpan("rtp_llm.generate_stream_call", nullptr);
     std::shared_ptr<GenerateInput> input;
-    ASSERT_TRUE(server.prepareInput(makeVitRequest(4101), input, parent).ok());
+    grpc::ServerContext            context;
+    ASSERT_TRUE(server.prepareInput(makeVitRequest(4101), input, parent, &context).ok());
+    EXPECT_EQ(processor->received_context, &context);
     EXPECT_EQ(processor->calls, 1);
     ASSERT_TRUE(input->multimodal_features);
     EXPECT_EQ(input->multimodal_features->size(), 2u);

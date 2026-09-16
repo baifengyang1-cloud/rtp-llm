@@ -4,10 +4,12 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+import aiohttp
 import grpc
 import grpc.aio
+import orjson
 
 from rtp_llm.config.exceptions import (
     AdmissionRejectReason,
@@ -69,6 +71,7 @@ class FlexlbResponse:
     error_message: Optional[str] = None
     admission_reject_reason: AdmissionRejectReason = AdmissionRejectReason.UNSPECIFIED
     enqueued_by_master: bool = False
+    result: Optional[dict] = None
 
     @property
     def is_ok(self) -> bool:
@@ -138,6 +141,10 @@ def _admission_reject_reason_from_response(response) -> AdmissionRejectReason:
         return AdmissionRejectReason.INVALID
 
 
+VIT_ROUTE_STALE_CODE = 8407
+DEFAULT_REQUEST_TIMEOUT_SEC = 5
+
+
 class MasterClient:
     """Client for FlexLB schedule gRPC API (master and optional slave)."""
 
@@ -180,6 +187,9 @@ class MasterClient:
             await channel.close()
 
     async def close(self) -> None:
+        session = getattr(self, "_metadata_session", None)
+        if session is not None:
+            await session.close()
         for channel in self._channels.values():
             await channel.close()
         self._channels.clear()
@@ -262,6 +272,11 @@ class MasterClient:
                 elapsed,
             )
             if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                if request_pb.vit_only:
+                    # This lookup has no admission side effects. Preserve the
+                    # slave/discovery fallback when optional cache routing stalls.
+                    await self._close_channel(target)
+                    return None
                 await self._best_effort_cancel(
                     stub, request_id, CANCEL_REASON_DEADLINE_EXCEEDED, trace_metadata
                 )
@@ -308,6 +323,173 @@ class MasterClient:
                 exc_info=True,
             )
 
+    async def get_vit_cache_metadata(
+        self, address: RoleAddr, keys: List[str], input: Optional[GenerateInput] = None
+    ):
+        """Probe hashes, then submit only missing media when routing requires them."""
+        started = time.monotonic()
+        unique_keys = list(dict.fromkeys(keys))
+        metadata = await self._post_vit_metadata(
+            address, {"keys": unique_keys}, DEFAULT_REQUEST_TIMEOUT_SEC
+        )
+        if input is None:
+            return metadata
+        entries = {
+            e["key"]: e
+            for e in (metadata or {}).get("entries", [])
+            if isinstance(e, dict) and isinstance(e.get("key"), str)
+        }
+        if not metadata or metadata.get("feature_hash_version") != 1:
+            entries = {}
+        missing = {
+            key
+            for key in unique_keys
+            if not entries.get(key, {}).get(
+                "hash_hit", entries.get(key, {}).get("hit", False)
+            )
+        }
+        if not missing:
+            return metadata
+
+        from google.protobuf.json_format import MessageToDict
+
+        from rtp_llm.cpp.model_rpc.model_rpc_client import iter_multimodal_inputs
+
+        # The cache-hit probe carries no URLs. On a miss serialize each distinct
+        # missing input once, without copying image/video data into embeddings.
+        inputs = []
+        submitted = set()
+        for key, item in zip(
+            keys, iter_multimodal_inputs(input, input.generate_config)
+        ):
+            if key in missing and key not in submitted:
+                inputs.append(MessageToDict(item, preserving_proto_field_name=True))
+                submitted.add(key)
+        if submitted != missing:
+            raise FtRuntimeException(
+                ExceptionType.MM_PROCESS_ERROR, "Missing ViT submission inputs"
+            )
+        configured_timeout = input.generate_config.mm_timeout_ms
+        if not configured_timeout or configured_timeout <= 0:
+            configured_timeout = max(
+                (
+                    i.mm_preprocess_config.mm_timeout_ms
+                    for i in input.mm_inputs
+                    if i.mm_preprocess_config.mm_timeout_ms > 0
+                ),
+                default=120000,
+            )
+        limits = [configured_timeout]
+        for name in ("ttft_timeout_ms", "timeout_ms"):
+            limit = getattr(input.generate_config, name, None)
+            if limit and limit > 0:
+                limits.append(limit)
+        remaining = min(limits) / 1000.0 - (time.monotonic() - started)
+        if remaining <= 0:
+            raise FtRuntimeException(
+                ExceptionType.GENERATE_TIMEOUT, "ViT hash acquisition timed out"
+            )
+        filled = await self._post_vit_metadata(
+            address,
+            {
+                "keys": [key for key in unique_keys if key in missing],
+                "inputs": inputs,
+                "request_id": input.request_id,
+                "timeout_ms": max(1, int(remaining * 1000)),
+            },
+            remaining,
+            required=True,
+        )
+        if metadata and filled.get("worker_instance") != metadata.get(
+            "worker_instance"
+        ):
+            raise FtRuntimeException(
+                ExceptionType.ROUTE_ERROR, "ViT restarted during hash acquisition"
+            )
+        if filled.get("feature_hash_version") != 1:
+            raise FtRuntimeException(
+                ExceptionType.MM_PROCESS_ERROR, "Unsupported ViT feature hash version"
+            )
+        entries.update({e["key"]: e for e in filled.get("entries", [])})
+        if any(
+            not entries.get(key, {}).get(
+                "hash_hit", entries.get(key, {}).get("hit", False)
+            )
+            for key in unique_keys
+        ):
+            raise FtRuntimeException(
+                ExceptionType.MM_PROCESS_ERROR, "ViT returned incomplete feature hashes"
+            )
+        filled["entries"] = [entries[key] for key in unique_keys]
+        return filled
+
+    async def _post_vit_metadata(self, address, payload, timeout_sec, required=False):
+        import aiohttp
+
+        started = time.monotonic()
+        try:
+            session = await self._get_session()
+            async with session.post(
+                f"http://{address.ip}:{address.http_port}/mm_cache/metadata",
+                data=orjson.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            ) as response:
+                # One bounded buffer avoids retaining chunks plus a joined copy.
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    if len(body) + len(chunk) > 16 * 1024 * 1024:
+                        raise ValueError("ViT metadata response exceeds byte limit")
+                    body.extend(chunk)
+                data = orjson.loads(body)
+                if response.status != SUCCESS_CODE:
+                    if not required:
+                        return None
+                    detail = data.get("detail", "ViT hash computation failed")
+                    code = (
+                        ExceptionType.GENERATE_TIMEOUT
+                        if response.status == 504
+                        else ExceptionType.MM_PROCESS_ERROR
+                    )
+                    if isinstance(detail, dict):
+                        code = ExceptionType(detail.get("error_code", int(code)))
+                        detail = detail.get("message", "ViT hash computation failed")
+                    raise FtRuntimeException(code, str(detail))
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid ViT metadata response")
+                return data
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as error:
+            if required:
+                code = (
+                    ExceptionType.GENERATE_TIMEOUT
+                    if isinstance(error, (TimeoutError, asyncio.TimeoutError))
+                    else ExceptionType.MM_PROCESS_ERROR
+                )
+                raise FtRuntimeException(
+                    code, f"ViT hash acquisition failed: {type(error).__name__}"
+                ) from error
+            route_logger.warning(
+                "ViT metadata unavailable, address=%s:%s", address.ip, address.http_port
+            )
+            return None
+        finally:
+            route_logger.debug(
+                "ViT metadata query elapsed_ms=%.3f",
+                (time.monotonic() - started) * 1000,
+            )
+
+    async def _get_session(self):
+        session = getattr(self, "_metadata_session", None)
+        if session is None or session.closed:
+            self._metadata_session = aiohttp.ClientSession()
+        return self._metadata_session
+
     async def get_backend_role_addrs(
         self,
         block_cache_keys: list[int],
@@ -315,6 +497,11 @@ class MasterClient:
         input: GenerateInput,
         request_id: int,
         input_pb: Optional["GenerateInputPB"] = None,
+        *,
+        media_keys: Optional[List[str]] = None,
+        selected_vit: Optional[Dict[str, Any]] = None,
+        seq_len: Optional[int] = None,
+        vit_only: bool = False,
     ) -> FlexlbResponse:
         """
         Resolve backend role addrs from FlexLB scheduler (master, then slave on connection failure).
@@ -343,7 +530,9 @@ class MasterClient:
         request_pb = FlexlbScheduleRequestPB(
             request_id=request_id,
             block_cache_keys=block_cache_keys,
-            seq_len=input.prompt_length,
+            seq_len=(
+                (0 if vit_only else input.prompt_length) if seq_len is None else seq_len
+            ),
             generate_timeout=ttft_timeout_ms,
             request_time_ms=int(time.time() * 1000),
             max_new_tokens=gc.max_new_tokens,
@@ -354,7 +543,15 @@ class MasterClient:
             cache_key_block_size=cache_key_block_size,
             priority=priority,
         )
-        if input_pb is not None:
+        request_pb.media_keys.extend(media_keys or [])
+        request_pb.vit_only = vit_only
+        if selected_vit is not None:
+            from google.protobuf.json_format import ParseDict
+
+            ParseDict(selected_vit, request_pb.selected_vit, ignore_unknown_fields=True)
+        if vit_only:
+            timeout_s = min(timeout_s, 0.5) if timeout_s else 0.5
+        if input_pb is not None and not vit_only:
             request_pb.generate_input = input_pb.SerializeToString()
 
         response = await self._send_schedule_request(
@@ -376,6 +573,8 @@ class MasterClient:
 
         self.latest_queue_length = response.queue_length
 
+        if selected_vit is not None and response.code == VIT_ROUTE_STALE_CODE:
+            return FlexlbResponse.error_response(response.code, response.error_message)
         if response.code != SUCCESS_CODE:
             admission_reject_reason = _admission_reject_reason_from_response(response)
             try:
@@ -411,10 +610,13 @@ class MasterClient:
             )
             for s in response.server_status
         ]
-        return FlexlbResponse.ok(
-            role_addrs,
-            enqueued_by_master=response.enqueued_by_master,
+        result = FlexlbResponse.ok(
+            role_addrs, enqueued_by_master=response.enqueued_by_master
         )
+        from google.protobuf.json_format import MessageToDict
+
+        result.result = MessageToDict(response, preserving_proto_field_name=True)
+        return result
 
     @staticmethod
     def _extract_api_key(input: GenerateInput) -> str:

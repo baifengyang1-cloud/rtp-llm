@@ -154,6 +154,31 @@ class FlexlbServiceImplTest {
     }
 
     @Test
+    void testSchedule_preservesVitCacheRoutingMetadata() {
+        when(lbStatusConsistencyService.isNeedConsistency()).thenReturn(false);
+        Response response = new Response();
+        response.setSuccess(true);
+        response.setCode(200);
+        when(routeService.route(any(BalanceContext.class))).thenReturn(CompletableFuture.completedFuture(response));
+        var selected = FlexlbScheduleProtocol.FlexlbServerStatusPB.newBuilder()
+                .setServerIp("127.0.0.1").setHttpPort(8080).setGrpcPort(8081)
+                .setGroup("vit-group").setWorkerInstance("worker-generation").build();
+        var request = FlexlbScheduleProtocol.FlexlbScheduleRequestPB.newBuilder()
+                .setRequestId(12346L).setSeqLen(100).setVitOnly(true)
+                .addMediaKeys("image-key").setSelectedVit(selected).build();
+        StreamObserver<FlexlbScheduleProtocol.FlexlbScheduleResponsePB> observer = mock(StreamObserver.class);
+        service.schedule(request, observer);
+        ArgumentCaptor<BalanceContext> captor = ArgumentCaptor.forClass(BalanceContext.class);
+        verify(routeService).route(captor.capture());
+        Request routed = captor.getValue().getRequest();
+        assertTrue(routed.isVitOnly());
+        assertEquals(java.util.List.of("image-key"), routed.getMediaKeys());
+        assertEquals("vit-group", routed.getSelectedVit().getGroup());
+        assertEquals("worker-generation", routed.getSelectedVit().getWorkerInstance());
+        verify(observer).onCompleted();
+    }
+
+    @Test
     void testSchedule_clientCancellationReleasesSchedulerOwnedRequest() {
         when(lbStatusConsistencyService.isNeedConsistency()).thenReturn(false);
         CompletableFuture<Response> pendingRoute = new CompletableFuture<>();

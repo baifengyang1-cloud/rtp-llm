@@ -12,10 +12,23 @@
 #include "rtp_llm/cpp/normal_engine/NormalModelInputGatherer.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
+#include "rtp_llm/models_py/bindings/core/ExecOps.h"
 
 namespace rtp_llm {
 
 namespace {
+
+void checkRuntimeCudaDevice(const torch::Tensor& tensor, const char* name) {
+    if (!tensor.defined() || !tensor.is_cuda()) {
+        return;
+    }
+    const auto expected_device = static_cast<int>(getDeviceId());
+    RTP_LLM_CHECK_WITH_INFO(tensor.get_device() == expected_device,
+                            "%s is on cuda:%d, expected runtime cuda:%d",
+                            name,
+                            tensor.get_device(),
+                            expected_device);
+}
 
 bool asyncDebugEnabled() {
     const char* env = std::getenv("RTP_LLM_ASYNC_DEBUG");
@@ -179,8 +192,9 @@ void gatherMultimodalInputsForContextBatch(const GenerateStreamPtr&    stream,
         auto          current_feature = mm_feature.slice(0, token_offset, feature_len).contiguous();
         if (!current_feature.is_cuda()) {
             host_holder.hold_host(current_feature);
-            gathered_mm_features.emplace_back(current_feature.to(torch::kCUDA, /*non_blocking=*/true));
+            gathered_mm_features.emplace_back(current_feature.to(getTorchCudaDevice(), /*non_blocking=*/true));
         } else {
+            checkRuntimeCudaDevice(current_feature, "multimodal feature");
             gathered_mm_features.emplace_back(std::move(current_feature));
         }
 
@@ -193,8 +207,10 @@ void gatherMultimodalInputsForContextBatch(const GenerateStreamPtr&    stream,
                 sliceMultimodalExtraInput(mm_extra_input[i], mm_feature, token_offset, feature_len);
             if (!current_extra_input.is_cuda()) {
                 host_holder.hold_host(current_extra_input);
-                gathered_mm_extra_input.emplace_back(current_extra_input.to(torch::kCUDA, /*non_blocking=*/true));
+                gathered_mm_extra_input.emplace_back(
+                    current_extra_input.to(getTorchCudaDevice(), /*non_blocking=*/true));
             } else {
+                checkRuntimeCudaDevice(current_extra_input, "multimodal extra input");
                 gathered_mm_extra_input.emplace_back(std::move(current_extra_input));
             }
         }
@@ -415,8 +431,8 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
     for (const auto& stream : stream_groups.decodeStreams()) {
         model_input.need_all_logits        = model_input.need_all_logits || stream->calculateLoss();
         model_input.need_all_hidden_states = model_input.need_all_hidden_states || stream->needReturnHiddenStates();
-        const bool use_mtp_cache_snapshot = stream->hasMtpCacheSnapshot();
-        const auto current_batch_size     = use_mtp_cache_snapshot ? 1 : stream->currentBatchSize();
+        const bool use_mtp_cache_snapshot  = stream->hasMtpCacheSnapshot();
+        const auto current_batch_size      = use_mtp_cache_snapshot ? 1 : stream->currentBatchSize();
         if (use_mtp_cache_snapshot) {
             RTP_LLM_CHECK_WITH_INFO(stream->maxBatchSize() == 1 && !stream->hasNumBeams(),
                                     "MTP cache snapshots require one non-beam sequence per stream, stream=%ld",

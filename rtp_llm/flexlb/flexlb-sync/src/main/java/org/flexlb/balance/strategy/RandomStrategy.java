@@ -12,6 +12,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import org.flexlb.service.VitCacheDirectory;
+import org.springframework.beans.factory.annotation.Autowired;
 import java.util.concurrent.ThreadLocalRandom;
 
 /** Random selection for the stateless VIT role. */
@@ -21,6 +23,8 @@ public final class RandomStrategy {
             LoggerFactory.getLogger(RandomStrategy.class);
 
     private final WorkerDirectory workerDirectory;
+    @Autowired
+    private VitCacheDirectory vitCacheDirectory;
 
     public RandomStrategy(WorkerDirectory workerDirectory) {
         this.workerDirectory = workerDirectory;
@@ -31,6 +35,25 @@ public final class RandomStrategy {
         if (role != RoleType.VIT) {
             throw new IllegalArgumentException(
                     "RANDOM endpoint selection is supported only for VIT");
+        }
+        if (vitCacheDirectory != null && (context.getRequest().getSelectedVit() != null
+                || (context.getRequest().getMediaKeys() != null && !context.getRequest().getMediaKeys().isEmpty()))) {
+            ServerStatus route = context.getRequest().getSelectedVit() == null
+                    ? vitCacheDirectory.select(context, group) : vitCacheDirectory.validate(context, group);
+            if (!route.isSuccess()) {
+                return null;
+            }
+            String address = route.getServerIp() + ":" + route.getHttpPort();
+            WorkerEndpoint.GenerationPin pin = workerDirectory.captureEndpoint(RoleType.VIT, address);
+            if (pin == null) {
+                return null;
+            }
+            WorkerStatus status = pin.endpoint().getStatus();
+            if (group != null && !group.equals(status.topologySnapshot().group())) {
+                pin.close();
+                return null;
+            }
+            return SelectedRole.stateless(pin, route);
         }
         List<String> addresses =
                 workerDirectory.endpointAddressSnapshot(RoleType.VIT);

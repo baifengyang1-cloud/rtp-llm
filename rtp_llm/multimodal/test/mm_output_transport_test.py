@@ -1,3 +1,4 @@
+import weakref
 from contextlib import contextmanager
 from unittest import TestCase, main
 from unittest.mock import MagicMock, patch
@@ -5,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from rtp_llm.config.py_config_modules import (
+    MM_TRANSPORT_MODE_AUTO,
     MM_TRANSPORT_MODE_GRPC,
     MM_TRANSPORT_MODE_RDMA,
     MM_TRANSPORT_MODES,
@@ -16,6 +18,7 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
     MultimodalOutputPB,
 )
 from rtp_llm.metrics.kmonitor_metric_reporter import GaugeMetrics
+from rtp_llm.multimodal.mm_process_engine import MMEmbeddingRes
 from rtp_llm.multimodal.transport.base import (
     MMOutputTransport,
     MMTransportBackend,
@@ -26,11 +29,7 @@ from rtp_llm.multimodal.transport.grpc.backend import (
     TRANSPORT_BYTES,
     GrpcInlineOutputBackend,
 )
-from rtp_llm.multimodal.transport.rdma.backend import (
-    TRANSPORT_RDMA,
-    RdmaOutputBackend,
-)
-from rtp_llm.multimodal.mm_process_engine import MMEmbeddingRes
+from rtp_llm.multimodal.transport.rdma.backend import TRANSPORT_RDMA, RdmaOutputBackend
 
 
 def _serialized_desc(handle: str, nbytes: int = 16) -> bytes:
@@ -66,13 +65,34 @@ def _rdma_request() -> MultimodalInputsPB:
 
 
 class MMOutputTransportFactoryTest(TestCase):
-    def test_default_mode_is_grpc_and_auto_is_not_accepted(self):
-        config = MMTransportConfig()
 
-        self.assertEqual(config.mode, MM_TRANSPORT_MODE_GRPC)
-        self.assertEqual(MM_TRANSPORT_MODES, (MM_TRANSPORT_MODE_GRPC, MM_TRANSPORT_MODE_RDMA))
-        self.assertNotIn("auto", MM_TRANSPORT_MODES)
-        self.assertIsInstance(create_mm_output_transport(config)._backend, GrpcInlineOutputBackend)
+    @patch(
+        "rtp_llm.multimodal.transport.rdma.backend.RdmaOutputBackend.create",
+        side_effect=RuntimeError("provider unavailable"),
+    )
+    def test_auto_is_default_and_initialization_failure_uses_grpc(self, create):
+        config = MMTransportConfig()
+        self.assertEqual(config.mode, MM_TRANSPORT_MODE_AUTO)
+        self.assertIn(MM_TRANSPORT_MODE_AUTO, MM_TRANSPORT_MODES)
+        self.assertIsInstance(
+            create_mm_output_transport(config)._backend, GrpcInlineOutputBackend
+        )
+        create.assert_called_once_with(config.rdma, 0)
+
+    @patch("rtp_llm.multimodal.transport.rdma.backend.RdmaOutputBackend.create")
+    def test_auto_prefers_rdma_and_has_inline_fallback(self, create):
+        transport = create_mm_output_transport(MMTransportConfig())
+        self.assertIs(transport._backend, create.return_value)
+        self.assertIsInstance(transport._fallback, GrpcInlineOutputBackend)
+
+    @patch("rtp_llm.multimodal.transport.rdma.backend.RdmaOutputBackend.create")
+    def test_explicit_grpc_does_not_initialize_rdma(self, create):
+        config = MMTransportConfig()
+        config.mode = MM_TRANSPORT_MODE_GRPC
+        self.assertIsInstance(
+            create_mm_output_transport(config)._backend, GrpcInlineOutputBackend
+        )
+        create.assert_not_called()
 
     @patch(
         "rtp_llm.multimodal.transport.rdma.backend.RdmaOutputBackend.create",
@@ -133,7 +153,10 @@ class RdmaOutputBackendTest(TestCase):
 
         # Descriptor order is what lets the LLM re-concat the chunks.
         self.assertEqual(
-            [slot.rdma_descriptor.lease_id for slot in result.receipt.output_rdma_slots],
+            [
+                slot.rdma_descriptor.lease_id
+                for slot in result.receipt.output_rdma_slots
+            ],
             ["one", "two"],
         )
         # split_size must describe the per-image row counts of the un-concatenated inputs.
@@ -156,14 +179,13 @@ class RdmaOutputBackendTest(TestCase):
         cuda_res = MMEmbeddingRes([_rows(1)])
         with _tensors_look_cuda():
             with self.assertRaisesRegex(RuntimeError, "did not advertise RDMA"):
-                self.backend.transfer(
-                    MultimodalInputsPB(support_rdma=False), cuda_res
-                )
+                self.backend.transfer(MultimodalInputsPB(support_rdma=False), cuda_res)
             with self.assertRaisesRegex(RuntimeError, "no multimodal embeddings"):
                 self.backend.transfer(_rdma_request(), MMEmbeddingRes([]))
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             self.backend.transfer(_rdma_request(), cuda_res)
         self.exporter.export_embedding.assert_not_called()
+
 
 class GrpcInlineOutputBackendTest(TestCase):
     def test_payload_is_encoded_inline(self):
@@ -182,6 +204,7 @@ class GrpcInlineOutputBackendTest(TestCase):
         self.assertEqual(list(result.receipt.split_size), [2, 3])
         self.assertEqual(len(result.receipt.output_rdma_slots), 0)
 
+
 class _FakeBackend(MMTransportBackend):
     name = "fake"
 
@@ -195,6 +218,52 @@ class _FakeBackend(MMTransportBackend):
 
 
 class MMOutputTransportTest(TestCase):
+
+    def test_auto_releases_failed_export_temporaries_before_inline_serialization(self):
+        temporary_ref = None
+
+        class FailingBackend(MMTransportBackend):
+            name = "rdma"
+
+            def transfer(self, request, res):
+                nonlocal temporary_ref
+                temporary = torch.zeros(16)
+                temporary_ref = weakref.ref(temporary)
+                raise RuntimeError("export failed")
+
+        fallback = GrpcInlineOutputBackend()
+        original_transfer = fallback.transfer
+
+        def check_transfer(request, res):
+            self.assertIsNone(temporary_ref())
+            return original_transfer(request, res)
+
+        with patch.object(fallback, "transfer", side_effect=check_transfer):
+            receipt = MMOutputTransport(FailingBackend(), fallback).transfer(
+                _rdma_request(), MMEmbeddingRes([_rows(2)])
+            )
+        self.assertTrue(receipt.HasField("multimodal_embedding"))
+
+    def test_auto_skips_rdma_for_client_without_support(self):
+        primary = _FakeBackend(RuntimeError("must not export"))
+        transport = MMOutputTransport(primary, GrpcInlineOutputBackend())
+        receipt = transport.transfer(MultimodalInputsPB(), MMEmbeddingRes([_rows(2)]))
+        self.assertEqual(primary.transfer_calls, [])
+        self.assertTrue(receipt.HasField("multimodal_embedding"))
+        self.assertEqual(list(receipt.split_size), [2])
+
+    def test_auto_export_failure_falls_back_after_rolling_back_leases(self):
+        exporter = MagicMock()
+        exporter.export_embedding.return_value = [_serialized_desc("partial"), b"\x80"]
+        transport = MMOutputTransport(
+            RdmaOutputBackend(exporter), GrpcInlineOutputBackend()
+        )
+        with _tensors_look_cuda():
+            receipt = transport.transfer(_rdma_request(), MMEmbeddingRes([_rows(2)]))
+        exporter.release.assert_called_once_with(["partial"])
+        self.assertTrue(receipt.HasField("multimodal_embedding"))
+        self.assertEqual(len(receipt.output_rdma_slots), 0)
+
     def setUp(self):
         self.terminal = GrpcInlineOutputBackend()
 
@@ -227,7 +296,10 @@ class MMOutputTransportTest(TestCase):
         self.assertEqual(samples[GaugeMetrics.VIT_RESPONSE_POS_BYTES_METRIC], 8)
         self.assertEqual(samples[GaugeMetrics.VIT_RESPONSE_DEEPSTACK_BYTES_METRIC], 6)
         self.assertEqual(samples[GaugeMetrics.VIT_OUTPUT_TOKEN_COUNT_METRIC], 2)
-        self.assertEqual(samples[GaugeMetrics.VIT_RPC_RESPONSE_BYTES_METRIC], result.receipt.ByteSize())
+        self.assertEqual(
+            samples[GaugeMetrics.VIT_RPC_RESPONSE_BYTES_METRIC],
+            result.receipt.ByteSize(),
+        )
 
     @patch("rtp_llm.multimodal.transport.base.kmonitor.report")
     def test_rdma_output_metrics_use_descriptor_payload_sizes(self, report):
@@ -246,7 +318,11 @@ class MMOutputTransportTest(TestCase):
         self.assertEqual(samples[GaugeMetrics.VIT_RESPONSE_POS_BYTES_METRIC], 0)
         self.assertEqual(samples[GaugeMetrics.VIT_RESPONSE_DEEPSTACK_BYTES_METRIC], 0)
         self.assertEqual(samples[GaugeMetrics.VIT_OUTPUT_TOKEN_COUNT_METRIC], 2)
-        self.assertEqual(samples[GaugeMetrics.VIT_RPC_RESPONSE_BYTES_METRIC], result.receipt.ByteSize())
+        self.assertEqual(
+            samples[GaugeMetrics.VIT_RPC_RESPONSE_BYTES_METRIC],
+            result.receipt.ByteSize(),
+        )
+
 
 if __name__ == "__main__":
     main()

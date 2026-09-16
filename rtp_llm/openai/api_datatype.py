@@ -60,7 +60,8 @@ class MMPreprocessConfigPart(BaseModel):
     resized_height: Optional[int] = None
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
-    fps: Optional[int] = None
+    max_long_side_pixel: Optional[int] = None
+    fps: Optional[float] = None
     min_frames: Optional[int] = None
     max_frames: Optional[int] = None
     crop_positions: Optional[str] = None
@@ -77,6 +78,8 @@ class IgraphInfo(BaseModel):
 class ImageURL(BaseModel):
     url: str
     detail: Optional[str] = "auto"
+    max_long_side_pixel: Optional[int] = None
+    fps: Optional[float] = None
 
 
 class AudioURL(BaseModel):
@@ -91,6 +94,8 @@ class ContentPart(BaseModel):
     video_url: Optional[ImageURL] = None
     audio_url: Optional[AudioURL] = None
     preprocess_config: Optional[MMPreprocessConfigPart] = None
+    max_long_side_pixel: Optional[int] = None
+    fps: Optional[float] = None
 
 
 class ChatMessage(BaseModel):

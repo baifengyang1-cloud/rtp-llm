@@ -900,7 +900,6 @@ class DashScGrpcRequestTest(TestCase):
         self.assertEqual(parsed.values, [7, 8, 9])
         self.assertEqual(parse_input_ids_from_request(req), [7, 8, 9])
 
-
     def test_inference_input_ids_from_int64_converts_to_engine_dtype(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
         _add_tensor(req, "input_ids", "INT64", [2], struct.pack("<2q", 10, 11))
@@ -911,7 +910,6 @@ class DashScGrpcRequestTest(TestCase):
         assert parsed is not None
         self.assertEqual(parsed.tensor.dtype, torch.int32)
         self.assertEqual(parsed.tensor.tolist(), [10, 11])
-
 
     def test_inference_input_ids_from_int64_accepts_int32_boundaries(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
@@ -929,7 +927,6 @@ class DashScGrpcRequestTest(TestCase):
         assert parsed is not None
         self.assertEqual(parsed.tensor.tolist(), [-(2**31), 2**31 - 1])
 
-
     def test_inference_input_ids_from_int64_rejects_int32_overflow(self) -> None:
         for value in (-(2**40), 2**40):
             with self.subTest(value=value):
@@ -939,7 +936,6 @@ class DashScGrpcRequestTest(TestCase):
                     DashScInputIdsError, "outside the INT32 range"
                 ):
                     parse_dash_sc_grpc_request(req)
-
 
     def test_inference_input_ids_rejects_misaligned_wire_buffer(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
@@ -1285,6 +1281,31 @@ class BuildStreamResponseFromGenerateOutputsTest(TestCase):
         with self.assertRaises(ValueError) as ctx:
             builder.build(go)
         self.assertIn("non-empty", str(ctx.exception))
+
+    def test_multimodal_token_usage_is_returned_in_parameters(self) -> None:
+        out = GenerateOutput(
+            output_ids=torch.tensor([7], dtype=torch.int32),
+            finished=True,
+            aux_info=AuxInfo(
+                input_len=100,
+                multimodal_lengths={
+                    MMUrlType.IMAGE: 64,
+                    MMUrlType.VIDEO: 32,
+                    MMUrlType.AUDIO: 16,
+                },
+            ),
+        )
+        resp = StreamResponseBuilder(
+            dash_sc_request_id="req-mm",
+            model_name="mdl",
+            request_log_tag=stream_log_tag(request_id_numeric=100, trace_id="req-mm"),
+            return_input_ids=False,
+        ).build(GenerateOutputs(generate_outputs=[out]))
+        infer = resp.infer_response
+
+        self.assertEqual(infer.parameters["image_tokens"].int64_param, 64)
+        self.assertEqual(infer.parameters["video_tokens"].int64_param, 32)
+        self.assertEqual(infer.parameters["audio_tokens"].int64_param, 16)
 
     def test_basic_generated_ids_finish_aux(self) -> None:
         out = GenerateOutput(

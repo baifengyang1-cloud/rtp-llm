@@ -403,3 +403,10 @@ def __getattr__(name: str):
         if name in globals():
             return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def get_multimodal_feature_hash(embedding: torch.Tensor) -> torch.Tensor:
+    ensure_engine_ops_loaded()
+    return importlib.import_module("libth_transformer").get_multimodal_feature_hash(
+        embedding
+    )

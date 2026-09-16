@@ -176,6 +176,13 @@ class DashErrorSpecForFtExceptionTest(unittest.TestCase):
                     expected,
                 )
 
+    def test_unsafe_multimodal_input_maps_to_inspection_failure(self) -> None:
+        mapping = _dash_error_mapping_for_ft_exception(
+            FtRuntimeException(ExceptionType.UNSAFE_INPUT_CONTENT, "rejected image")
+        )
+        self.assertEqual(mapping.error_spec.status_code, 400)
+        self.assertEqual(mapping.error_spec.status_name, "DataInspectionFailed")
+
     def test_internal_exception_maps_to_internal(self) -> None:
         self.assertEqual(
             _dash_error_spec_for_ft_exception(
@@ -482,7 +489,8 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
                                 "image_url": {"url": "http://x.png"},
                                 "min_pixels": 128,
                                 "max_pixels": 4096,
-                                "fps": 3,
+                                "fps": 2.5,
+                                "max_long_side_pixel": 960,
                                 "min_frames": 5,
                                 "max_frames": 17,
                             }
@@ -498,7 +506,8 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mm_inputs[0].url, "http://x.png")
         self.assertEqual(mm_inputs[0].mm_preprocess_config.min_pixels, 128)
         self.assertEqual(mm_inputs[0].mm_preprocess_config.max_pixels, 4096)
-        self.assertEqual(mm_inputs[0].mm_preprocess_config.fps, 3)
+        self.assertEqual(mm_inputs[0].mm_preprocess_config.fps, 2.5)
+        self.assertEqual(mm_inputs[0].mm_preprocess_config.max_long_side_pixel, 960)
         self.assertEqual(mm_inputs[0].mm_preprocess_config.min_frames, 5)
         self.assertEqual(mm_inputs[0].mm_preprocess_config.max_frames, 17)
         self.assertEqual(mm_inputs[0].mm_preprocess_config.mm_timeout_ms, -1)

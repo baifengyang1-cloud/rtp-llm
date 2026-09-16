@@ -53,6 +53,21 @@ public class DefaultRouter {
                         modelMetaConfig, "modelMetaConfig").requiredRoles());
     }
 
+    public Response routeVit(BalanceContext context) {
+        Response invalid = validateRequest(context);
+        if (invalid != null) {
+            return invalid;
+        }
+        try (SelectedRole selected = vitSelector.select(context, RoleType.VIT, resolvePolicyGroup(context))) {
+            if (selected == null) {
+                return Response.error(context.getRequest().getSelectedVit() == null
+                        ? StrategyErrorType.NO_VIT_WORKER : StrategyErrorType.VIT_ROUTE_STALE);
+            }
+            return Response.buildSuccessResponse(
+                    buildSuccessResponse(List.of(selected.serverStatus())), false);
+        }
+    }
+
     public PlacementResult<RouteAdmission, PlacementKey> select(BalanceContext context) {
         return select(context, resolvePolicyGroup(context));
     }
@@ -153,8 +168,13 @@ public class DefaultRouter {
             case PREFILL, PDFUSION ->
                     prefillSelector.select(context, role, group);
             case DECODE -> decodeSelector.select(decodeAdmission, group);
-            case VIT -> selectedOrBlocked(
-                    vitSelector.select(context, role, group), role);
+            case VIT -> {
+                SelectedRole selected = vitSelector.select(context, role, group);
+                if (selected == null && context.getRequest().getSelectedVit() != null) {
+                    yield PlacementResult.rejected(Response.error(StrategyErrorType.VIT_ROUTE_STALE));
+                }
+                yield selectedOrBlocked(selected, role);
+            }
             case FRONTEND -> throw new IllegalArgumentException(
                     "Endpoint selection is not supported for FRONTEND");
         };

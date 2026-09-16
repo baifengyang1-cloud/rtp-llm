@@ -100,7 +100,7 @@ public:
             query->generate_config->in_think_mode       = true;
             query->generate_config->max_thinking_tokens = 1024;
         }
-        query->generate_config->num_return_sequences  = num_return_sequences;
+        query->generate_config->num_return_sequences = num_return_sequences;
         GenerateStreamPtr stream =
             make_shared<NormalGenerateStream>(query, model_config, runtime_config, resource_context, nullptr);
         if (!end_think_token_ids.empty()) {
@@ -301,10 +301,10 @@ TEST_F(MtpBatchStreamProcessorTest, testSpecSamplerInputMasksThinkBoundaryTokens
     // exactly the way MtpExecutor::buildSpecLogitsVerifyInline wires it.
     SpecLogitsVerifyRunner             runner;
     SpecLogitsVerifyRunner::LaunchTask task;
-    task.total_streams   = 1;
-    task.propose_step    = static_cast<int>(sp_config.gen_num_per_cycle);
-    task.vocab_size      = model_config.vocab_size;
-    task.draft_tokens    = torch::tensor(std::vector<int32_t>{1, 2}, torch::kInt32).reshape({1, 2});
+    task.total_streams = 1;
+    task.propose_step  = static_cast<int>(sp_config.gen_num_per_cycle);
+    task.vocab_size    = model_config.vocab_size;
+    task.draft_tokens  = torch::tensor(std::vector<int32_t>{1, 2}, torch::kInt32).reshape({1, 2});
     for (const auto& processor_ptr : stream->getAllLogitsProcessorPtr()) {
         ASSERT_NE(processor_ptr, nullptr);
         ASSERT_EQ(processor_ptr->mtpCapability().mode, MtpProcessorMode::SPEC_VERIFY);
@@ -1000,14 +1000,14 @@ TEST_F(MtpBatchStreamProcessorTest, testDSparkPrepareAndVerifyUsePerStreamDevice
     ProfilingDebugLoggingConfig profiling_debug_logging_config;
     CacheConfig                 cache_config = makeProcessorCacheConfig();
     SpeculativeExecutionConfig  sp_config;
-    model_config.max_seq_len          = 2048;
-    model_config.vocab_size           = 256;
-    model_config.num_layers           = 1;
+    model_config.max_seq_len                           = 2048;
+    model_config.vocab_size                            = 256;
+    model_config.num_layers                            = 1;
     model_config.mm_model_config.mm_position_ids_style = MROPE;
     model_config.attn_config.rope_config.index_factor  = 3;
-    sp_config.type                    = SP_TYPE_DSPARK;
-    sp_config.gen_num_per_cycle       = gamma;
-    sp_config.sp_dspark_mask_token_id = 255;
+    sp_config.type                                     = SP_TYPE_DSPARK;
+    sp_config.gen_num_per_cycle                        = gamma;
+    sp_config.sp_dspark_mask_token_id                  = 255;
 
     ResourceContext resource_context;
 
@@ -1022,9 +1022,9 @@ TEST_F(MtpBatchStreamProcessorTest, testDSparkPrepareAndVerifyUsePerStreamDevice
     // published before its previous bookkeeping worker. The fresh stream has
     // no previous round and therefore legitimately falls back to host state.
     GenerateStream::MtpAsyncDeviceState steady_state;
-    steady_state.accept_len_gpu    = torch::tensor({2}, torch::kInt32).to(torch::kCUDA);
-    steady_state.accept_tokens_gpu = torch::tensor({{101, 102, 0, 0}}, torch::kInt32).to(torch::kCUDA);
-    steady_state.next_seq_len_gpu  = torch::tensor({10}, torch::kInt32).to(torch::kCUDA);
+    steady_state.accept_len_gpu        = torch::tensor({2}, torch::kInt32).to(torch::kCUDA);
+    steady_state.accept_tokens_gpu     = torch::tensor({{101, 102, 0, 0}}, torch::kInt32).to(torch::kCUDA);
+    steady_state.next_seq_len_gpu      = torch::tensor({10}, torch::kInt32).to(torch::kCUDA);
     steady_state.next_position_ids_gpu = torch::tensor({30, 40, 50}, torch::kInt32).to(torch::kCUDA);
     steady_stream->setMtpAsyncDeviceState(std::move(steady_state));
 
@@ -1196,8 +1196,91 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInputShiftsCo
     TensorHolder holder;
     processor.updatePrefillPostDraftModelInput(stream_groups, model_input, model_output, sampler_output, holder);
     EXPECT_EQ((vector<int>{11, 12, 21, 22, 23}), toVec<int>(model_input.combo_tokens));
-    EXPECT_EQ((vector<int>{110, 111, 112, 112, 112, 112, 210, 211, 212, 220, 221, 222, 222, 222, 222}),
+    EXPECT_EQ((vector<int>{110, 111, 112, 113, 113, 113, 210, 211, 212, 220, 221, 222, 223, 223, 223}),
               toVec<int>(model_input.combo_position_ids));
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testPrefillMultimodalMetadataShift) {
+    ModelConfig                 model_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    SpeculativeExecutionConfig  sp_config;
+    model_config.max_seq_len                           = 2048;
+    model_config.vocab_size                            = 4;
+    model_config.num_layers                            = 1;
+    model_config.mm_model_config.mm_position_ids_style = MROPE;
+    model_config.attn_config.rope_config.index_factor  = 3;
+    sp_config.gen_num_per_cycle                        = 2;
+    MtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+    auto            stream1 = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 1);
+    auto            stream2 = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3}, 2);
+    stream1->setContextPositionIds(torch::tensor({100, 101, 102, 110, 111, 112}, torch::kInt32));
+    stream2->setContextPositionIds(torch::tensor({200, 201, 202, 210, 211, 212, 220, 221, 222}, torch::kInt32));
+    auto           stream_groups = StreamGroups({stream1, stream2});
+    GptModelInputs model_input;
+    model_input.input_lengths = torch::tensor({2, 3}, torch::kInt32);
+    model_input.combo_tokens  = torch::tensor({10, 11, 20, 21, 22}, torch::kInt32);
+    model_input.combo_position_ids =
+        torch::tensor({100, 101, 102, 110, 111, 112, 200, 201, 202, 210, 211, 212, 220, 221, 222}, torch::kInt32);
+    model_input.text_tokens_mask      = torch::tensor({0, 0, 0, 0, 1}, torch::kInt32);
+    model_input.combo_tokens_type_ids = torch::tensor({1, 1, 2, 2, 0}, torch::kInt32);
+    model_input.mm_features_locs      = torch::tensor({0, 2}, torch::kInt32);
+    model_input.multimodal_features   = std::vector<torch::Tensor>{torch::ones({2, 4}), torch::ones({2, 4})};
+    model_input.mm_extra_input =
+        std::vector<torch::Tensor>{torch::arange(16, torch::kFloat32), torch::arange(16, 32, torch::kFloat32)};
+    GptModelOutputs model_output;
+    model_output.all_hidden_states =
+        torch::tensor({0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f}, torch::kFloat32).reshape({5, 2});
+    SamplerOutput sampler_output;
+    sampler_output.token_ids = torch::tensor({1, -2, 12, 1, 2, 23}, torch::kInt32).reshape({2, 3});
+    TensorHolder holder;
+    processor.updatePrefillPostDraftModelInput(stream_groups, model_input, model_output, sampler_output, holder);
+    EXPECT_EQ((vector<int>{11, 12, 21, 22, 23}), toVec<int>(model_input.combo_tokens));
+    EXPECT_EQ((vector<int>{110, 111, 112, 113, 113, 113, 210, 211, 212, 220, 221, 222, 223, 223, 223}),
+              toVec<int>(model_input.combo_position_ids));
+    EXPECT_EQ((vector<int>{0, 1, 0, 1, 1}), toVec<int>(model_input.text_tokens_mask));
+    EXPECT_EQ((vector<int>{1, 1, 2, 0, 0}), toVec<int>(model_input.combo_tokens_type_ids));
+    EXPECT_EQ((vector<int>{0, 2}), toVec<int>(model_input.mm_features_locs));
+    ASSERT_EQ(2U, model_input.multimodal_features->size());
+    EXPECT_EQ(1, model_input.multimodal_features->at(0).size(0));
+    EXPECT_EQ(1, model_input.multimodal_features->at(1).size(0));
+    EXPECT_EQ(8, model_input.mm_extra_input->at(0).numel());
+    EXPECT_EQ(8, model_input.mm_extra_input->at(1).numel());
+
+    stream1->getSPOutputBuffer()->tokens = torch::tensor({{12, 13}}, torch::kInt32);
+    stream2->getSPOutputBuffer()->tokens = torch::tensor({{23, 24}}, torch::kInt32);
+    for (bool device_state : {false, true}) {
+        SCOPED_TRACE(device_state);
+        GptModelInputs decode;
+        decode.input_lengths      = model_input.input_lengths;
+        decode.sequence_lengths   = torch::tensor({2, 3}, torch::kInt32);
+        decode.combo_position_ids = torch::tensor({114, 114, 114, 224, 224, 224}, torch::kInt32);
+        auto positions            = decode.combo_position_ids.clone();
+        if (device_state) {
+            GenerateStream::MtpAsyncDeviceState first;
+            first.propose_tokens_gpu = torch::tensor({{13}}, torch::kInt32).to(torch::kCUDA);
+            first.next_seq_len_gpu   = torch::tensor({3}, torch::kInt32).to(torch::kCUDA);
+            stream1->setMtpAsyncDeviceState(std::move(first));
+            GenerateStream::MtpAsyncDeviceState second;
+            second.propose_tokens_gpu = torch::tensor({{24}}, torch::kInt32).to(torch::kCUDA);
+            second.next_seq_len_gpu   = torch::tensor({4}, torch::kInt32).to(torch::kCUDA);
+            stream2->setMtpAsyncDeviceState(std::move(second));
+        }
+        processor.prepareDecodeDraftModelInput(stream_groups, decode, holder);
+        EXPECT_EQ((vector<int>{2, 3}), toVec<int>(decode.sequence_lengths));
+        EXPECT_EQ((vector<int>{2, 3}), toVec<int>(decode.prefix_lengths));
+        EXPECT_EQ((vector<int>{13, 24}), toVec<int>(decode.combo_tokens));
+        EXPECT_TRUE(torch::equal(positions, decode.combo_position_ids));
+        GptModelOutputs draft_output;
+        draft_output.all_hidden_states = torch::zeros({2, 2});
+        processor.updateDecodeDraftModelInput(decode, draft_output, torch::tensor({{14}, {25}}, torch::kInt32), holder);
+        EXPECT_EQ((vector<int>{3, 4}), toVec<int>(decode.sequence_lengths));
+        EXPECT_EQ(toVec<int>(positions + 1), toVec<int>(decode.combo_position_ids));
+    }
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInput) {
@@ -1782,12 +1865,12 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesHostC
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesEveryBlockOffsetAndAcceptLength) {
-    constexpr int32_t block_size       = 64;
-    constexpr int32_t max_accept       = 8;
-    constexpr int64_t group_count      = 2;
-    constexpr int64_t block_count      = 16;
-    constexpr int64_t offsets          = block_size;
-    constexpr int64_t batch_size       = offsets * max_accept;
+    constexpr int32_t    block_size  = 64;
+    constexpr int32_t    max_accept  = 8;
+    constexpr int64_t    group_count = 2;
+    constexpr int64_t    block_count = 16;
+    constexpr int64_t    offsets     = block_size;
+    constexpr int64_t    batch_size  = offsets * max_accept;
     std::vector<int32_t> previous_lengths;
     std::vector<int32_t> accept_lengths;
     previous_lengths.reserve(batch_size);
@@ -1816,11 +1899,11 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesEvery
         if (accept <= 1) {
             continue;
         }
-        const int current_cached = previous_lengths[static_cast<size_t>(batch)] - 1;
-        const int next_cached    = current_cached + accept;
-        const auto cached_swap   = getCachedTokenBlockSwapIdx(current_cached, next_cached, block_size);
-        const auto final_swap    = getFinalTokenBlockSwapIdx(current_cached, next_cached, block_size);
-        auto*      row           = expected.select(0, 0).select(0, batch).data_ptr<int32_t>();
+        const int  current_cached = previous_lengths[static_cast<size_t>(batch)] - 1;
+        const int  next_cached    = current_cached + accept;
+        const auto cached_swap    = getCachedTokenBlockSwapIdx(current_cached, next_cached, block_size);
+        const auto final_swap     = getFinalTokenBlockSwapIdx(current_cached, next_cached, block_size);
+        auto*      row            = expected.select(0, 0).select(0, batch).data_ptr<int32_t>();
         std::swap(row[cached_swap.first], row[cached_swap.second]);
         std::swap(row[final_swap.first], row[final_swap.second]);
     }
@@ -1841,22 +1924,21 @@ TEST_F(MtpBatchStreamProcessorTest, testCacheSnapshotOverlayKeepsPhysicalKernelP
     sp_config.gen_num_per_cycle              = 3;
 
     ResourceContext resource_context;
-    auto steady = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
-    auto fresh  = createContextStream(model_config, runtime_config, resource_context, {2}, 2);
+    auto            steady = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    auto            fresh  = createContextStream(model_config, runtime_config, resource_context, {2}, 2);
     steady->setIsContextStream(false);
     fresh->setIsContextStream(false);
 
-    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    const auto                          cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     GenerateStream::MtpAsyncDeviceState state;
-    state.next_kv_cache_block_id_gpu =
-        torch::tensor({11, 12, 13}, torch::kInt32).reshape({1, 1, 3}).to(cuda_i32);
+    state.next_kv_cache_block_id_gpu = torch::tensor({11, 12, 13}, torch::kInt32).reshape({1, 1, 3}).to(cuda_i32);
     state.next_kv_cache_kernel_block_id_gpu =
         torch::tensor({101, 102, 103, 104}, torch::kInt32).reshape({1, 1, 4}).to(cuda_i32);
     steady->setMtpAsyncDeviceState(std::move(state));
 
     GptModelInputs model_input;
-    auto pinned_i32 = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
-    model_input.kv_cache_block_id = torch::zeros({1, 2, 5}, pinned_i32);
+    auto           pinned_i32            = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    model_input.kv_cache_block_id        = torch::zeros({1, 2, 5}, pinned_i32);
     model_input.kv_cache_kernel_block_id = torch::zeros({1, 2, 7}, pinned_i32);
     model_input.kv_cache_block_id.select(1, 1).copy_(torch::tensor({21, 22, 23, 24, 25}, torch::kInt32));
     model_input.kv_cache_kernel_block_id.select(1, 1).copy_(
@@ -1869,10 +1951,8 @@ TEST_F(MtpBatchStreamProcessorTest, testCacheSnapshotOverlayKeepsPhysicalKernelP
 
     ASSERT_TRUE(model_input.kv_cache_block_id.is_cuda());
     ASSERT_TRUE(model_input.kv_cache_kernel_block_id.is_cuda());
-    EXPECT_EQ((std::vector<int32_t>{11, 12, 13, 0, 0}),
-              toVec<int32_t>(model_input.kv_cache_block_id.select(1, 0)));
-    EXPECT_EQ((std::vector<int32_t>{21, 22, 23, 24, 25}),
-              toVec<int32_t>(model_input.kv_cache_block_id.select(1, 1)));
+    EXPECT_EQ((std::vector<int32_t>{11, 12, 13, 0, 0}), toVec<int32_t>(model_input.kv_cache_block_id.select(1, 0)));
+    EXPECT_EQ((std::vector<int32_t>{21, 22, 23, 24, 25}), toVec<int32_t>(model_input.kv_cache_block_id.select(1, 1)));
     EXPECT_EQ((std::vector<int32_t>{101, 102, 103, 104, 0, 0, 0}),
               toVec<int32_t>(model_input.kv_cache_kernel_block_id.select(1, 0)));
     EXPECT_EQ((std::vector<int32_t>{201, 202, 203, 204, 205, 206, 207}),

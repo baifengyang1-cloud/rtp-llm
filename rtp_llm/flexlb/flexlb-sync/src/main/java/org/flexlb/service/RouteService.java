@@ -2,6 +2,7 @@ package org.flexlb.service;
 
 import com.google.protobuf.ByteString;
 import org.flexlb.balance.scheduler.CancelReason;
+import org.flexlb.balance.scheduler.DefaultRouter;
 import org.flexlb.balance.scheduler.RequestScheduler;
 import org.flexlb.balance.scheduler.RequestState;
 import org.flexlb.config.DispatcherConfig;
@@ -18,11 +19,13 @@ import java.util.concurrent.CompletableFuture;
 @Component
 public class RouteService {
 
+    private final DefaultRouter router;
     private final RequestScheduler requestScheduler;
     private final RecentCacheKeyTraceReporter recentCacheKeyTraceReporter;
 
-    public RouteService(RequestScheduler requestScheduler,
+    public RouteService(DefaultRouter router, RequestScheduler requestScheduler,
                         RecentCacheKeyTraceReporter recentCacheKeyTraceReporter) {
+        this.router = router;
         this.requestScheduler = requestScheduler;
         this.recentCacheKeyTraceReporter = recentCacheKeyTraceReporter;
     }
@@ -39,7 +42,9 @@ public class RouteService {
                         : flexlbConfig.getDispatcher().getType() == DispatcherConfig.Type.BATCH
                                 ? "BATCH" : "QUEUE");
 
-        CompletableFuture<Response> resultFuture = routeScheduled(balanceContext);
+        CompletableFuture<Response> resultFuture = balanceContext.getRequest().isVitOnly()
+                ? CompletableFuture.completedFuture(router.routeVit(balanceContext))
+                : routeScheduled(balanceContext);
 
         // Observe the scheduler-owned future without replacing it with a
         // dependent stage. Returning the exact source preserves external

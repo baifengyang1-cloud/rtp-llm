@@ -159,6 +159,7 @@ class ExceptionType(IntEnum):
     MM_EMPTY_ENGINE_ERROR = 904
     MM_NOT_SUPPORTED_ERROR = 905, ExceptionCategory.UNSUPPORTED
     MM_DOWNLOAD_FAILED = 906
+    UNSAFE_INPUT_CONTENT = 908, ExceptionCategory.BAD_REQUEST
     MM_REMOTE_RPC_FAILED = 907
 
     @classmethod

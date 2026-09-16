@@ -95,6 +95,40 @@ class DefaultRouterTest {
     }
 
     @Test
+    void vitOnlyRoutePreservesWorkerIdentityAndClosesSelectionWithoutGenerationAdmission() {
+        when(modelMeta.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.DECODE, RoleType.VIT));
+        BalanceContext context = context(71L);
+        context.getRequest().setVitOnly(true);
+        SelectedRole selected = mock(SelectedRole.class);
+        ServerStatus status = new ServerStatus();
+        status.setRole(RoleType.VIT);
+        status.setSuccess(true);
+        status.setWorkerInstance("vit-generation-1");
+        when(selected.serverStatus()).thenReturn(status);
+        when(vitSelector.select(context, RoleType.VIT, null)).thenReturn(selected);
+
+        Response response = router().routeVit(context);
+
+        assertTrue(response.isSuccess());
+        assertEquals(200, response.getCode());
+        assertFalse(response.isEnqueuedByMaster());
+        assertEquals("vit-generation-1", response.getServerStatus().get(0).getWorkerInstance());
+        verify(selected).close();
+        verifyNoInteractions(prefillSelector, decodeSelector);
+    }
+
+    @Test
+    void vitOnlyRouteRejectsStaleSelectionAndReportsUnavailableWorker() {
+        when(modelMeta.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.VIT));
+        BalanceContext context = context(72L);
+        DefaultRouter router = router();
+        assertEquals(StrategyErrorType.NO_VIT_WORKER.getErrorCode(), router.routeVit(context).getCode());
+        context.getRequest().setSelectedVit(new ServerStatus());
+        assertEquals(StrategyErrorType.VIT_ROUTE_STALE.getErrorCode(), router.routeVit(context).getCode());
+        verifyNoInteractions(prefillSelector, decodeSelector);
+    }
+
+    @Test
     void invalidRequestFailsBeforePolicyOrEndpointSelection() {
         when(modelMeta.requiredRoles()).thenReturn(List.of(RoleType.PREFILL));
         DefaultRouter router = router();

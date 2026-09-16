@@ -1,3 +1,4 @@
+load("//bazel:device_defs.bzl", "device_impl_target", "device_test_envs")
 load("//:def.bzl", "cc_test_wrapper", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
@@ -52,7 +53,6 @@ cc_test(
     copts = test_copts,
     deps = [
         "//rtp_llm/cpp/testing:device_test_utils",
-        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
         "//rtp_llm/cpp/cache:cache",
         "//rtp_llm/cpp/cache/test:cache_config_test_utils",
         "//rtp_llm/cpp/normal_engine:normal_engine",
@@ -63,10 +63,8 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",
-    ] + torch_deps() + cuda13_torch_link_deps,
-    env = {
-        "TEST_USING_DEVICE": "CUDA",
-    },
+    ] + device_impl_target() + torch_deps() + cuda13_torch_link_deps,
+    env = device_test_envs(),
     exec_properties = {'gpu':'A10'},
 )
 

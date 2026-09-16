@@ -1,5 +1,8 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import grpc
 
 from rtp_llm.config.exceptions import (
     AdmissionRejectReason,
@@ -127,6 +130,60 @@ class _FakeInputPB:
 
 
 class MasterClientBatchPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_vit_only_deadline_retries_slave_without_cancelling_admission(self):
+        client = MasterClient(
+            host_service=_FakeHostServiceWithSlave(), master_config=_FakeMasterConfig()
+        )
+        error = grpc.aio.AioRpcError(
+            grpc.StatusCode.DEADLINE_EXCEEDED, (), (), "route timed out"
+        )
+        stub = MagicMock()
+        stub.Schedule = AsyncMock(side_effect=error)
+        client._get_channel = MagicMock()
+        client._close_channel = AsyncMock()
+        client._best_effort_cancel = AsyncMock()
+        with patch("rtp_llm.server.master_client.FlexlbServiceStub", return_value=stub):
+            response = await client.get_backend_role_addrs(
+                block_cache_keys=[],
+                cache_key_block_size=1024,
+                input=_FakeInput(),
+                request_id=100,
+                vit_only=True,
+            )
+        self.assertTrue(response.connection_failed)
+        self.assertEqual(stub.Schedule.await_count, 2)
+        self.assertTrue(
+            all(call.args[0].vit_only for call in stub.Schedule.call_args_list)
+        )
+        client._best_effort_cancel.assert_not_awaited()
+
+    async def test_admission_deadline_remains_terminal(self):
+        client = MasterClient(
+            host_service=_FakeHostServiceWithSlave(), master_config=_FakeMasterConfig()
+        )
+        error = grpc.aio.AioRpcError(
+            grpc.StatusCode.DEADLINE_EXCEEDED, (), (), "admission timed out"
+        )
+        stub = MagicMock()
+        stub.Schedule = AsyncMock(side_effect=error)
+        client._get_channel = MagicMock()
+        client._close_channel = AsyncMock()
+        client._best_effort_cancel = AsyncMock()
+        with patch("rtp_llm.server.master_client.FlexlbServiceStub", return_value=stub):
+            with self.assertRaises(FtRuntimeException) as raised:
+                await client.get_backend_role_addrs(
+                    block_cache_keys=[],
+                    cache_key_block_size=1024,
+                    input=_FakeInput(),
+                    request_id=100,
+                    input_pb=_FakeInputPB(),
+                )
+        self.assertEqual(
+            raised.exception.exception_type, ExceptionType.DEADLINE_EXCEEDED
+        )
+        self.assertEqual(stub.Schedule.await_count, 1)
+        client._best_effort_cancel.assert_awaited_once()
+
     def test_python_reason_enum_matches_schedule_wire_values(self):
         self.assertEqual(
             int(AdmissionRejectReason.UNSPECIFIED),

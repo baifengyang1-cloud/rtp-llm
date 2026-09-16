@@ -354,7 +354,7 @@ class MasterBatchEndToEndPerformanceTest extends FlexLBMockTestBase {
         simulatedStatusThread.setDaemon(true);
         simulatedStatusThread.start();
 
-        RouteService routeService = new RouteService(
+        RouteService routeService = new RouteService(org.mockito.Mockito.mock(org.flexlb.balance.scheduler.DefaultRouter.class),
                 scheduler,
                 new RecentCacheKeyTraceReporter());
 

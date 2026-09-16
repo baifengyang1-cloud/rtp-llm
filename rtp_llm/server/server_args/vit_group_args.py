@@ -3,7 +3,7 @@ import logging
 import os
 
 from rtp_llm.config.py_config_modules import (
-    MM_TRANSPORT_MODE_GRPC,
+    MM_TRANSPORT_MODE_AUTO,
     MM_TRANSPORT_MODES,
     VitConfig,
 )
@@ -166,7 +166,31 @@ def init_vit_group_args(parser, vit_config):
         bind_to=(vit_config, "mm_cache_item_num"),
         type=int,
         default=10,
-        help="多模态开启的Cache的大小",
+        help="旧模型内部按条目缓存的容量；ViT embedding cache 使用 MM_CACHE_GPU_MAX_BYTES 和 MM_CACHE_CPU_MAX_BYTES",
+    )
+    vit_group.add_argument(
+        "--mm_cache_gpu_max_bytes",
+        env_name="MM_CACHE_GPU_MAX_BYTES",
+        bind_to=(vit_config, "mm_cache_gpu_max_bytes"),
+        type=int,
+        default=VitConfig.DEFAULT_MM_CACHE_GPU_MAX_BYTES,
+        help="每个ViT进程的GPU embedding缓存容量，单位bytes，默认20GiB，0关闭GPU驻留；淘汰时下放CPU",
+    )
+    vit_group.add_argument(
+        "--mm_cache_cpu_max_bytes",
+        env_name="MM_CACHE_CPU_MAX_BYTES",
+        bind_to=(vit_config, "mm_cache_cpu_max_bytes"),
+        type=int,
+        default=VitConfig.DEFAULT_MM_CACHE_CPU_MAX_BYTES,
+        help="每个ViT进程的CPU embedding缓存容量，单位bytes，默认200GiB，0关闭CPU驻留；命中时恢复原设备",
+    )
+    vit_group.add_argument(
+        "--mm_hash_key_cache_max_bytes",
+        env_name="MM_HASH_KEY_CACHE_MAX_BYTES",
+        bind_to=(vit_config, "mm_hash_key_cache_max_bytes"),
+        type=int,
+        default=VitConfig.DEFAULT_MM_HASH_KEY_CACHE_MAX_BYTES,
+        help="每个ViT进程的CPU hash缓存容量，单位bytes，包含hash张量和key元数据，0关闭",
     )
     vit_group.add_argument(
         "--url_cache_item_num",
@@ -223,6 +247,22 @@ def init_vit_group_args(parser, vit_config):
         type=int,
         default=4,
         help="多模态预处理时最大线程数量",
+    )
+    vit_group.add_argument(
+        "--vit_concurrency",
+        env_name="VIT_CONCURRENCY",
+        bind_to=(vit_config, "vit_concurrency"),
+        type=int,
+        default=64,
+        help="ViT 异步计算的最大并发数",
+    )
+    vit_group.add_argument(
+        "--vit_max_queue_size",
+        env_name="VIT_MAX_QUEUE_SIZE",
+        bind_to=(vit_config, "vit_max_queue_size"),
+        type=int,
+        default=64,
+        help="ViT 异步计算等待队列的最大任务数",
     )
     vit_group.add_argument(
         "--biencoder_preprocess",
@@ -297,8 +337,8 @@ def init_vit_group_args(parser, vit_config):
         bind_to=(transport_config, "mode"),
         type=_convert_mm_transport_mode,
         choices=list(MM_TRANSPORT_MODES),
-        default=MM_TRANSPORT_MODE_GRPC,
-        help="多模态输出传输模式：grpc 使用内联传输，rdma 强制使用 RDMA 且失败时直接报错",
+        default=MM_TRANSPORT_MODE_AUTO,
+        help="多模态输出传输模式：auto 优先 RDMA 并在失败时回退 gRPC，grpc 使用内联传输，rdma 强制使用 RDMA 且失败时直接报错",
     )
     vit_group.add_argument(
         "--mm_rdma_bind_ip",

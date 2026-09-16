@@ -211,7 +211,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     // extra-input (model-specific, treated as opaque flat 1-D tensors) per-tensor element count
     torch::Tensor mm_extra_input_shape_t;
     int64_t*      mm_extra_input_shape_ptr = nullptr;
-    auto checkedHint = [&](GptModelInputIndex index, const char* name) -> int64_t {
+    auto          checkedHint              = [&](GptModelInputIndex index, const char* name) -> int64_t {
         const auto value = shape_hints_ptr[index];
         RTP_LLM_CHECK_WITH_INFO(
             value >= 0, "tpSyncModelInputs received negative %s shape hint: %lld", name, static_cast<long long>(value));
@@ -325,16 +325,16 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         };
 
         inputs.combo_tokens     = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                       {checkedHint(GptModelInputIndex::comboTokens, "comboTokens")},
+                                           {checkedHint(GptModelInputIndex::comboTokens, "comboTokens")},
                                        pickAlloc(GptModelInputDeviceBit::kDeviceBitComboTokens));
         inputs.input_lengths    = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                        {checkedHint(GptModelInputIndex::inputLengths, "inputLengths")},
+                                           {checkedHint(GptModelInputIndex::inputLengths, "inputLengths")},
                                         pickAlloc(GptModelInputDeviceBit::kDeviceBitInputLengths));
         inputs.sequence_lengths = allocBuf(rtp_llm::DataType::TYPE_INT32,
                                            {checkedHint(GptModelInputIndex::sequenceLengths, "sequenceLengths")},
                                            pickAlloc(GptModelInputDeviceBit::kDeviceBitSequenceLengths));
         inputs.prefix_lengths   = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                         {context_batch_size},
+                                           {context_batch_size},
                                          pickAlloc(GptModelInputDeviceBit::kDeviceBitPrefixLengths));
         if (max_kernel_blocks != 0) {
             // kv_cache_kernel_block_id residency follows the producer (rank 0): device only when
@@ -378,7 +378,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
                                                 {request_length},
                                                 pickAlloc(GptModelInputDeviceBit::kDeviceBitRequestPdSeparation));
         inputs.lm_output_indexes     = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                            {checkedHint(GptModelInputIndex::lmOutputIndexes, "lmOutputIndexes")},
+                                                {checkedHint(GptModelInputIndex::lmOutputIndexes, "lmOutputIndexes")},
                                             pickAlloc(GptModelInputDeviceBit::kDeviceBitLmOutputIndexes));
         if (combo_position_ids_size) {
             inputs.combo_position_ids = allocBuf(rtp_llm::DataType::TYPE_INT32,
@@ -407,11 +407,15 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
             inputs.text_tokens_mask = allocBuf(rtp_llm::DataType::TYPE_INT32,
                                                {text_tokens_mask_size},
                                                pickAlloc(GptModelInputDeviceBit::kDeviceBitTextTokensMask));
+        } else {
+            inputs.text_tokens_mask = torch::Tensor();
         }
         if (mm_features_locs_size) {
             inputs.mm_features_locs = allocBuf(rtp_llm::DataType::TYPE_INT32,
                                                {mm_features_locs_size},
                                                pickAlloc(GptModelInputDeviceBit::kDeviceBitMmFeaturesLocs));
+        } else {
+            inputs.mm_features_locs = torch::Tensor();
         }
         if (mm_features_num) {
             std::vector<torch::Tensor> mm_features;
@@ -423,6 +427,9 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
                 mm_features.emplace_back(allocBuf(mm_data_type, {mm_rows, mm_cols}, rtp_llm::AllocationType::DEVICE));
             }
             inputs.multimodal_features = std::move(mm_features);
+        } else {
+            // MTP can remove the last feature between target and draft prefill.
+            inputs.multimodal_features.reset();
         }
         if (mm_extra_input_num) {
             std::vector<torch::Tensor> mm_extra_input;
@@ -433,6 +440,8 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
                     allocBuf(extra_data_type, {mm_extra_input_shape_ptr[i]}, rtp_llm::AllocationType::DEVICE));
             }
             inputs.mm_extra_input = std::move(mm_extra_input);
+        } else {
+            inputs.mm_extra_input.reset();
         }
     }
 

@@ -4,6 +4,7 @@
 // data plane.
 
 #include <chrono>
+#include <grpcpp/server_context.h>
 #include <memory>
 #include <string>
 #include <utility>
@@ -17,8 +18,8 @@
 namespace rtp_llm {
 
 // Keep the direct client and ViT proxy defaults aligned: 120s worker budget plus 5s margin.
-constexpr int64_t kDefaultVitRpcTimeoutMs  = 125 * 1000;
-constexpr int64_t kVitRpcTimeoutMarginMs   = 5 * 1000;
+constexpr int64_t kDefaultVitRpcTimeoutMs = 125 * 1000;
+constexpr int64_t kVitRpcTimeoutMarginMs  = 5 * 1000;
 
 inline constexpr const char* kMetricSourceInferenceClient = "inference_client";
 
@@ -30,7 +31,8 @@ int64_t resolveRpcTimeoutMs(const MultimodalInputsPB& request,
 // Shared deadline for RPC, RDMA reads, release and fallback.
 class DeadlineBudget {
 public:
-    explicit DeadlineBudget(int64_t total_ms):
+    explicit DeadlineBudget(int64_t total_ms, grpc::ServerContext* server_context = nullptr):
+        server_context_(server_context),
         deadline_(std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms)) {}
 
     int64_t remainingMs() const {
@@ -42,7 +44,12 @@ public:
         return remainingMs() <= 0;
     }
 
+    grpc::ServerContext* serverContext() const {
+        return server_context_;
+    }
+
 private:
+    grpc::ServerContext*                  server_context_;
     std::chrono::steady_clock::time_point deadline_;
 };
 
@@ -95,12 +102,16 @@ public:
         return result;
     }
 
-    static ConsumeResult failure(ErrorInfo error) {
+    static ConsumeResult failure(ErrorInfo error, bool retryable = false) {
         ConsumeResult result;
-        result.error_ = std::move(error);
+        result.error_     = std::move(error);
+        result.retryable_ = retryable;
         return result;
     }
 
+    bool retryable() const {
+        return retryable_;
+    }
     bool succeeded() const {
         return succeeded_;
     }
@@ -113,6 +124,7 @@ public:
 
 private:
     bool             succeeded_ = false;
+    bool             retryable_ = false;
     MultimodalOutput output_;
     ErrorInfo        error_;
 };
@@ -160,17 +172,20 @@ public:
 class MMRemoteOutputTransport {
 public:
     MMRemoteOutputTransport(std::vector<std::unique_ptr<MMReceiptReader>> readers,
-                            std::unique_ptr<MMTerminalReceiptReader>     terminal,
-                            std::unique_ptr<MMControlClient>             control,
+                            std::unique_ptr<MMTerminalReceiptReader>      terminal,
+                            std::unique_ptr<MMControlClient>              control,
                             int64_t default_rpc_timeout_ms = kDefaultVitRpcTimeoutMs,
-                            int64_t rpc_timeout_margin_ms  = kVitRpcTimeoutMarginMs):
+                            int64_t rpc_timeout_margin_ms  = kVitRpcTimeoutMarginMs,
+                            bool    allow_fallback         = false):
         readers_(std::move(readers)),
         terminal_(std::move(terminal)),
         control_(std::move(control)),
         default_rpc_timeout_ms_(default_rpc_timeout_ms),
-        rpc_timeout_margin_ms_(rpc_timeout_margin_ms) {}
+        rpc_timeout_margin_ms_(rpc_timeout_margin_ms),
+        allow_fallback_(allow_fallback) {}
 
-    ErrorResult<MultimodalOutput> fetch(const std::string& endpoint, MultimodalInputsPB& request_pb);
+    ErrorResult<MultimodalOutput>
+    fetch(const std::string& endpoint, MultimodalInputsPB& request_pb, grpc::ServerContext* server_context = nullptr);
 
 private:
     // nullptr means the receipt is inline.
@@ -181,6 +196,7 @@ private:
     std::unique_ptr<MMControlClient>              control_;
     int64_t                                       default_rpc_timeout_ms_;
     int64_t                                       rpc_timeout_margin_ms_;
+    bool                                          allow_fallback_;
 };
 
 }  // namespace rtp_llm

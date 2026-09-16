@@ -98,6 +98,8 @@ class ServerStatus(BaseModel):
     server_ip: str
     http_port: int
     grpc_port: int
+    group: Optional[str] = None
+    worker_instance: Optional[str] = None
     debug_info: Optional[DebugInfo] = None
 
     @field_validator("role", mode="before")

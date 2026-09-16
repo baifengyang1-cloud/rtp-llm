@@ -11,23 +11,30 @@
 
 namespace rtp_llm {
 
-std::unique_ptr<MMRemoteOutputTransport>
-createMMRemoteOutputTransport(const MMTransportConfig&     transport_config,
-                              kmonitor::MetricsReporterPtr reporter,
-                              int                          device_id) {
-    const auto mode = validateMMTransportMode(transport_config.mode);
-    auto metrics = std::make_shared<const MMTransportMetrics>(std::move(reporter));
+std::unique_ptr<MMRemoteOutputTransport> createMMRemoteOutputTransport(const MMTransportConfig&     transport_config,
+                                                                       kmonitor::MetricsReporterPtr reporter,
+                                                                       int                          device_id) {
+    const auto mode    = validateMMTransportMode(transport_config.mode);
+    auto       metrics = std::make_shared<const MMTransportMetrics>(std::move(reporter));
 
     std::vector<std::unique_ptr<MMReceiptReader>> readers;
-    if (mode == kMMTransportModeRdma) {
-        auto reader = rdma_transport::createRdmaRead(transport_config.rdma, device_id);
-        if (reader == nullptr) {
-            throw std::runtime_error("failed to initialize RDMA reader for multimodal output transport");
+    std::shared_ptr<rdma_transport::RdmaRead>     reader;
+    if (mode != kMMTransportModeGrpc) {
+        try {
+            reader = rdma_transport::createRdmaRead(transport_config.rdma, device_id);
+            if (reader == nullptr) {
+                throw std::runtime_error("failed to initialize RDMA reader for multimodal output transport");
+            }
+        } catch (const std::exception& error) {
+            if (mode == kMMTransportModeRdma) {
+                throw;
+            }
+            RTP_LLM_LOG_WARNING("RDMA initialization failed; using inline gRPC: %s", error.what());
         }
-        RTP_LLM_LOG_INFO("mm transport mode=rdma: reader initialized");
+    }
+    if (reader != nullptr) {
         readers.push_back(std::make_unique<MMRdmaReader>(std::move(reader), transport_config.rdma));
     } else {
-        RTP_LLM_LOG_INFO("mm transport mode=grpc: rdma disabled, use inline grpc");
         readers.push_back(createMMRdmaReader(nullptr));
     }
 
@@ -36,7 +43,8 @@ createMMRemoteOutputTransport(const MMTransportConfig&     transport_config,
         createGrpcInlineReceiptReader(),
         createGrpcMMControlClient(metrics, transport_config.control.release_timeout_ms),
         transport_config.default_rpc_timeout_ms,
-        transport_config.rpc_timeout_margin_ms);
+        transport_config.rpc_timeout_margin_ms,
+        mode == kMMTransportModeAuto);
 }
 
 }  // namespace rtp_llm

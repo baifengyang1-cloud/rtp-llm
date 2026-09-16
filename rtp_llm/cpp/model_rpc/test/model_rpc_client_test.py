@@ -3,7 +3,8 @@ import json
 import struct
 import sys
 from enum import Enum
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Mock the ops module to avoid CUDA dependency in this unit test
 # This MUST be at the very top before any other imports, even before unittest
@@ -53,6 +54,7 @@ from rtp_llm.cpp.model_rpc.model_rpc_client import (
     ModelRpcClient,
     StreamState,
     _engine_reported_finished,
+    _make_multimodal_inputs_pb,
     _record_client_span_latency,
     _record_client_span_usage,
     _request_completed_normally,
@@ -198,6 +200,60 @@ def _decode_role_addr(ip="decode", grpc_port=9001):
 
 
 class ModelRpcClientTest(TestCase):
+    def test_multimodal_rpc_request_keeps_request_id(self):
+        input_pb = GenerateInputPB(request_id=987654321)
+        input_pb.multimodal_inputs.add().multimodal_url = "image://test"
+
+        mm_inputs_pb = _make_multimodal_inputs_pb(input_pb)
+
+        self.assertEqual(mm_inputs_pb.request_id, 987654321)
+        self.assertEqual(
+            mm_inputs_pb.multimodal_inputs[0].multimodal_url, "image://test"
+        )
+
+    def test_trans_input_keeps_fractional_fps_and_max_long_side(self):
+        preprocess_config = SimpleNamespace(
+            width=-1,
+            height=-1,
+            min_pixels=-1,
+            max_pixels=-1,
+            fps=0.2,
+            min_frames=-1,
+            max_frames=-1,
+            crop_positions=[],
+            mm_timeout_ms=-1,
+            max_long_side_pixel=1008,
+        )
+        mm_input = SimpleNamespace(
+            url="https://example.com/video.mp4",
+            mm_type=2,
+            mm_preprocess_config=preprocess_config,
+        )
+
+        input_pb = trans_input(
+            GenerateInput(
+                token_ids=torch.tensor([1]),
+                generate_config=GenerateConfig(),
+                request_id=1,
+                mm_inputs=[mm_input],
+            )
+        )
+        config_pb = input_pb.multimodal_inputs[0].mm_preprocess_config
+        self.assertAlmostEqual(config_pb.fps, 0.2)
+        self.assertEqual(config_pb.max_long_side_pixel, 1008)
+
+        input_pb = trans_input(
+            GenerateInput(
+                token_ids=torch.tensor([1]),
+                generate_config=GenerateConfig(fps=1, max_long_side_pixel=784),
+                request_id=2,
+                mm_inputs=[mm_input],
+            )
+        )
+        config_pb = input_pb.multimodal_inputs[0].mm_preprocess_config
+        self.assertAlmostEqual(config_pb.fps, 1.0)
+        self.assertEqual(config_pb.max_long_side_pixel, 784)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         # self.client = FakeModelRpcClient()
@@ -638,6 +694,51 @@ class ModelRpcClientTest(TestCase):
         start_span.assert_called_once_with(
             "rtp_llm.generate_stream_call", "worker:9000"
         )
+
+    def test_multimodal_gate_runs_only_before_direct_admission(self):
+        for enqueued_by_master in (False, True):
+            with self.subTest(enqueued_by_master=enqueued_by_master):
+                client = ModelRpcClient(
+                    addresses=["worker:9000"],
+                    client_config={},
+                    max_rpc_timeout_ms=0,
+                    decode_entrance=False,
+                )
+                client._channel_pool = _FakeChannelPool()
+                client._wait_greennet_verdict = AsyncMock()
+                stub = _RoutingStub(
+                    fetch_responses=[_make_response(finished=True)],
+                    generate_responses=[_make_response(finished=True)],
+                )
+                input_py = GenerateInput(
+                    token_ids=torch.tensor([1, 2, 3]),
+                    generate_config=GenerateConfig(
+                        timeout_ms=1000,
+                        role_addrs=[_prefill_role_addr("worker", 9000)],
+                    ),
+                    request_id=326,
+                    mm_inputs=[],
+                    enqueued_by_master=enqueued_by_master,
+                )
+                input_pb = GenerateInputPB(request_id=326)
+                input_pb.multimodal_inputs.add()
+                with patch(
+                    "rtp_llm.cpp.model_rpc.model_rpc_client.RpcServiceStub",
+                    return_value=stub,
+                ), patch(
+                    "rtp_llm.cpp.model_rpc.model_rpc_client.trans_input",
+                    return_value=input_pb,
+                ):
+                    responses = asyncio.run(self._run(client, input_py))
+                self.assertEqual(len(responses), 1)
+                if enqueued_by_master:
+                    client._wait_greennet_verdict.assert_not_awaited()
+                    self.assertEqual(len(stub.fetch_calls), 1)
+                else:
+                    client._wait_greennet_verdict.assert_awaited_once_with(
+                        input_py, input_pb
+                    )
+                    self.assertEqual(len(stub.generate_calls), 1)
 
     def test_enqueue_cancels_fetch_stream_on_early_close(self):
         async def run_and_close():

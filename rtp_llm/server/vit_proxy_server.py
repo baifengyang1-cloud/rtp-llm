@@ -1,3 +1,5 @@
+from rtp_llm.server.vit_rpc_constants import VIT_ERROR_REPORTED_METADATA_KEY
+
 """
 VIT Proxy Server - 主进程代理服务器
 负责接收外部请求并分发到工作进程，解决 SO_REUSEPORT 流量打偏问题
@@ -363,9 +365,7 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
         self.connection_pool = connection_pool
         self.default_rpc_timeout_seconds = default_rpc_timeout_seconds
         self.profiler = MMProfiler()
-        self._transport_router = MMOutputProxyRouter(
-            connection_pool, transport_config
-        )
+        self._transport_router = MMOutputProxyRouter(connection_pool, transport_config)
         kmonitor.init()
         self._status_probes: dict[str, _WorkerStatusProbe] = {}
         self._status_probes_lock = threading.Lock()
@@ -406,6 +406,93 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
             context.set_code(code)
             context.set_details(details)
         raise error
+
+    def _decrement_connections(
+        self, worker_address: Optional[str], report_error: bool = True
+    ) -> None:
+        """Release a proxy worker slot without hiding the request outcome."""
+        if not worker_address:
+            return
+        try:
+            self.load_balancer.decrement_connections(worker_address)
+        except Exception:
+            # A bookkeeping failure must still be observable, but it should
+            # not replace an RPC error that is already being propagated.
+            if report_error:
+                _report_vit_error_qps()
+            logging.exception(
+                "Failed to decrement proxy connection count for worker %s",
+                worker_address,
+            )
+
+    def WaitGreenNetVerdict(self, request: MultimodalInputsPB, context) -> EmptyPB:
+        """Forward the prefill-side GreenNet gate to one VIT worker.
+
+        This RPC is part of the multimodal service contract. Leaving the
+        generated UNIMPLEMENTED fallback in the proxy turns a valid GreenNet
+        rejection or worker failure into an unobserved proxy error.
+        """
+        worker_address = None
+        request_failed = False
+        try:
+            worker_address = self.load_balancer.get_worker()
+            self.load_balancer.increment_connections(worker_address)
+            stub = self.connection_pool.get_stub(worker_address)
+            timeout_s = _resolve_rpc_timeout_seconds(
+                request, self.default_rpc_timeout_seconds
+            )
+            worker_call = stub.WaitGreenNetVerdict.future(request, timeout=timeout_s)
+            if not context.add_callback(worker_call.cancel):
+                worker_call.cancel()
+            return worker_call.result()
+        except grpc.RpcError as error:
+            request_failed = True
+            logging.error(
+                "RPC error when forwarding GreenNet verdict to worker %s: " "%s - %s",
+                worker_address,
+                error.code(),
+                error.details(),
+            )
+            _report_vit_error_qps(error)
+            _forward_worker_error_metadata(context, error)
+            context.abort(error.code(), error.details())
+        except Exception as error:
+            request_failed = True
+            logging.error(
+                "Error forwarding GreenNet verdict to worker %s: %s",
+                worker_address,
+                error,
+            )
+            _report_vit_error_qps(error)
+            raise
+        finally:
+            self._decrement_connections(worker_address, report_error=not request_failed)
+
+    def AsyncSubmitEmbedding(self, request: MultimodalInputsPB, context) -> EmptyPB:
+        worker_address = None
+        request_failed = False
+        try:
+            worker_address = self.load_balancer.get_worker()
+            self.load_balancer.increment_connections(worker_address)
+            stub = self.connection_pool.get_stub(worker_address)
+            return stub.AsyncSubmitEmbedding(request, timeout=5.0)
+        except grpc.RpcError as e:
+            request_failed = True
+            logging.error(
+                f"RPC error when forwarding AsyncSubmit to worker {worker_address}: {e.code()} - {e.details()}"
+            )
+            _report_vit_error_qps(e)
+            _forward_worker_error_metadata(context, e)
+            context.abort(e.code(), e.details())
+        except Exception as e:
+            request_failed = True
+            logging.error(
+                f"Error forwarding AsyncSubmit to worker {worker_address}: {e}"
+            )
+            _report_vit_error_qps(e)
+            raise
+        finally:
+            self._decrement_connections(worker_address, report_error=not request_failed)
 
     def RemoteMultimodalEmbedding(
         self, request: MultimodalInputsPB, context
@@ -491,9 +578,15 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
                         f"timeout: {attempt_timeout_s}s"
                     )
                     worker_rpc_start_us = _now_us()
-                    response = stub.RemoteMultimodalEmbedding(
+                    worker_call = stub.RemoteMultimodalEmbedding.future(
                         request, timeout=attempt_timeout_s
                     )
+                    if not context.add_callback(worker_call.cancel):
+                        worker_call.cancel()
+                        context.abort(
+                            grpc.StatusCode.CANCELLED, "VIT request cancelled"
+                        )
+                    response = worker_call.result()
                     self.load_balancer.set_worker_alive(worker_address, True)
                     self._transport_router.record_receipt(worker_address, response)
                     kmonitor.report(
@@ -715,9 +808,7 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
         for probe in probes:
             probe.cancel()
 
-    def ReleaseRdmaLease(
-        self, request: ReleaseLeasePB, context
-    ) -> EmptyPB:
+    def ReleaseRdmaLease(self, request: ReleaseLeasePB, context) -> EmptyPB:
         self._transport_router.release(request, context)
         return EmptyPB()
 
@@ -881,3 +972,41 @@ class VitProxyServer:
         """等待服务器终止"""
         if self.rpc_server:
             self.rpc_server.wait_for_termination()
+
+
+def _worker_already_reported_vit_error(error: Optional[BaseException]) -> bool:
+    if error is None:
+        return False
+    try:
+        metadata = error.trailing_metadata()
+    except Exception:
+        return False
+    return any(
+        key == VIT_ERROR_REPORTED_METADATA_KEY and value in ("1", b"1")
+        for key, value in (metadata or ())
+    )
+
+
+def _forward_worker_error_metadata(context, error: BaseException) -> None:
+    """Forward public worker error details without exposing the dedupe marker."""
+    try:
+        metadata = error.trailing_metadata()
+    except Exception:
+        return
+    public_metadata = tuple(
+        (key, value)
+        for key, value in (metadata or ())
+        if key != VIT_ERROR_REPORTED_METADATA_KEY
+    )
+    if public_metadata:
+        context.set_trailing_metadata(public_metadata)
+
+
+def _report_vit_error_qps(error: Optional[BaseException] = None) -> None:
+    if _worker_already_reported_vit_error(error):
+        return
+    try:
+        kmonitor.report(AccMetrics.VIT_ERROR_QPS_METRIC, 1)
+    except Exception:
+        # Telemetry failures must not hide the original RPC failure.
+        logging.exception("Failed to report ViT error QPS")

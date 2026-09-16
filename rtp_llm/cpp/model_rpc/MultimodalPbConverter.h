@@ -12,10 +12,12 @@ namespace rtp_llm {
 
 class MultimodalPbConverter {
 public:
-    static MultimodalInputsPB inputsToPb(const std::vector<MultimodalInput>& mm_inputs);
+    static MultimodalInputsPB inputsToPb(const std::vector<MultimodalInput>& mm_inputs, int64_t request_id = 0);
 
     // Decode and validate an inline response.
     static ErrorResult<MultimodalOutput> inlineOutputFromPb(const MultimodalOutputPB& output_pb);
+
+    static ErrorInfo attachFeatureHashes(const MultimodalOutputPB& output_pb, MultimodalOutput& output);
 
 private:
     static void preprocessConfigToPb(MMPreprocessConfigPB* config_pb, const MMPreprocessConfig& config);

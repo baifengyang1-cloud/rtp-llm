@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import IntEnum
 from functools import cache
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -28,11 +28,14 @@ from rtp_llm.dash_sc.structural_tag import (
     structural_tag_from_response_format,
     validate_structural_tag_shape,
 )
-from rtp_llm.utils.base_model_datatypes import GenerateOutput, GenerateOutputs
+from rtp_llm.utils.base_model_datatypes import (
+    GenerateOutput,
+    GenerateOutputs,
+    MMUrlType,
+)
 
 if TYPE_CHECKING:
     from rtp_llm.config.generate_config import GenerateConfig
-    from rtp_llm.utils.base_model_datatypes import MMUrlType
 
 _INT32_MIN = -2_147_483_648
 _INT32_MAX = 2_147_483_647
@@ -1077,7 +1080,6 @@ def parse_dash_sc_grpc_request(
 def _multimodal_type_maps() -> (
     tuple[dict[str, tuple[str, MMUrlType]], dict[str, MMUrlType]]
 ):
-    from rtp_llm.utils.base_model_datatypes import MMUrlType
 
     return (
         {
@@ -1093,14 +1095,21 @@ def _multimodal_type_maps() -> (
     )
 
 
+_MULTIMODAL_USAGE_FIELDS = (
+    (MMUrlType.IMAGE, "image_tokens"),
+    (MMUrlType.VIDEO, "video_tokens"),
+    (MMUrlType.AUDIO, "audio_tokens"),
+)
+
 _MULTIMODAL_PARAMETER_KEYS: tuple[str, ...] = ("payload", "__messages__")
 _PER_PART_CONFIG_INT_KEYS: tuple[str, ...] = (
     "min_pixels",
     "max_pixels",
-    "fps",
+    "max_long_side_pixel",
     "max_frames",
     "min_frames",
 )
+_PER_PART_CONFIG_FLOAT_KEYS: tuple[str, ...] = ("fps",)
 
 
 @dataclass(frozen=True)
@@ -1111,7 +1120,8 @@ class MultimodalPart:
     mm_type: MMUrlType
     min_pixels: int = -1
     max_pixels: int = -1
-    fps: int = -1
+    max_long_side_pixel: int = -1
+    fps: float = -1.0
     max_frames: int = -1
     min_frames: int = -1
 
@@ -1137,6 +1147,14 @@ def _extract_per_part_config(part: dict[str, Any]) -> dict[str, int]:
                 and value > 0
             ):
                 out[key] = int(value)
+        for key in _PER_PART_CONFIG_FLOAT_KEYS:
+            value = nested.get(key)
+            if (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and value > 0
+            ):
+                out[key] = float(value)
     for key in _PER_PART_CONFIG_INT_KEYS:
         value = part.get(key)
         if (
@@ -1145,6 +1163,14 @@ def _extract_per_part_config(part: dict[str, Any]) -> dict[str, int]:
             and value > 0
         ):
             out[key] = int(value)
+    for key in _PER_PART_CONFIG_FLOAT_KEYS:
+        value = part.get(key)
+        if (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and value > 0
+        ):
+            out[key] = float(value)
     return out
 
 
@@ -1429,6 +1455,20 @@ def _append_prompt_cache_usage_parameters(
     infer.parameters["prompt_cached_token_num"].int64_param = cached_tokens
 
 
+def _append_multimodal_usage(
+    infer: predict_v2_pb2.ModelInferResponse,
+    multimodal_lengths: dict[int, int] | None,
+) -> None:
+    if not multimodal_lengths:
+        return
+
+    for mm_type, field_name in _MULTIMODAL_USAGE_FIELDS:
+        token_count = int(multimodal_lengths.get(mm_type, 0) or 0)
+        if token_count <= 0:
+            continue
+        infer.parameters[field_name].int64_param = token_count
+
+
 def _append_aux_info_metrics_outputs(
     infer: predict_v2_pb2.ModelInferResponse,
     out_py: GenerateOutput,
@@ -1441,6 +1481,10 @@ def _append_aux_info_metrics_outputs(
     _append_int32_scalar_output(infer, "prompt_token_num", input_len)
     _append_int32_scalar_output(infer, "prompt_cached_token_num", reuse_len)
     _append_prompt_cache_usage_parameters(infer, input_len, reuse_len)
+    _append_multimodal_usage(
+        infer,
+        ax.multimodal_lengths if ax is not None else None,
+    )
 
 
 def build_stream_response_from_generate_outputs(

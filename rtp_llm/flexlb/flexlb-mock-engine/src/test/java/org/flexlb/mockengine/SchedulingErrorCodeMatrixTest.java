@@ -260,7 +260,7 @@ class SchedulingErrorCodeMatrixTest {
             config.getDispatcher().setMaxInflightPerPrefillWorker(prefillCapacity);
             harness = new AutoTpmE2EHarness(61_500, 1, 1, "1", 1.0, true,
                     false, decision, true, config);
-            service = new RouteService(harness.scheduler, mock(RecentCacheKeyTraceReporter.class));
+            service = new RouteService(org.mockito.Mockito.mock(org.flexlb.balance.scheduler.DefaultRouter.class), harness.scheduler, mock(RecentCacheKeyTraceReporter.class));
         }
 
         BalanceContext context() { return harness.context(REQUEST_ID, 50); }

@@ -1,3 +1,5 @@
+import logging
+import threading
 import time
 from concurrent import futures
 
@@ -12,6 +14,7 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
     CacheStatusPB,
     CacheVersionPB,
     EmptyPB,
+    ErrorDetailsPB,
     MultimodalInputsPB,
     ReleaseLeasePB,
     StatusVersionPB,
@@ -29,7 +32,13 @@ from rtp_llm.multimodal.mm_scheduler import (
     MMSchedulerRequestTooLargeError,
     MMSchedulerTimeoutError,
 )
+from rtp_llm.multimodal.multimodal_util import (
+    add_multimodal_feature_hashes,
+    build_multimodal_output_pb,
+    trans_mm_input,
+)
 from rtp_llm.multimodal.transport import create_mm_output_transport
+from rtp_llm.server.vit_rpc_constants import VIT_ERROR_REPORTED_METADATA_KEY
 
 
 def _now_us() -> int:
@@ -49,6 +58,8 @@ _EXCEPTION_CATEGORY_TO_GRPC_STATUS = {
 def _grpc_status_for_runtime_exception(
     error: FtRuntimeException,
 ) -> grpc.StatusCode:
+    if error.exception_type == ExceptionType.UNSAFE_INPUT_CONTENT:
+        return grpc.StatusCode.PERMISSION_DENIED
     return _EXCEPTION_CATEGORY_TO_GRPC_STATUS.get(
         error.exception_type.category, grpc.StatusCode.INTERNAL
     )
@@ -56,6 +67,43 @@ def _grpc_status_for_runtime_exception(
 
 def _runtime_exception_reason(error: FtRuntimeException) -> str:
     return f"runtime_{error.exception_type.category.value}"
+
+
+def merge_embedding_results(results: list[MMEmbeddingRes]) -> MMEmbeddingRes:
+    embeddings, position_ids, extra_input = [], [], []
+    hashes = [] if all(res.feature_hashes is not None for res in results) else None
+    for res in results:
+        embeddings.extend(res.embeddings)
+        if res.position_ids:
+            position_ids.extend(res.position_ids)
+        if res.extra_input:
+            extra_input.extend(res.extra_input)
+        if hashes is not None:
+            hashes.extend(res.feature_hashes)
+    return MMEmbeddingRes(embeddings, position_ids or None, extra_input or None, hashes)
+
+
+def _mark_vit_error_reported(context, status_details=None) -> None:
+    """Tell an optional proxy that the worker already counted this error."""
+    metadata = [(VIT_ERROR_REPORTED_METADATA_KEY, "1")]
+    if status_details is not None:
+        metadata.insert(0, ("grpc-status-details-bin", status_details))
+    try:
+        context.set_trailing_metadata(tuple(metadata))
+    except Exception:
+        # Metadata is only for metric de-duplication; never mask the request
+        # failure if a custom gRPC context rejects it.
+        logging.exception("Failed to attach ViT error metadata")
+
+
+def _abort_ft_runtime(context, error: FtRuntimeException) -> None:
+    details = ErrorDetailsPB(
+        error_code=int(error.exception_type),
+        error_message=error.message,
+    )
+    _mark_vit_error_reported(context, details.SerializeToString())
+    status = _grpc_status_for_runtime_exception(error)
+    context.abort(status, f"[{error.exception_type.name}] {error.message}")
 
 
 class MultimodalRpcServer(MultimodalRpcServiceServicer):
@@ -66,9 +114,98 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
         local_device_id: int = 0,
     ):
         self.engine = mm_process_engine
-        self._transport = create_mm_output_transport(
-            transport_config, local_device_id
-        )
+        self._transport = create_mm_output_transport(transport_config, local_device_id)
+
+    def _register_queue_cancellation(self, request_id: int, context):
+        rpc_done = threading.Event()
+
+        def cancel_queued_work() -> None:
+            rpc_done.set()
+            try:
+                self.engine.cancel_queued_request(request_id)
+            except Exception as error:
+                # Cancellation runs in gRPC's callback thread, after the
+                # handler may have returned; report failures here as well.
+                self.engine.report_vit_error(error)
+                logging.exception("Failed to cancel queued ViT work")
+
+        if not context.add_callback(cancel_queued_work):
+            cancel_queued_work()
+        return rpc_done
+
+    def AsyncSubmitEmbedding(self, multimodal_inputs: MultimodalInputsPB, context):
+        try:
+            converted_inputs = trans_mm_input(multimodal_inputs)
+            self.engine.async_submit(converted_inputs, multimodal_inputs.request_id)
+            return EmptyPB()
+        except FtRuntimeException as error:
+            self.engine.report_vit_error(error)
+            _abort_ft_runtime(context, error)
+        except Exception as error:
+            self.engine.report_vit_error(error)
+            _mark_vit_error_reported(context)
+            logging.exception("AsyncSubmitEmbedding failed")
+            context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"[MM_PROCESS_ERROR] {type(error).__name__}: {error}",
+            )
+
+    def WaitGreenNetVerdict(self, multimodal_inputs: MultimodalInputsPB, context):
+        """Start missing work and block until GreenNet decides for all inputs."""
+        verdict = None
+        try:
+            converted_inputs = trans_mm_input(multimodal_inputs)
+            cancellation_event = self._register_queue_cancellation(
+                multimodal_inputs.request_id, context
+            )
+            verdict = self.engine.wait_greennet_verdict(
+                converted_inputs,
+                request_id=multimodal_inputs.request_id,
+                cancellation_event=cancellation_event,
+            )
+            if verdict is None:
+                raise RuntimeError("ViT GreenNet returned no verdict")
+        except FtRuntimeException as error:
+            self.engine.report_vit_error(error)
+            _abort_ft_runtime(context, error)
+            return EmptyPB()
+        except Exception as error:
+            self.engine.report_vit_error(error)
+            _mark_vit_error_reported(context)
+            logging.exception("WaitGreenNetVerdict failed")
+            context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"[MM_PROCESS_ERROR] {type(error).__name__}: {error}",
+            )
+            return EmptyPB()
+
+        try:
+            if not verdict.passed:
+                self.engine.report_vit_error(verdict)
+                error_code = (
+                    ExceptionType.UNSAFE_INPUT_CONTENT
+                    if verdict.code == 2
+                    else ExceptionType.MM_PROCESS_ERROR
+                )
+                details = ErrorDetailsPB(
+                    error_code=int(error_code),
+                    error_message=verdict.message or "data inspection failed",
+                )
+                _mark_vit_error_reported(context, details.SerializeToString())
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details(verdict.message or "data inspection failed")
+        except Exception as error:
+            # A malformed verdict or response-metadata failure is also an
+            # exceptional result and must be visible in the error QPS.
+            self.engine.report_vit_error(error)
+            _mark_vit_error_reported(context)
+            logging.exception("Failed to serialize ViT GreenNet verdict")
+            context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"[MM_PROCESS_ERROR] {type(error).__name__}: {error}",
+            )
+            return EmptyPB()
+        return EmptyPB()
 
     def RemoteMultimodalEmbedding(self, multimodal_inputs: MultimodalInputsPB, context):
         tags = {"source": "vit_server"}
@@ -101,8 +238,17 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 len(multimodal_inputs.multimodal_inputs),
                 tags,
             )
-            res: MMEmbeddingRes = self.engine.mm_embedding_rpc(multimodal_inputs)
+            cancellation_event = self._register_queue_cancellation(
+                multimodal_inputs.request_id, context
+            )
+            results = self.engine.get_embedding_result(
+                trans_mm_input(multimodal_inputs),
+                request_id=multimodal_inputs.request_id,
+                cancellation_event=cancellation_event,
+            )
+            res = merge_embedding_results(results)
             output_pb = self._transport.transfer(multimodal_inputs, res)
+            add_multimodal_feature_hashes(output_pb, res.embeddings, res.feature_hashes)
             kmonitor.report(
                 GaugeMetrics.VIT_RPC_SERVER_HANDLER_RT_US_METRIC,
                 _now_us() - start_us,

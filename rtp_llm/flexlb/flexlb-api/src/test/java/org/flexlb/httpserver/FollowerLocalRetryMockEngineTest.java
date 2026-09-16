@@ -30,7 +30,7 @@ class FollowerLocalRetryMockEngineTest extends FlexLBMockTestBase {
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
     void followerRecoveryDispatchesExactlyOnceToMockEngine(String failure) throws Exception {
         RouteService remoteRoutes = mock(RouteService.class);
-        RouteService localRoutes = new RouteService(scheduler, mock(RecentCacheKeyTraceReporter.class));
+        RouteService localRoutes = new RouteService(org.mockito.Mockito.mock(org.flexlb.balance.scheduler.DefaultRouter.class), scheduler, mock(RecentCacheKeyTraceReporter.class));
         try (Node oldMaster = new Node("10.0.0.1", remoteRoutes);
              Node follower = new Node("10.0.0.2", localRoutes)) {
             when(follower.leadership.getMasterHostIpPort()).thenReturn(oldMaster.httpAddress());

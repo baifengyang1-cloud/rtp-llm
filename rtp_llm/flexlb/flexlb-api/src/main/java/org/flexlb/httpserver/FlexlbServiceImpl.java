@@ -832,6 +832,19 @@ public class FlexlbServiceImpl extends FlexlbServiceGrpc.FlexlbServiceImplBase {
 
         Request request = new Request();
         request.setRequestId(pb.getRequestId());
+        request.setMediaKeys(pb.getMediaKeysList());
+        request.setVitOnly(pb.getVitOnly());
+        if (pb.hasSelectedVit()) {
+            var selected = pb.getSelectedVit();
+            ServerStatus vit = new ServerStatus();
+            vit.setRole(org.flexlb.dao.route.RoleType.VIT);
+            vit.setServerIp(selected.getServerIp());
+            vit.setHttpPort(selected.getHttpPort());
+            vit.setGrpcPort(selected.getGrpcPort());
+            vit.setGroup(selected.getGroup());
+            vit.setWorkerInstance(selected.getWorkerInstance());
+            request.setSelectedVit(vit);
+        }
         request.setBlockCacheKeys(pb.getBlockCacheKeysList());
         request.setSeqLen(pb.getSeqLen());
         // Keep the wire values for transport compatibility and request
@@ -914,6 +927,8 @@ public class FlexlbServiceImpl extends FlexlbServiceGrpc.FlexlbServiceImplBase {
                         .setServerIp(ss.getServerIp() != null ? ss.getServerIp() : "")
                         .setHttpPort(ss.getHttpPort())
                         .setGrpcPort(ss.getGrpcPort())
+                        .setGroup(ss.getGroup() == null ? "" : ss.getGroup())
+                        .setWorkerInstance(ss.getWorkerInstance() == null ? "" : ss.getWorkerInstance())
                         .build());
             }
         }

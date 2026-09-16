@@ -29,6 +29,9 @@ public class ServerStatus {
     @JsonProperty("group")
     private String group;
 
+    @JsonProperty("worker_instance")
+    private String workerInstance;
+
     @JsonProperty("debug_info")
     private DebugInfo debugInfo;
 
@@ -58,6 +61,7 @@ public class ServerStatus {
         copy.dpRank = source.dpRank;
         copy.prefillTime = source.prefillTime;
         copy.group = source.group;
+        copy.workerInstance = source.workerInstance;
         copy.debugInfo = DebugInfo.copyOf(source.debugInfo);
         copy.requestId = source.requestId;
         copy.success = source.success;

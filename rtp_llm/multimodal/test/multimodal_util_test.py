@@ -88,6 +88,18 @@ class TestMultiModalUtil(unittest.TestCase):
         self.assertFalse(response.content_accessed)
         self.assertTrue(response.closed)
 
+    def test_first_reader_cannot_close_or_mutate_cached_payload(self):
+        response = _FakeResponse(content=b"original")
+        with patch(
+            "rtp_llm.multimodal.multimodal_util.request_get", return_value=response
+        ) as download:
+            first = get_bytes_io_from_url("https://example.com/cache-ownership")
+            first.write(b"modified")
+            first.close()
+            second = get_bytes_io_from_url("https://example.com/cache-ownership")
+        self.assertEqual(second.read(), b"original")
+        download.assert_called_once()
+
     def test_http_checks_streamed_body_size(self):
         response = _FakeResponse(
             headers={"Content-Length": "1"},

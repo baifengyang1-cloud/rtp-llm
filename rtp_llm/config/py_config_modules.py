@@ -294,9 +294,14 @@ class DistributeConfig:
 
 
 # Keep these transport defaults aligned with cpp/config/ConfigModules.h::MMTransportConfig.
+MM_TRANSPORT_MODE_AUTO = "auto"
 MM_TRANSPORT_MODE_GRPC = "grpc"
 MM_TRANSPORT_MODE_RDMA = "rdma"
-MM_TRANSPORT_MODES = (MM_TRANSPORT_MODE_GRPC, MM_TRANSPORT_MODE_RDMA)
+MM_TRANSPORT_MODES = (
+    MM_TRANSPORT_MODE_AUTO,
+    MM_TRANSPORT_MODE_GRPC,
+    MM_TRANSPORT_MODE_RDMA,
+)
 DEFAULT_MM_TIMEOUT_MS = 120000
 
 
@@ -319,12 +324,15 @@ class MMControlConfig:
 
 class MMTransportConfig:
     def __init__(self):
-        self.mode: str = MM_TRANSPORT_MODE_GRPC
+        self.mode: str = MM_TRANSPORT_MODE_AUTO
         self.control = MMControlConfig()
         self.rdma = MMRdmaConfig()
 
 
 class VitConfig:
+    DEFAULT_MM_CACHE_GPU_MAX_BYTES = 20 * 1024 * 1024 * 1024
+    DEFAULT_MM_CACHE_CPU_MAX_BYTES = 200 * 1024 * 1024 * 1024
+    DEFAULT_MM_HASH_KEY_CACHE_MAX_BYTES = 256 * 1024 * 1024
     DEFAULT_MM_TIMEOUT_MS: int = DEFAULT_MM_TIMEOUT_MS
     DEFAULT_MM_IMAGE_MAX_FILE_SIZE_KB: int = 100 * 1024
     DEFAULT_MM_VIDEO_MAX_FILE_SIZE_KB: int = 2 * 1024 * 1024
@@ -342,6 +350,11 @@ class VitConfig:
             VitConfig.DEFAULT_MM_VIDEO_MAX_FILE_SIZE_KB
         )
         self.mm_cache_item_num: int = 10
+        self.mm_cache_gpu_max_bytes: int = VitConfig.DEFAULT_MM_CACHE_GPU_MAX_BYTES
+        self.mm_cache_cpu_max_bytes: int = VitConfig.DEFAULT_MM_CACHE_CPU_MAX_BYTES
+        self.mm_hash_key_cache_max_bytes: int = (
+            VitConfig.DEFAULT_MM_HASH_KEY_CACHE_MAX_BYTES
+        )
         self.url_cache_item_num: int = 100
         self.use_igraph_cache: bool = True
         self.igraph_search_dom: str = "com.taobao.search.igraph.common"
@@ -349,6 +362,8 @@ class VitConfig:
         self.igraph_table_name: str = ""
         self.default_key: Optional[str] = None
         self.mm_preprocess_max_workers: int = 4
+        self.vit_concurrency: int = 64
+        self.vit_max_queue_size: int = 64
         self.biencoder_preprocess: bool = False
         self.extra_input_in_mm_embedding = ""
         self.mm_timeout_ms: int = VitConfig.DEFAULT_MM_TIMEOUT_MS
@@ -375,9 +390,9 @@ class VitConfig:
         """Resolved MMScheduler kwargs, inferred from gpu_max_batch_size alone.
 
         gpu_max_batch_size > 1 -> cross-request GPU batching with the gpu_* limits;
-        gpu_max_batch_images then caps both the batch and (since a request is never
-        split) the single-request image count; gpu_batch_wait_ms is the collect
-        window.
+        gpu_max_batch_images caps the batch image count; gpu_batch_wait_ms is
+        the collect window. Models providing work estimates may split requests
+        into cost-bounded chunks; other models retain the single-request cap.
         gpu_max_batch_size == 1 -> serial: one request per forward, no wait window
         (effective batch_wait_ms forced to 0 regardless of the configured value),
         and no image cap (sys.maxsize) — matches the old serial path, which never
@@ -418,6 +433,9 @@ class VitConfig:
             f"mm_image_max_file_size_kb: {self.mm_image_max_file_size_kb}\n"
             f"mm_video_max_file_size_kb: {self.mm_video_max_file_size_kb}\n"
             f"mm_cache_item_num: {self.mm_cache_item_num}\n"
+            f"mm_cache_gpu_max_bytes: {self.mm_cache_gpu_max_bytes}\n"
+            f"mm_cache_cpu_max_bytes: {self.mm_cache_cpu_max_bytes}\n"
+            f"mm_hash_key_cache_max_bytes: {self.mm_hash_key_cache_max_bytes}\n"
             f"url_cache_item_num: {self.url_cache_item_num}\n"
             f"use_igraph_cache: {self.use_igraph_cache}\n"
             f"igraph_search_dom: {self.igraph_search_dom}\n"
@@ -425,6 +443,8 @@ class VitConfig:
             f"igraph_table_name: {self.igraph_table_name}\n"
             f"igraph_default_key: {self.default_key}\n"
             f"mm_preprocess_max_workers: {self.mm_preprocess_max_workers}\n"
+            f"vit_concurrency: {self.vit_concurrency}\n"
+            f"vit_max_queue_size: {self.vit_max_queue_size}\n"
             f"biencoder_preprocess: {self.biencoder_preprocess}\n"
             f"extra_input_in_mm_embedding: {self.extra_input_in_mm_embedding}\n"
             f"mm_timeout_ms: {self.mm_timeout_ms}\n"

@@ -57,7 +57,7 @@ class RouteServiceTraceTest {
             RequestScheduler scheduler = mock(RequestScheduler.class);
             CompletableFuture<Response> pending = new CompletableFuture<>();
             when(scheduler.submit(any())).thenReturn(pending);
-            RouteService service = new RouteService(scheduler,
+            RouteService service = new RouteService(org.mockito.Mockito.mock(org.flexlb.balance.scheduler.DefaultRouter.class), scheduler,
                     mock(RecentCacheKeyTraceReporter.class));
             BalanceContext ctx = new BalanceContext(config);
             Request request = new Request();
@@ -77,10 +77,31 @@ class RouteServiceTraceTest {
     }
 
     @Test
+    void vitOnlyRequestBypassesBatchInputRequirementAndGenerationScheduler() {
+        RequestScheduler scheduler = mock(RequestScheduler.class);
+        DefaultRouter router = mock(DefaultRouter.class);
+        RecentCacheKeyTraceReporter reporter = mock(RecentCacheKeyTraceReporter.class);
+        RouteService service = new RouteService(router, scheduler, reporter);
+        BalanceContext ctx = new BalanceContext(SchedulingTestConfig.batchConfig());
+        Request request = new Request();
+        request.setRequestId(702L);
+        request.setVitOnly(true);
+        ctx.setRequest(request);
+        Response expected = Response.buildSuccessResponse(new Response(), false);
+        when(router.routeVit(ctx)).thenReturn(expected);
+
+        assertSame(expected, service.route(ctx).join());
+        assertSame(expected, ctx.getResponse());
+        verify(router).routeVit(ctx);
+        verify(reporter).report(ctx);
+        verifyNoInteractions(scheduler);
+    }
+
+    @Test
     void missingBatchInputStillRejectsWithoutDirectFallback() {
         FlexlbConfig config = SchedulingTestConfig.batchConfig();
         RequestScheduler scheduler = mock(RequestScheduler.class);
-        RouteService service = new RouteService(scheduler,
+        RouteService service = new RouteService(org.mockito.Mockito.mock(org.flexlb.balance.scheduler.DefaultRouter.class), scheduler,
                 mock(RecentCacheKeyTraceReporter.class));
         BalanceContext ctx = new BalanceContext(config);
         Request request = new Request();

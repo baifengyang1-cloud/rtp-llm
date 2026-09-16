@@ -158,6 +158,7 @@ def _build_mm_inputs_from_request(
                 fps=part.fps,
                 min_frames=part.min_frames,
                 max_frames=part.max_frames,
+                max_long_side_pixel=part.max_long_side_pixel,
             ),
         )
         for part in parts
@@ -313,6 +314,16 @@ def _dash_error_mapping_for_ft_exception(
     """
 
     exception_type = exc.exception_type
+    if exception_type == ExceptionType.UNSAFE_INPUT_CONTENT:
+        return _DashFtErrorMapping(
+            DashErrorSpec(
+                error_no=DASH_ERROR_BAD_REQUEST.error_no,
+                finish_reason=DASH_ERROR_BAD_REQUEST.finish_reason,
+                status_code=400,
+                status_name="DataInspectionFailed",
+            ),
+            f"DataInspectionFailed: {exc.message}",
+        )
     raw_reason = getattr(
         exc,
         "admission_reject_reason",

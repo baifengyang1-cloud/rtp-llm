@@ -115,3 +115,22 @@ py_test(
     ],
     exec_properties = {'gpu':'A10'},
 )
+
+py_test(
+    name = "mm_embedding_cache_test",
+    srcs = ["mm_embedding_cache_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
+    name = "mm_cost_scheduler_test",
+    srcs = ["mm_cost_scheduler_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
+    name = "multimodal_cache_engine_test",
+    srcs = ["multimodal_cache_engine_test.py"],
+    deps = ["//rtp_llm:testlib"],
+    data = [":testdata"],
+)

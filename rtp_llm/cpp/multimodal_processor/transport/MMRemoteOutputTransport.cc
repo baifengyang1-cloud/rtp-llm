@@ -6,15 +6,13 @@
 
 namespace rtp_llm {
 
-int64_t resolveRpcTimeoutMs(const MultimodalInputsPB& request,
-                            int64_t                   default_rpc_timeout_ms,
-                            int64_t                   rpc_timeout_margin_ms) {
+int64_t
+resolveRpcTimeoutMs(const MultimodalInputsPB& request, int64_t default_rpc_timeout_ms, int64_t rpc_timeout_margin_ms) {
     int64_t max_timeout_ms = 0;
     for (const auto& mm_input : request.multimodal_inputs()) {
         const int64_t configured_timeout_ms = mm_input.mm_preprocess_config().mm_timeout_ms();
-        const int64_t resolved_timeout_ms = configured_timeout_ms > 0
-                                                ? configured_timeout_ms + rpc_timeout_margin_ms
-                                                : default_rpc_timeout_ms;
+        const int64_t resolved_timeout_ms =
+            configured_timeout_ms > 0 ? configured_timeout_ms + rpc_timeout_margin_ms : default_rpc_timeout_ms;
         max_timeout_ms = std::max(max_timeout_ms, resolved_timeout_ms);
     }
     return max_timeout_ms > 0 ? max_timeout_ms : default_rpc_timeout_ms;
@@ -55,11 +53,14 @@ void MMTransportMetrics::reportRpcMetrics(const std::string& endpoint,
 
 // ---- MMRemoteOutputTransport ----
 
-ErrorResult<MultimodalOutput> MMRemoteOutputTransport::fetch(const std::string&  endpoint,
-                                                             MultimodalInputsPB& request_pb) {
-    DeadlineBudget budget(resolveRpcTimeoutMs(request_pb, default_rpc_timeout_ms_, rpc_timeout_margin_ms_));
+ErrorResult<MultimodalOutput> MMRemoteOutputTransport::fetch(const std::string&   endpoint,
+                                                             MultimodalInputsPB&  request_pb,
+                                                             grpc::ServerContext* server_context) {
+    DeadlineBudget  budget(resolveRpcTimeoutMs(request_pb, default_rpc_timeout_ms_, rpc_timeout_margin_ms_),
+                          server_context);
     DeliveryContext context{endpoint, budget, *control_};
 
+    request_pb.set_support_rdma(false);
     std::vector<MMReceiptReader*> advertised;
     for (auto& reader : readers_) {
         if (reader->advertise(endpoint, request_pb)) {
@@ -73,8 +74,7 @@ ErrorResult<MultimodalOutput> MMRemoteOutputTransport::fetch(const std::string& 
     }
 
     auto* matched = matchReader(receipt.value());
-    if (matched != nullptr
-        && std::find(advertised.begin(), advertised.end(), matched) == advertised.end()) {
+    if (matched != nullptr && std::find(advertised.begin(), advertised.end(), matched) == advertised.end()) {
         // Reject an unadvertised data plane and release its remote resources.
         matched->discard(receipt.value(), context);
         return ErrorInfo(ErrorCode::MM_PROCESS_ERROR,
@@ -87,9 +87,24 @@ ErrorResult<MultimodalOutput> MMRemoteOutputTransport::fetch(const std::string& 
         if (result.succeeded()) {
             return std::move(result.output());
         }
-        return result.error();
+        if (!allow_fallback_ || !result.retryable() || budget.exhausted()
+            || (server_context != nullptr && server_context->IsCancelled())) {
+            return result.error();
+        }
+        // consume() has released the original leases and dropped partial tensors.
+        // Retry once against the same worker, using the remaining request budget.
+        request_pb.set_support_rdma(false);
+        auto fallback = control_->request(endpoint, request_pb, budget);
+        if (!fallback.ok()) {
+            return fallback.status();
+        }
+        if (auto* unexpected = matchReader(fallback.value())) {
+            unexpected->discard(fallback.value(), context);
+            return ErrorInfo(ErrorCode::MM_PROCESS_ERROR, "gRPC fallback returned an RDMA receipt");
+        }
+        return terminal_->consumeTerminal(fallback.value(), context);
     }
-    if (!advertised.empty()) {
+    if (!allow_fallback_ && !advertised.empty()) {
         return ErrorInfo(ErrorCode::MM_PROCESS_ERROR,
                          "vit returned an inline receipt while RDMA transport was required");
     }

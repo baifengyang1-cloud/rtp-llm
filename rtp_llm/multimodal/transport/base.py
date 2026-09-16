@@ -1,7 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
     MultimodalInputsPB,
@@ -72,17 +72,39 @@ def report_output_metrics(result: MMOutputResult) -> None:
 
 
 class MMOutputTransport:
-    """Owns the explicitly selected data plane and its lifecycle."""
+    """Owns the selected data plane and optional inline fallback."""
 
-    def __init__(self, backend: MMTransportBackend):
+    def __init__(
+        self,
+        backend: MMTransportBackend,
+        fallback: Optional[MMTerminalBackend] = None,
+    ):
         self._backend = backend
+        self._fallback = fallback
 
     def transfer(
         self, request: MultimodalInputsPB, res: MMEmbeddingRes
     ) -> MultimodalOutputPB:
-        result = self._backend.transfer(request, res)
+        result = self._transfer(request, res)
         report_output_metrics(result)
         return result.receipt
+
+    def _transfer(
+        self, request: MultimodalInputsPB, res: MMEmbeddingRes
+    ) -> MMOutputResult:
+        if self._fallback is None:
+            return self._backend.transfer(request, res)
+        if request.support_rdma:
+            try:
+                return self._backend.transfer(request, res)
+            except Exception as error:
+                # RDMA export rolls back partial leases before propagating failure.
+                logging.warning(
+                    "[VIT] RDMA export failed (%s); using inline gRPC", str(error)
+                )
+        # Leave the exception handler before serializing: its traceback can retain
+        # temporary CUDA tensors from the failed export.
+        return self._fallback.transfer(request, res)
 
     def release(self, request: ReleaseLeasePB) -> None:
         handles = list(request.lease_id)
