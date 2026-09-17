@@ -24,6 +24,11 @@ def qos_priority_tag(qos_level: Any) -> str:
 
 
 class AccMetrics(Enum):
+    PRETRIGGER_OUTCOME_QPS_METRIC = "py_rtp_pretrigger_outcome_qps"
+    VIT_REQUEST_MERGE_QPS_METRIC = "py_rtp_vit_request_merge_qps"
+    VIT_PRETRIGGER_REUSE_QPS_METRIC = "py_rtp_vit_pretrigger_reuse_qps"
+    VIT_ADMISSION_QPS_METRIC = "py_rtp_vit_admission_qps"
+
     VIT_CUDA_GRAPH_HIT_QPS_METRIC = "py_rtp_vit_cuda_graph_hit_qps"
     VIT_CUDA_GRAPH_MISS_QPS_METRIC = "py_rtp_vit_cuda_graph_miss_qps"
     VIT_CUDA_GRAPH_CAPTURE_QPS_METRIC = "py_rtp_vit_cuda_graph_capture_qps"
@@ -88,6 +93,10 @@ class AccMetrics(Enum):
 
 
 class GaugeMetrics(Enum):
+    PRETRIGGER_SUBMISSION_RT_METRIC = "py_rtp_pretrigger_submission_rt_ms"
+    VIT_ASYNC_ACTIVE_TASKS_METRIC = "py_rtp_vit_async_active_tasks"
+    VIT_INFERENCE_WAIT_RT_METRIC = "py_rtp_vit_inference_wait_rt_ms"
+
     VIT_DOWNLOAD_RT_METRIC = "py_rtp_vit_download_rt"
     VIT_PREPROCESS_OTHER_RT_METRIC = "py_rtp_vit_preprocess_other_rt"
     VIT_PREPROCESS_QUEUE_SIZE_METRIC = "py_rtp_vit_preprocess_queue_size"

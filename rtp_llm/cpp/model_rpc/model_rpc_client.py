@@ -709,6 +709,25 @@ def iter_multimodal_inputs(input_py: GenerateInput, generate_config: GenerateCon
         yield mm_input_pb
 
 
+def serialize_multimodal_inputs(mm_inputs, generate_config, request_id=0):
+    """Use the same option resolution as inference without rendering prompt tokens."""
+    from types import SimpleNamespace
+
+    inputs = MultimodalInputsPB(request_id=request_id)
+    inputs.multimodal_inputs.extend(
+        iter_multimodal_inputs(SimpleNamespace(mm_inputs=mm_inputs), generate_config)
+    )
+    return inputs
+
+
+def resolved_multimodal_cache_keys(inputs: MultimodalInputsPB) -> list[str]:
+    from rtp_llm.multimodal.multimodal_util import trans_mm_input
+
+    if any(not item.multimodal_url for item in inputs.multimodal_inputs):
+        return []
+    return [item.cache_key() for item in trans_mm_input(inputs)]
+
+
 def multimodal_cache_keys(input_py: GenerateInput) -> list[str]:
     from rtp_llm.ops import MMPreprocessConfig, MultimodalInput
 
@@ -955,6 +974,17 @@ class ModelRpcClient(object):
             options=self._options, cleanup_interval=60  # clean up every minute
         )
         logging.info(f"addresses: {self._addresses}")
+
+    async def submit_embedding(self, address, inputs, timeout_s):
+        deadline = time.monotonic() + timeout_s
+        channel = await self._channel_pool.get(f"{address.ip}:{address.grpc_port}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        stub = MultimodalRpcServiceStub(channel)
+        await stub.AsyncSubmitEmbedding(
+            inputs, timeout=remaining, metadata=(("x-rtp-pretrigger", "1"),)
+        )
 
     async def close(self) -> None:
         await self._channel_pool.close()

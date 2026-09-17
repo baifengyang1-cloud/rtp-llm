@@ -55,17 +55,31 @@ class RequestExtractor:
         }
         return config_values, remain_values
 
+    @classmethod
+    def resolve_generate_config(cls, kwargs: Dict[str, Any]):
+        """Resolve native aliases/overrides without generation validation."""
+        kwargs = kwargs.copy()
+        config_json = kwargs.pop("generate_config", kwargs.pop("generation_config", {}))
+        if not isinstance(config_json, dict):
+            raise ValueError("generate_config must be an object")
+        nested_config, remain_config_json = cls._partition_generate_config_fields(
+            config_json
+        )
+        top_level_config, remain_kwargs = cls._partition_generate_config_fields(kwargs)
+        nested_config.update(top_level_config)
+        return nested_config, remain_config_json, remain_kwargs
+
     def _format_generate_config(
         self, kwargs: Dict[str, Any]
     ) -> Tuple[GenerateConfig, Dict[str, Any]]:
-        config_json = kwargs.pop("generate_config", kwargs.pop("generation_config", {}))
-        nested_config, remain_config_json = self._partition_generate_config_fields(
-            config_json
+        resolved_config, remain_config_json, remain_kwargs = (
+            self.resolve_generate_config(kwargs)
         )
-        top_level_config, remain_kwargs = self._partition_generate_config_fields(kwargs)
+        # Preserve the historical consumption of both nested aliases.
+        kwargs.pop("generate_config", None)
+        kwargs.pop("generation_config", None)
         config_values = self.default_generate_config.model_dump()
-        config_values.update(nested_config)
-        config_values.update(top_level_config)
+        config_values.update(resolved_config)
 
         def update_optional(key: str, params: List[str]) -> None:
             for source in [remain_config_json, remain_kwargs]:

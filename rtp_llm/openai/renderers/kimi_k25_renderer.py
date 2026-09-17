@@ -69,12 +69,18 @@ class KimiK25Renderer(KimiK2Renderer):
                         "the in-tree image processor is image-only."
                     )
                 else:
-                    new_parts.append({"type": part.type.value})
+                    raise ValueError(f"Unsupported Kimi-K2.5 media type: {part.type}")
             new_msg = msg.model_copy()
             new_msg.content = new_parts
             rewritten.append(new_msg)
 
         return rewritten, PromptWithMMInput(prompt="", urls=urls, mm_types=types)
+
+    def extract_multimodal_inputs(self, messages):
+        _, media = self._collect_and_rewrite(messages)
+        return RenderedInputs(
+            [], input_urls=media.urls, input_urls_type=media.mm_types
+        ).multimodal_inputs
 
     @override
     def render_chat(self, request: ChatCompletionRequest) -> RenderedInputs:

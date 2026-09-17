@@ -7,8 +7,9 @@ from typing import Any, Callable, Dict, Union
 
 from fastapi import Request
 from fastapi import Request as RawRequest
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from rtp_llm.access_logger.access_logger import AccessLogger
 from rtp_llm.config.log_config import get_log_path
@@ -17,6 +18,12 @@ from rtp_llm.config.model_config import (
     update_tokenizer_special_tokens,
 )
 from rtp_llm.frontend.frontend_worker import FrontendWorker, TokenizerEncodeResponse
+from rtp_llm.frontend.pretrigger import (
+    prepare_encoder_response,
+    prepare_pretrigger,
+    pretrigger_error_status,
+    resolve_pretrigger_config,
+)
 from rtp_llm.frontend.request_id_generator import generate_request_id
 from rtp_llm.metrics import AccMetrics, GaugeMetrics, kmonitor
 from rtp_llm.model_factory import ModelFactory
@@ -160,6 +167,14 @@ class FrontendServer(object):
         kmonitor.init()
 
     def start(self):
+        if self.py_env_configs.vit_config.pretrigger_timeout_ms <= 0:
+            raise ValueError("pretrigger_timeout_ms must be positive")
+        logging.info(
+            "Pretrigger submission deadline_ms=%s vit_separation=%s vit_server_count=%s",
+            self.py_env_configs.vit_config.pretrigger_timeout_ms,
+            self.py_env_configs.vit_config.vit_separation,
+            self.py_env_configs.server_config.vit_server_count,
+        )
         if (
             self.py_env_configs.profiling_debug_logging_config.debug_start_fake_process
             == 1
@@ -365,6 +380,12 @@ class FrontendServer(object):
             if isinstance(req, str):
                 req = json.loads(req)
             assert isinstance(req, dict)
+            try:
+                config = resolve_pretrigger_config(req)
+            except (ValueError, TypeError) as error:
+                return self._handle_exception(req, error, status_code=400)
+            if config.get("pretrigger_scheme", "disable") == "encoder":
+                return await self._encoder_inference(req, raw_request, False, config)
             sequence = self._global_controller.increment() % 4096  # 12 bits
             req[request_id_field_name] = generate_request_id(
                 self.py_env_configs.server_config.ip,
@@ -419,17 +440,7 @@ class FrontendServer(object):
                     trace_state.finish(error=e)
         return rep
 
-    async def chat_completion(
-        self, request: ChatCompletionRequest, raw_request: Request
-    ):
-        sequence = self._global_controller.increment() % 4096  # 12 bits
-        request_id = generate_request_id(
-            self.py_env_configs.server_config.ip,
-            self.py_env_configs.server_config.server_port,
-            self.server_id,
-            sequence,
-        )
-
+    def _start_chat_trace(self, model, raw_request, request_id):
         # Trace entry point: only chat completions get an HTTP SERVER span.
         # Returns None when telemetry is disabled; all calls below are no-ops then.
         loaded_model = (
@@ -437,7 +448,7 @@ class FrontendServer(object):
             if self._openai_endpoint is not None
             else ""
         ) or self.py_env_configs.model_args.model_type
-        request_model = request.model or loaded_model
+        request_model = model or loaded_model
         initial_trace_attributes = {
             trace_attrs.GEN_AI_SPAN_KIND: "LLM",
             trace_attrs.GEN_AI_OPERATION_NAME: "chat",
@@ -460,6 +471,130 @@ class FrontendServer(object):
             trace_state.set_attribute("request_id", str(request_id))
             trace_state.set_attribute(trace_attrs.HTTP_REQUEST_METHOD, "POST")
             trace_state.set_attribute(trace_attrs.HTTP_METHOD, "POST")
+
+        return trace_state
+
+    async def _encoder_inference(self, body, raw_request: Request, chat, config):
+        """Admission completes before the shared JSON/SSE response lifecycle starts."""
+        try:
+            sequence = self._global_controller.increment() % 4096
+        except ConcurrencyException as error:
+            return self._handle_exception(body, error, status_code=429)
+        request_id = generate_request_id(
+            self.py_env_configs.server_config.ip,
+            self.py_env_configs.server_config.server_port,
+            self.server_id,
+            sequence,
+        )
+        body = dict(body)
+        body[request_id_field_name] = request_id
+        started = time.monotonic()
+        outcome = "error"
+        response = None
+        trace_state = None
+        try:
+            if chat:
+                trace_state = self._start_chat_trace(
+                    body.get("model"), raw_request, request_id
+                )
+            body, generate_call = prepare_encoder_response(body, chat, config)
+            inputs = prepare_pretrigger(
+                body, chat, self._openai_endpoint, request_id, config
+            )
+            if inputs.multimodal_inputs:
+                if self.py_env_configs.server_config.vit_server_count != 1:
+                    from rtp_llm.config.exceptions import (
+                        ExceptionType,
+                        FtRuntimeException,
+                    )
+
+                    raise FtRuntimeException(
+                        ExceptionType.MASTER_NO_VIT_WORKER,
+                        "pretrigger requires vit_server_count=1",
+                    )
+                timeout = self.py_env_configs.vit_config.pretrigger_timeout_ms / 1000.0
+                deadline = time.monotonic() + timeout
+                await asyncio.wait_for(
+                    self._frontend_worker.backend_rpc_server_visitor.submit_pretrigger(
+                        inputs, dict(raw_request.headers), deadline
+                    ),
+                    timeout=timeout,
+                )
+                outcome = "accepted"
+            else:
+                outcome = "noop"
+            response = await self._infer_impl(body, raw_request, generate_call)
+            return response
+        except asyncio.CancelledError as error:
+            outcome = "cancelled"
+            if trace_state is not None:
+                trace_state.finish(error=error, error_type="Cancelled")
+            raise
+        except Exception as error:
+            code = pretrigger_error_status(error)
+            outcome = str(code)
+            logging.warning(
+                "pretrigger request_id=%s status=%s: %s", request_id, code, error
+            )
+            response = self._handle_exception(body, error, status_code=code)
+            if trace_state is not None:
+                _record_http_status(trace_state, code)
+                trace_state.finish(error=error)
+            return response
+        finally:
+            # SSE completion/cancellation releases this slot in stream_response.
+            if not isinstance(response, StreamingResponse):
+                if trace_state is not None:
+                    _record_http_status(
+                        trace_state, getattr(response, "status_code", 500)
+                    )
+                    trace_state.finish()
+                self._global_controller.decrement()
+            try:
+                kmonitor.report(
+                    AccMetrics.PRETRIGGER_OUTCOME_QPS_METRIC, 1, {"outcome": outcome}
+                )
+                kmonitor.report(
+                    GaugeMetrics.PRETRIGGER_SUBMISSION_RT_METRIC,
+                    (time.monotonic() - started) * 1000,
+                )
+            except Exception:
+                logging.exception("Failed to report pretrigger metrics")
+
+    async def chat_completion(
+        self,
+        request: Union[ChatCompletionRequest, Dict[str, Any]],
+        raw_request: Request,
+    ):
+        body = (
+            request.model_dump(exclude_none=True)
+            if isinstance(request, ChatCompletionRequest)
+            else request
+        )
+        try:
+            config = resolve_pretrigger_config(body, chat=True)
+        except (ValueError, TypeError) as error:
+            return self._handle_exception(body, error, status_code=400)
+        if config.get("pretrigger_scheme", "disable") == "encoder":
+            return await self._encoder_inference(body, raw_request, True, config)
+        if not isinstance(request, ChatCompletionRequest):
+            try:
+                request = ChatCompletionRequest.model_validate(body)
+            except ValidationError as error:
+                # Preserve FastAPI's conventional request-validation response.
+                errors = [
+                    dict(item, loc=("body", *item["loc"])) for item in error.errors()
+                ]
+                raise RequestValidationError(errors, body=body) from error
+        sequence = self._global_controller.increment() % 4096  # 12 bits
+        request_id = generate_request_id(
+            self.py_env_configs.server_config.ip,
+            self.py_env_configs.server_config.server_port,
+            self.server_id,
+            sequence,
+        )
+
+        trace_state = self._start_chat_trace(request.model, raw_request, request_id)
 
         def generate_call():
             assert self._openai_endpoint != None
@@ -559,7 +694,9 @@ class FrontendServer(object):
         except Exception as e:
             return ORJSONResponse(format_exception(e), status_code=500)
 
-    def _handle_exception(self, request: Dict[str, Any], e: BaseException):
+    def _handle_exception(
+        self, request: Dict[str, Any], e: BaseException, status_code=500
+    ):
         exception_json = format_exception(e)
         error_code_str = exception_json.get("error_code_str", "")
         if isinstance(e, ConcurrencyException):
@@ -588,7 +725,7 @@ class FrontendServer(object):
             )
             self._access_logger.log_exception_access(request, e, exception_json)
 
-        rep = ORJSONResponse(exception_json, status_code=500)
+        rep = ORJSONResponse(exception_json, status_code=status_code)
         return rep
 
     async def _call_generate_with_report(

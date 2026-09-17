@@ -38,9 +38,25 @@ class QwenVLRenderer(QwenRenderer):
             vit_config,
         )
 
+    def extract_multimodal_inputs(self, messages):
+        urls = []
+        for message in messages:
+            if isinstance(message.content, list):
+                for part in message.content:
+                    if part.type == ContentPartTypeEnum.text:
+                        continue
+                    if (
+                        part.type != ContentPartTypeEnum.image_url
+                        or part.image_url is None
+                    ):
+                        raise ValueError("Qwen-VL supports image_url media only")
+                    urls.append(part.image_url.url)
+        return RenderedInputs([], input_urls=urls).multimodal_inputs
+
     def _render_messages(self, messages: List[ChatMessage]) -> PromptWithMMInput:
         prompt = ""
-        images = []
+        images = [item.url for item in self.extract_multimodal_inputs(messages)]
+        image_index = 0
         if messages[0].role != RoleEnum.system:
             messages = [
                 ChatMessage(
@@ -60,8 +76,8 @@ class QwenVLRenderer(QwenRenderer):
                     elif content_part.type == ContentPartTypeEnum.image_url:
                         assert content_part.image_url != None
                         url = content_part.image_url.url
-                        images.append(url)
-                        prompt += f"Picture {len(images)}: <img>{url}</img>\n"
+                        image_index += 1
+                        prompt += f"Picture {image_index}: <img>{url}</img>\n"
                 prompt += "<|im_end|>\n"
         prompt += "<|im_start|>assistant\n"
         return PromptWithMMInput(prompt=prompt, urls=images)
@@ -98,15 +114,51 @@ class Qwen2VLRenderer(QwenRenderer):
             vit_config,
         )
 
+    def extract_multimodal_inputs(self, messages):
+        urls, types, configs = [], [], []
+        for message in messages:
+            if not isinstance(message.content, list):
+                continue
+            for part in message.content:
+                if part.type == ContentPartTypeEnum.text:
+                    continue
+                if part.type not in (
+                    ContentPartTypeEnum.image_url,
+                    ContentPartTypeEnum.video_url,
+                ):
+                    raise ValueError(f"Unsupported Qwen-VL media type: {part.type}")
+                media = (
+                    part.image_url
+                    if part.type == ContentPartTypeEnum.image_url
+                    else part.video_url
+                )
+                if media is None or not media.url.strip():
+                    raise ValueError("media URL is required")
+                urls.append(media.url)
+                types.append(
+                    MMUrlType.IMAGE
+                    if part.type == ContentPartTypeEnum.image_url
+                    else MMUrlType.VIDEO
+                )
+                configs.append(
+                    get_preprocess_config(part.preprocess_config)
+                    if part.preprocess_config
+                    else MMPreprocessConfig()
+                )
+        return RenderedInputs(
+            [], input_urls=urls, input_urls_type=types, preprocess_configs=configs
+        ).multimodal_inputs
+
     def _format_tool_call_arguments(self, arguments: Any) -> Any:
         return arguments
 
     def _render_messages(
         self, request: ChatCompletionRequest, add_vision_id: bool
     ) -> PromptWithMMInput:
-        urls = []
-        types = []
-        preprocess_configs = []
+        media = self.extract_multimodal_inputs(request.messages)
+        urls = [item.url for item in media]
+        types = [item.mm_type for item in media]
+        preprocess_configs = [item.mm_preprocess_config for item in media]
         final_messages = []
         for message in request.messages:
             msg_dict = {"role": message.role.value}
@@ -119,23 +171,11 @@ class Qwen2VLRenderer(QwenRenderer):
                         now_content.append({"type": "text", "text": content_part.text})
                     elif content_part.type == ContentPartTypeEnum.image_url:
                         assert content_part.image_url != None
-                        urls.append(content_part.image_url.url)
-                        types.append(MMUrlType.IMAGE)
-                        if content_part.preprocess_config:
-                            preprocess_configs.append(
-                                get_preprocess_config(content_part.preprocess_config)
-                            )
                         now_content.append(
                             {"type": "image", "image": content_part.image_url.url}
                         )
                     elif content_part.type == ContentPartTypeEnum.video_url:
                         assert content_part.video_url != None
-                        urls.append(content_part.video_url.url)
-                        types.append(MMUrlType.VIDEO)
-                        if content_part.preprocess_config:
-                            preprocess_configs.append(
-                                get_preprocess_config(content_part.preprocess_config)
-                            )
                         now_content.append(
                             {"type": "video", "video": content_part.video_url.url}
                         )

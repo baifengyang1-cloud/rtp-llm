@@ -3,7 +3,7 @@ import hashlib
 import logging
 import time
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import (
     BaseModel,
@@ -115,6 +115,17 @@ def _reset_sanitize_warn_state():
 
 
 class GenerateConfig(BaseModel):
+    pretrigger_scheme: Literal["disable", "encoder"] = "disable"
+
+    @field_validator("pretrigger_scheme", mode="before")
+    @classmethod
+    def validate_pretrigger_scheme(cls, value):
+        if not isinstance(value, str) or value not in ("disable", "encoder"):
+            raise ValueError(
+                'invalid pretrigger_scheme: expected "disable" or "encoder"'
+            )
+        return value
+
     # --- private attrs（不参与序列化/schema，生命周期与实例绑定） ---
     _diverge_depth_warned: bool = PrivateAttr(default=False)
     _ban_auto_downgraded: bool = PrivateAttr(default=False)

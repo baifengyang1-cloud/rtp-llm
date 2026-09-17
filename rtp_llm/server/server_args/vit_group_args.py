@@ -281,6 +281,14 @@ def init_vit_group_args(parser, vit_config):
         help='在多模态嵌入中使用额外的输入，可选值"INDEX"',
     )
     vit_group.add_argument(
+        "--pretrigger_timeout_ms",
+        env_name="PRETRIGGER_TIMEOUT_MS",
+        bind_to=(vit_config, "pretrigger_timeout_ms"),
+        type=int,
+        default=5000,
+        help="Total pretrigger routing/submission deadline in milliseconds",
+    )
+    vit_group.add_argument(
         "--mm_timeout_ms",
         env_name="MM_TIMEOUT_MS",
         bind_to=(vit_config, "mm_timeout_ms"),

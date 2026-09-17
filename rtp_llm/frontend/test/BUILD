@@ -77,3 +77,9 @@ py_test(
         "//rtp_llm:frontend",
     ],
 )
+
+py_test(
+    name = "pretrigger_test",
+    srcs = ["pretrigger_test.py"],
+    deps = ["//rtp_llm:testlib"] + telemetry_test_deps(),
+)

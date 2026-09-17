@@ -107,6 +107,7 @@ class BackendRPCServerVisitor:
         self.sp_config = sp_config
         self.source_role = source_role
         self.mm_model_config = mm_model_config
+        self.vit_separation = vit_separation
         self._mm_cache_routing = (
             vit_separation == VitSeparation.VIT_SEPARATION_REMOTE
             and getattr(pd_sep_config, "role_type", None) == RoleType.FRONTEND
@@ -204,6 +205,62 @@ class BackendRPCServerVisitor:
             or "recvmsg:Connection timed out" in text
             or "Socket closed" in text
         )
+
+    async def submit_pretrigger(self, inputs, headers, deadline):
+        """Resolve only ViT; an explicit scheduler rejection never falls back."""
+        from rtp_llm.cpp.model_rpc.model_rpc_client import (
+            resolved_multimodal_cache_keys,
+        )
+
+        if self.vit_separation != VitSeparation.VIT_SEPARATION_REMOTE:
+            raise FtRuntimeException(
+                ExceptionType.MASTER_NO_VIT_WORKER, "pretrigger requires remote ViT"
+            )
+        keys = resolved_multimodal_cache_keys(inputs)
+        result = await self.master_client.route_vit(
+            keys, inputs.request_id, headers, deadline
+        )
+        if result.connection_failed:
+            # Discovery may block on network I/O; keep it off the event loop so
+            # the caller's overall deadline also covers fallback discovery.
+            addresses = await asyncio.to_thread(
+                self.host_service.get_backend_role_addrs, [RoleType.VIT]
+            )
+        elif not result.is_ok:
+            if result.error_code == 403:
+                from rtp_llm.server.master_client import VitRoutingPolicyError
+
+                raise VitRoutingPolicyError(
+                    ExceptionType.MASTER_INVALID_REQUEST,
+                    result.error_message or "ViT routing policy rejected",
+                )
+            try:
+                code = ExceptionType(result.error_code)
+            except ValueError:
+                if result.error_code == 429:
+                    code = ExceptionType.CONCURRENCY_LIMIT_ERROR
+                elif result.error_code in (501, 503):
+                    code = ExceptionType.MASTER_NO_VIT_WORKER
+                elif result.error_code in (400, 422):
+                    code = ExceptionType.MASTER_INVALID_REQUEST
+                else:
+                    code = ExceptionType.UNKNOWN_ERROR
+            raise FtRuntimeException(
+                code,
+                result.error_message or "ViT routing rejected",
+                admission_reject_reason=result.admission_reject_reason,
+            )
+        else:
+            addresses = result.role_addrs
+        vit = [addr for addr in addresses if addr.role == RoleType.VIT]
+        if len(vit) != 1 or not vit[0].ip or vit[0].grpc_port <= 0:
+            raise FtRuntimeException(
+                ExceptionType.MASTER_NO_VIT_WORKER, "No ViT worker is available"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        await self.model_rpc_client.submit_embedding(vit[0], inputs, remaining)
 
     async def close(self) -> None:
         try:

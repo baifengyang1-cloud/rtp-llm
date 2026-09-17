@@ -245,6 +245,16 @@ class ResponseObject:
     aux_info: Optional[AuxInfo] = None
 
 
+def response_choice_count(n, generate_config):
+    """Shared response cardinality; independent of rendering or tokenization."""
+    beams = (
+        generate_config.variable_num_beams[-1]
+        if len(generate_config.variable_num_beams) > 1
+        else generate_config.num_beams
+    )
+    return beams if beams != 1 else (n if n is not None else 1)
+
+
 class TemplateType(Enum):
     """Template type for different model types."""
 
@@ -325,6 +335,20 @@ class RenderedInputs:
 
 
 class CustomChatRenderer:
+
+    def extract_multimodal_inputs(
+        self, messages: List[ChatMessage]
+    ) -> List[MultimodalInput]:
+        """Renderers opt in with their normal media extraction semantics."""
+        for message in messages:
+            if isinstance(message.content, list) and any(
+                part.type.value != "text" for part in message.content
+            ):
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support pretrigger media extraction"
+                )
+        return []
+
     def __init__(
         self,
         tokenizer: BaseTokenizer,
@@ -1152,16 +1176,10 @@ class CustomChatRenderer:
         generate_config: GenerateConfig,
     ) -> AsyncGenerator[StreamResponseObject, None]:
         stop_word_slice_list = get_stop_word_slices(generate_config.stop_words_str)
-        nums_output = request.n if request.n is not None else 1
         # FIXME(zhangjianning.zjn): for variable width beam search,
         # the num_ouput may not be the last num beams,
         # and is dependent to the length of sequence
-        last_num_beams = (
-            generate_config.variable_num_beams[-1]
-            if len(generate_config.variable_num_beams) > 1
-            else generate_config.num_beams
-        )
-        nums_output = last_num_beams if last_num_beams != 1 else nums_output
+        nums_output = response_choice_count(request.n, generate_config)
         status_list = await self._create_status_list(nums_output, request)
         index = 0
         resolved_thinking_mode = generate_config.thinking_mode

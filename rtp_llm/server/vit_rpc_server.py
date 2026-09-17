@@ -134,10 +134,27 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
         return rpc_done
 
     def AsyncSubmitEmbedding(self, multimodal_inputs: MultimodalInputsPB, context):
+        pretrigger = (
+            dict(context.invocation_metadata() or ()).get("x-rtp-pretrigger") == "1"
+        )
+        if pretrigger and self.engine.is_proxy_mode:
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "pretrigger requires a standalone ViT worker",
+            )
         try:
             converted_inputs = trans_mm_input(multimodal_inputs)
-            self.engine.async_submit(converted_inputs, multimodal_inputs.request_id)
+            if pretrigger:
+                self.engine.async_submit(
+                    converted_inputs, multimodal_inputs.request_id, pretrigger=True
+                )
+            else:
+                self.engine.async_submit(converted_inputs, multimodal_inputs.request_id)
             return EmptyPB()
+        except (ValueError, TypeError, MMSchedulerRequestTooLargeError) as error:
+            self.engine.report_vit_error(error)
+            _mark_vit_error_reported(context)
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
         except FtRuntimeException as error:
             self.engine.report_vit_error(error)
             _abort_ft_runtime(context, error)

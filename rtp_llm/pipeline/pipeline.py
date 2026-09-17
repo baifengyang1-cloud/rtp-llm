@@ -30,6 +30,7 @@ from rtp_llm.server.backend_rpc_server_visitor import (
     get_role_names,
 )
 from rtp_llm.server.request_headers import normalize_request_headers
+from rtp_llm.structure.multimodal_request import native_multimodal_inputs
 from rtp_llm.utils.base_model_datatypes import (
     GenerateInput,
     GenerateOutput,
@@ -199,19 +200,7 @@ class Pipeline(object):
             self.tokenizer,
             **kwargs,
         )
-        mm_inputs = (
-            [
-                MultimodalInput(
-                    url,
-                    MMUrlType.DEFAULT,
-                    torch.empty(0),
-                    MMPreprocessConfig(),
-                )
-                for url in urls
-            ]
-            if urls is not None
-            else []
-        )
+        mm_inputs = native_multimodal_inputs(urls) if urls is not None else []
 
         if len(prompt) == 0:
             raise FtRuntimeException(

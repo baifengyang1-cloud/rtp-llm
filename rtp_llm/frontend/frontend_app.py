@@ -892,9 +892,7 @@ class FrontendApp(object):
 
         @app.post("/chat/completions")
         @app.post("/v1/chat/completions")
-        async def chat_completion(
-            request: ChatCompletionRequest, raw_request: RawRequest
-        ):
+        async def chat_completion(request: Dict[str, Any], raw_request: RawRequest):
             async def call():
                 return await self.frontend_server.chat_completion(request, raw_request)
 

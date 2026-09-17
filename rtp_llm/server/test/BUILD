@@ -90,3 +90,9 @@ py_test(
     srcs = ["mm_cache_routing_test.py"],
     deps = ["//rtp_llm:testlib"],
 )
+
+py_test(
+    name = "vit_pretrigger_rpc_test",
+    srcs = ["vit_pretrigger_rpc_test.py"],
+    deps = ["//rtp_llm:testlib", "//rtp_llm/server:server"],
+)

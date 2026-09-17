@@ -373,5 +373,88 @@ class MasterClientBatchPayloadTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class PretriggerVitRouteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_rpc_policy_and_capacity_errors_do_not_allow_discovery(self):
+        from rtp_llm.cpp.model_rpc.proto.flexlb_schedule_service_pb2 import (
+            FlexlbScheduleRequestPB,
+        )
+
+        client = MasterClient(
+            host_service=_FakeHostServiceWithSlave(), master_config=_FakeMasterConfig()
+        )
+        for status, expected in (
+            (grpc.StatusCode.RESOURCE_EXHAUSTED, 429),
+            (grpc.StatusCode.PERMISSION_DENIED, 403),
+            (grpc.StatusCode.UNAUTHENTICATED, 403),
+            (grpc.StatusCode.INTERNAL, 503),
+        ):
+            with self.subTest(status=status):
+                stub = SimpleNamespace(
+                    Schedule=AsyncMock(
+                        side_effect=grpc.aio.AioRpcError(status, (), (), "rejected")
+                    )
+                )
+                with patch.object(client, "_get_channel", return_value=object()), patch(
+                    "rtp_llm.server.master_client.FlexlbServiceStub", return_value=stub
+                ):
+                    response = await client._send_schedule_request(
+                        "master:1234", FlexlbScheduleRequestPB(vit_only=True), 1, 123
+                    )
+                self.assertEqual(response.code, expected)
+
+    async def test_media_only_payload_and_shared_deadline(self):
+        from unittest.mock import AsyncMock, patch
+
+        client = MasterClient(
+            host_service=_FakeHostServiceWithSlave(), master_config=_FakeMasterConfig()
+        )
+        success = FlexlbScheduleResponsePB(
+            code=200,
+            server_status=[
+                FlexlbServerStatusPB(
+                    role="VIT", server_ip="vit", http_port=8000, grpc_port=8001
+                )
+            ],
+        )
+        client._send_schedule_request = AsyncMock(side_effect=[None, success])
+        with patch(
+            "rtp_llm.server.master_client.time.monotonic", side_effect=[10.0, 10.4]
+        ):
+            result = await client.route_vit(
+                ["a", "b"],
+                123,
+                {"x-api-key": "key", "x-dashscope-inner-qos-level": "42"},
+                10.6,
+            )
+        self.assertTrue(result.is_ok)
+        first, second = client._send_schedule_request.call_args_list
+        self.assertAlmostEqual(first.args[2], 0.6)
+        self.assertAlmostEqual(second.args[2], 0.2)
+        payload = first.args[1]
+        self.assertEqual(list(payload.media_keys), ["a", "b"])
+        self.assertEqual(list(payload.block_cache_keys), [])
+        self.assertEqual(payload.seq_len, 0)
+        self.assertEqual(payload.api_key, "key")
+        self.assertEqual(payload.priority, 42)
+        self.assertTrue(payload.vit_only)
+        self.assertFalse(payload.generate_input)
+        self.assertEqual(payload.generate_timeout, 0)
+
+    async def test_explicit_rejection_never_tries_slave(self):
+        import time
+        from unittest.mock import AsyncMock
+
+        client = MasterClient(
+            host_service=_FakeHostServiceWithSlave(), master_config=_FakeMasterConfig()
+        )
+        client._send_schedule_request = AsyncMock(
+            return_value=FlexlbScheduleResponsePB(code=429, error_message="full")
+        )
+        result = await client.route_vit(["a"], 124, {}, time.monotonic() + 5)
+        self.assertFalse(result.connection_failed)
+        self.assertEqual(result.error_code, 429)
+        self.assertEqual(client._send_schedule_request.await_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

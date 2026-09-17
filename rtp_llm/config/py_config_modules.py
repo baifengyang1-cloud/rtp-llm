@@ -366,6 +366,7 @@ class VitConfig:
         self.vit_max_queue_size: int = 64
         self.biencoder_preprocess: bool = False
         self.extra_input_in_mm_embedding = ""
+        self.pretrigger_timeout_ms: int = 5000
         self.mm_timeout_ms: int = VitConfig.DEFAULT_MM_TIMEOUT_MS
         self.extra_data_path: str = ""
         self.local_extra_data_path: str = ""
@@ -447,6 +448,7 @@ class VitConfig:
             f"vit_max_queue_size: {self.vit_max_queue_size}\n"
             f"biencoder_preprocess: {self.biencoder_preprocess}\n"
             f"extra_input_in_mm_embedding: {self.extra_input_in_mm_embedding}\n"
+            f"pretrigger_timeout_ms: {self.pretrigger_timeout_ms}\n"
             f"mm_timeout_ms: {self.mm_timeout_ms}\n"
             f"extra_data_path: {self.extra_data_path}\n"
             f"local_extra_data_path: {self.local_extra_data_path}\n"

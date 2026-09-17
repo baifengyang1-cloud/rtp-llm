@@ -85,6 +85,13 @@ def _copy_result_to_devices(result: Any, devices: Any) -> Any:
     return visit(result, devices)
 
 
+def _report(metric, value, tags=None):
+    try:
+        kmonitor.report(metric, value, tags or {})
+    except Exception as error:
+        logging.exception("Failed to report embedding cache metric: %s", error)
+
+
 def _embedding_result_cost(result: Any) -> Tuple[int, int]:
     """Return ``(output_tokens, tensor_bytes)`` retained by one cache value."""
 
@@ -154,6 +161,8 @@ class MMEmbeddingCacheEntry:
         # callback, a cache waiter, and an RPC handler). Keep one atomic claim
         # on the entry so a failed result contributes one error-QPS sample.
         self._error_reported = False
+        self.pretrigger_initiated = False
+        self._pretrigger_reused = False
         self.charge_tokens = 0
         self.charge_bytes = 0
         self.charge_gpu_bytes = 0
@@ -164,6 +173,13 @@ class MMEmbeddingCacheEntry:
         self.ready_events: List[Any] = []
         self._greennet_event = threading.Event()
         self._greennet_verdict: Optional[GreenNetVerdict] = None
+
+    def claim_pretrigger_reuse(self) -> bool:
+        with self._state_lock:
+            if not self.pretrigger_initiated or self._pretrigger_reused:
+                return False
+            self._pretrigger_reused = True
+            return True
 
     def claim_error_report(self) -> bool:
         """Claim the single error-telemetry sample for this cache entry."""
@@ -474,6 +490,12 @@ class MMEmbeddingCache:
 
     def try_acquire(self, cache_key: str) -> Tuple[str, MMEmbeddingCacheEntry]:
         with self._lock:
+            # fail() publishes the terminal error before its removal callback.
+            # A concurrent lookup in that interval must recompute, never report
+            # a failed placeholder as a completed cache hit/admission.
+            previous = self._entries.get(cache_key)
+            if previous is not None and previous.error is not None:
+                self._remove_entry_locked(cache_key)
             if not self.enabled:
                 self._stats["miss"] += 1
                 state, entry = "miss", MMEmbeddingCacheEntry()
@@ -540,7 +562,7 @@ class MMEmbeddingCache:
         if eviction:
             self._stats["eviction"] += 1
             if self._report_metrics_enabled:
-                kmonitor.report(AccMetrics.VIT_EMBEDDING_CACHE_EVICTION_QPS_METRIC, 1)
+                _report(AccMetrics.VIT_EMBEDDING_CACHE_EVICTION_QPS_METRIC, 1)
 
     def _admit_locked(
         self,
@@ -857,13 +879,13 @@ class MMEmbeddingCache:
             "complete": AccMetrics.VIT_EMBEDDING_CACHE_HIT_QPS_METRIC,
             "in_progress": AccMetrics.VIT_EMBEDDING_CACHE_INFLIGHT_QPS_METRIC,
         }[state]
-        kmonitor.report(metric, 1)
+        _report(metric, 1)
 
     def _report_resident_metrics(self, tokens: int, size_bytes: int) -> None:
         if not self._report_metrics_enabled:
             return
-        kmonitor.report(GaugeMetrics.VIT_EMBEDDING_CACHE_TOKENS_METRIC, tokens)
-        kmonitor.report(GaugeMetrics.VIT_EMBEDDING_CACHE_BYTES_METRIC, size_bytes)
+        _report(GaugeMetrics.VIT_EMBEDDING_CACHE_TOKENS_METRIC, tokens)
+        _report(GaugeMetrics.VIT_EMBEDDING_CACHE_BYTES_METRIC, size_bytes)
 
 
 # Compatibility alias for internal callers that imported the previous class.

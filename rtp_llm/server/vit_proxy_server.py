@@ -469,6 +469,10 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
             self._decrement_connections(worker_address, report_error=not request_failed)
 
     def AsyncSubmitEmbedding(self, request: MultimodalInputsPB, context) -> EmptyPB:
+        if dict(context.invocation_metadata() or ()).get("x-rtp-pretrigger") == "1":
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE, "pretrigger requires vit_server_count=1"
+            )
         worker_address = None
         request_failed = False
         try:

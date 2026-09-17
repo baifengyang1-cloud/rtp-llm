@@ -624,6 +624,36 @@ class MMEmbeddingCacheEntryTest(TestCase):
 
 
 class MMEmbeddingAsyncCacheTest(TestCase):
+
+    def test_lookup_during_failure_publication_recomputes(self):
+        cache = MMEmbeddingAsyncCache(gpu_max_bytes=4096, cpu_max_bytes=4096)
+        _, entry = cache.try_acquire("failed")
+        published, release = threading.Event(), threading.Event()
+        original = entry._on_fail
+
+        def delayed_remove(failed, error):
+            published.set()
+            if not release.wait(5):
+                raise TimeoutError("failure removal barrier was not released")
+            original(failed, error)
+
+        entry._on_fail = delayed_remove
+        producer = threading.Thread(target=entry.fail, args=(ValueError("failed"),))
+        producer.start()
+        try:
+            self.assertTrue(published.wait(5))
+            state, replacement = cache.try_acquire("failed")
+            self.assertEqual(state, "miss")
+            self.assertIsNot(replacement, entry)
+            release.set()
+            producer.join(5)
+            self.assertIs(cache.peek("failed"), replacement)
+            with self.assertRaisesRegex(ValueError, "failed"):
+                entry.wait(1)
+        finally:
+            release.set()
+            producer.join(5)
+
     def test_metadata_is_read_only_and_tracks_eviction(self):
         cache = MMEmbeddingAsyncCache(gpu_max_bytes=0, cpu_max_bytes=48)
         hash_cache = MMHashKeyCache(max_bytes=4096)
@@ -839,6 +869,214 @@ class VitErrorReportingTest(TestCase):
 
 
 class AsyncSubmitGetEmbeddingTest(TestCase):
+
+    def test_admission_metrics_use_mapping_tags_and_are_best_effort(self):
+        engine = self._make_engine()
+        media = self._make_input("fake://metrics")
+        try:
+            with patch.object(
+                engine._async_compute_executor,
+                "submit",
+                side_effect=lambda *args: concurrent.futures.Future(),
+            ):
+                with patch(
+                    "rtp_llm.multimodal.mm_process_engine.kmonitor.report"
+                ) as report:
+                    engine.async_submit([media], 801, pretrigger=True)
+                    engine.cancel_queued_request(801)
+                    self.assertTrue(report.call_args_list)
+                    for call in report.call_args_list:
+                        if len(call.args) > 2:
+                            self.assertIsInstance(call.args[2], dict)
+                with patch(
+                    "rtp_llm.multimodal.mm_process_engine.kmonitor.report",
+                    side_effect=RuntimeError("telemetry unavailable"),
+                ), patch("logging.exception"):
+                    self.assertEqual(
+                        engine.async_submit([media], 802, pretrigger=True),
+                        [media.cache_key()],
+                    )
+                    engine.cancel_queued_request(802)
+                    self.assertEqual(engine._async_admitted, 0)
+                    self.assertEqual(engine._async_tasks, {})
+        finally:
+            engine.stop()
+
+    def test_partial_overlap_failure_recompute_and_disabled_cache(self):
+        engine = self._make_engine()
+        a, b = self._make_input("fake://a"), self._make_input("fake://b")
+        futures = []
+
+        def enqueue(*args):
+            future = concurrent.futures.Future()
+            futures.append(future)
+            return future
+
+        try:
+            with patch.object(
+                engine._async_compute_executor, "submit", side_effect=enqueue
+            ):
+                engine.async_submit([a], 601, pretrigger=True)
+                claims = engine._claim_and_submit_async([a, b], request_id=602)
+                self.assertEqual(len(futures), 2)
+                self.assertIs(claims[0][1], engine._embedding_cache.peek(a.cache_key()))
+                self.assertEqual(engine.cancel_queued_request(602), 1)  # only B
+                self.assertEqual(engine._async_admitted, 1)
+                failure = ValueError("shared failure")
+                futures[0].set_exception(failure)
+                with self.assertRaisesRegex(ValueError, "shared failure"):
+                    claims[0][1].wait(1)
+                self.assertIsNone(engine._embedding_cache.peek(a.cache_key()))
+                self.assertEqual(engine._async_admitted, 0)
+                engine.async_submit([a], 603, pretrigger=True)
+                self.assertEqual(len(futures), 3)
+                self.assertIsNot(
+                    claims[0][1], engine._embedding_cache.peek(a.cache_key())
+                )
+                engine.cancel_queued_request(603)
+                engine._embedding_cache.resize(0, 0)
+                engine.async_submit([a], 604, pretrigger=True)
+                engine.async_submit([a], 605, pretrigger=True)
+                self.assertEqual(len(futures), 5)
+                self.assertEqual(engine._async_admitted, 2)
+                engine.cancel_queued_request(604)
+                engine.cancel_queued_request(605)
+                self.assertEqual(engine._async_admitted, 0)
+                self.assertEqual(engine._async_tasks, {})
+                self.assertEqual(engine._async_request_tasks, {})
+        finally:
+            engine.stop()
+
+    def test_join_cannot_acknowledge_before_executor_handoff(self):
+        engine = self._make_engine()
+        media = self._make_input("fake://handoff")
+        claimed, release, attempting, entered_early = (
+            threading.Event() for _ in range(4)
+        )
+        original_lock = engine._async_task_lock
+        original_submit = engine._submit_async_compute_batch
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "joining-pretrigger":
+                    acquired = original_lock.acquire(blocking=False)
+                    if acquired:
+                        entered_early.set()
+                    attempting.set()
+                    if acquired:
+                        return
+                original_lock.acquire()
+
+            def __exit__(self, *args):
+                original_lock.release()
+
+        def gated_submit(*args, **kwargs):
+            if kwargs.get("request_id") == 301:
+                claimed.set()
+                self.assertTrue(release.wait(5))
+            return original_submit(*args, **kwargs)
+
+        engine._async_task_lock = ObservedLock()
+        engine._submit_async_compute_batch = gated_submit
+        acknowledged = threading.Event()
+        failures = []
+
+        def submit(request_id):
+            try:
+                engine.async_submit([media], request_id=request_id, pretrigger=True)
+                if request_id == 302:
+                    acknowledged.set()
+            except Exception as error:
+                failures.append(error)
+
+        owner = threading.Thread(target=submit, args=(301,))
+        joiner = threading.Thread(target=submit, args=(302,), name="joining-pretrigger")
+        try:
+            owner.start()
+            self.assertTrue(claimed.wait(5))
+            joiner.start()
+            self.assertTrue(attempting.wait(5))
+            self.assertFalse(entered_early.is_set())
+            self.assertFalse(acknowledged.is_set())
+            release.set()
+            owner.join(5)
+            joiner.join(5)
+            self.assertFalse(owner.is_alive())
+            self.assertFalse(joiner.is_alive())
+            self.assertEqual(failures, [])
+            self.assertTrue(acknowledged.is_set())
+        finally:
+            release.set()
+            owner.join(5)
+            if joiner.ident is not None:
+                joiner.join(5)
+            engine.stop()
+
+    def test_cancellation_during_claim_never_orphans_joining_pretrigger(self):
+        engine = self._make_engine()
+        media = self._make_input("fake://cancel-handoff")
+        claimed, release, cancelled = (threading.Event() for _ in range(3))
+        submit = engine._submit_async_compute_batch
+        futures = []
+
+        def enqueue(*args):
+            future = concurrent.futures.Future()
+            futures.append(future)
+            return future
+
+        def gated_submit(*args, **kwargs):
+            if kwargs.get("request_id") == 401:
+                claimed.set()
+                self.assertTrue(release.wait(5))
+            return submit(*args, **kwargs)
+
+        engine._submit_async_compute_batch = gated_submit
+        with patch.object(
+            engine._async_compute_executor, "submit", side_effect=enqueue
+        ):
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                owner = pool.submit(
+                    engine._claim_and_submit_async, [media], 401, None, cancelled
+                )
+                try:
+                    self.assertTrue(claimed.wait(5))
+                    joining = pool.submit(
+                        engine.async_submit, [media], 402, pretrigger=True
+                    )
+                    cancelled.set()
+                    release.set()
+                    with self.assertRaises(FtRuntimeException):
+                        owner.result(5)
+                    self.assertEqual(joining.result(5), [media.cache_key()])
+                    entry = engine._embedding_cache.peek(media.cache_key())
+                    self.assertIsNotNone(engine._async_tasks[entry].future)
+                    self.assertIn(402, engine._async_tasks[entry].request_ids)
+                    self.assertEqual(engine._async_admitted, 1)
+                    engine.cancel_queued_request(402)
+                    self.assertEqual(engine._async_admitted, 0)
+                    self.assertEqual(engine._async_tasks, {})
+                finally:
+                    release.set()
+                    engine.stop()
+
+    def test_only_pretrigger_initiated_computation_is_credited(self):
+        engine = self._make_engine()
+        first = self._make_input("fake://pretrigger-first")
+        second = self._make_input("fake://inference-first")
+        try:
+            engine.async_submit([first], 501, pretrigger=True)
+            engine.get_embedding_result([first], request_id=502)
+            entry = engine._embedding_cache.peek(first.cache_key())
+            self.assertTrue(entry.pretrigger_initiated)
+            self.assertFalse(entry.claim_pretrigger_reuse())  # already counted
+            engine.get_embedding_result([second], request_id=503)
+            engine.async_submit([second], 504, pretrigger=True)
+            entry = engine._embedding_cache.peek(second.cache_key())
+            self.assertFalse(entry.pretrigger_initiated)
+            self.assertFalse(entry.claim_pretrigger_reuse())
+        finally:
+            engine.stop()
+
     def test_hashes_only_waits_on_shared_submit_and_does_not_read_cached_embeddings(
         self,
     ):

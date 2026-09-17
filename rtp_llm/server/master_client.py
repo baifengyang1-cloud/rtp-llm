@@ -23,6 +23,7 @@ from rtp_llm.cpp.model_rpc.proto.flexlb_schedule_service_pb2 import (
     CANCEL_REASON_DEADLINE_EXCEEDED,
     FlexlbCancelRequestPB,
     FlexlbScheduleRequestPB,
+    FlexlbScheduleResponsePB,
 )
 from rtp_llm.cpp.model_rpc.proto.flexlb_schedule_service_pb2_grpc import (
     FlexlbServiceStub,
@@ -53,6 +54,10 @@ def _resolve_role_from_server_status(s) -> RoleType:
         except (AttributeError, ValueError):
             pass
     return RoleType.PDFUSION
+
+
+class VitRoutingPolicyError(FtRuntimeException):
+    """An explicit FlexLB authentication/routing policy rejection."""
 
 
 @dataclass
@@ -262,6 +267,31 @@ class MasterClient:
                     client_span.finish()
             return response
         except grpc.aio.AioRpcError as e:
+            if request_pb.vit_only and e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                return FlexlbScheduleResponsePB(
+                    code=501, error_message="ViT preselection unavailable"
+                )
+            if request_pb.vit_only and e.code() in (
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                grpc.StatusCode.PERMISSION_DENIED,
+                grpc.StatusCode.UNAUTHENTICATED,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                grpc.StatusCode.FAILED_PRECONDITION,
+            ):
+                code = 429 if e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED else 400
+                if e.code() in (
+                    grpc.StatusCode.PERMISSION_DENIED,
+                    grpc.StatusCode.UNAUTHENTICATED,
+                ):
+                    code = 403
+                return FlexlbScheduleResponsePB(code=code, error_message=e.details())
+            if request_pb.vit_only and e.code() not in (
+                grpc.StatusCode.UNAVAILABLE,
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+            ):
+                # An RPC response carrying an internal/application failure is
+                # not evidence that discovery should bypass this scheduler.
+                return FlexlbScheduleResponsePB(code=503, error_message=e.details())
             elapsed = time.time() - start
             route_logger.error(
                 "gRPC schedule failed, addr=%s, request_id=%s, status=%s, detail=%s, elapsed=%.3fs",
@@ -288,7 +318,7 @@ class MasterClient:
             await self._close_channel(target)
             return None
         except asyncio.CancelledError:
-            if "stub" in locals():
+            if "stub" in locals() and not request_pb.vit_only:
                 await self._best_effort_cancel(
                     stub, request_id, CANCEL_REASON_CLIENT_CANCELLED, trace_metadata
                 )
@@ -302,6 +332,10 @@ class MasterClient:
                 elapsed,
             )
             await self._close_channel(target)
+            if request_pb.vit_only and not isinstance(
+                e, (OSError, asyncio.TimeoutError)
+            ):
+                raise
             return None
 
     @staticmethod
@@ -655,3 +689,64 @@ class MasterClient:
             if qos_priority is not None and qos_priority > 0:
                 return qos_priority
         return 50
+
+    async def route_vit(self, media_keys, request_id, headers, deadline):
+        """ViT-only placement with one remaining budget across both attempts."""
+        # Reuse header interpretation, without manufacturing GenerateInput or
+        # prompt tokens. RouteVit never carries a generation request.
+        from types import SimpleNamespace
+
+        routing = SimpleNamespace(headers=headers)
+        request_pb = FlexlbScheduleRequestPB(
+            request_id=request_id,
+            media_keys=media_keys,
+            block_cache_keys=[],
+            cache_key_block_size=0,
+            seq_len=0,
+            vit_only=True,
+            request_time_ms=int(time.time() * 1000),
+            model="engine_service",
+            api_key=self._extract_api_key(routing),
+            priority=self._extract_priority(routing),
+        )
+        addresses = []
+        if self.host_service:
+            addresses = [
+                self.host_service.get_master_addr(),
+                self.host_service.get_slave_addr(),
+            ]
+        for address in addresses:
+            if not address:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            # Placement-hint TTL uses FlexLB defaults, independently of the
+            # submission deadline and the worker computation timeout.
+            request_pb.generate_timeout = 0
+            response = await self._send_schedule_request(
+                address,
+                request_pb,
+                min(remaining, DEFAULT_REQUEST_TIMEOUT_SEC),
+                request_id,
+            )
+            if response is None:
+                continue
+            if response.code != SUCCESS_CODE:
+                return FlexlbResponse.error_response(
+                    response.code,
+                    response.error_message,
+                    _admission_reject_reason_from_response(response),
+                )
+            return FlexlbResponse.ok(
+                [
+                    RoleAddr(
+                        role=_resolve_role_from_server_status(item),
+                        ip=item.server_ip,
+                        http_port=item.http_port,
+                        grpc_port=item.grpc_port,
+                    )
+                    for item in response.server_status
+                ]
+            )
+        return FlexlbResponse.connection_failed_response()

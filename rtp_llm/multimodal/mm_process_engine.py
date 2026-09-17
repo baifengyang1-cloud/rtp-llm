@@ -175,6 +175,13 @@ def _report_preprocess_queue_size(queue_size: int) -> None:
         logging.exception("Failed to report ViT preprocess queue size")
 
 
+def _report_async_metric(metric, value, tags=None):
+    try:
+        kmonitor.report(metric, value, tags or {})
+    except Exception as error:
+        logging.exception("Failed to report ViT async metric: %s", error)
+
+
 def _count_images(mm_inputs: List[MultimodalInput]) -> int:
     """Count image-like inputs without treating videos or audio as images."""
     return sum(
@@ -1347,7 +1354,11 @@ class MMProcessEngine:
         return MMEmbeddingRes(emb_res, pos_res, extra_res, feature_hashes)
 
     def async_submit(
-        self, mm_inputs: List[MultimodalInput], request_id: int = 0
+        self,
+        mm_inputs: List[MultimodalInput],
+        request_id: int = 0,
+        *,
+        pretrigger: bool = False,
     ) -> List[str]:
         """Asynchronously submit multimodal URLs for embedding computation.
 
@@ -1357,7 +1368,9 @@ class MMProcessEngine:
         """
         try:
             self.mm_part.validate_inputs(mm_inputs)
-            claims = self._claim_and_submit_async(mm_inputs, request_id=request_id)
+            claims = self._claim_and_submit_async(
+                mm_inputs, request_id=request_id, pretrigger=pretrigger
+            )
             return [cache_key for cache_key, _ in claims]
         except Exception as error:
             self.report_vit_error(error)
@@ -1379,6 +1392,7 @@ class MMProcessEngine:
         If complete, returns immediately. With hashes_only, return sidecar hashes
         without exporting embeddings or promoting a CPU entry with cached hashes.
         """
+        wait_started = time.monotonic()
         current_entry: Optional[MMEmbeddingCacheEntry] = None
         try:
             self.mm_part.validate_inputs(mm_inputs)
@@ -1431,6 +1445,11 @@ class MMProcessEngine:
                 self.cancel_queued_request(request_id)
             self.report_vit_error(error, current_entry)
             raise
+        finally:
+            _report_async_metric(
+                GaugeMetrics.VIT_INFERENCE_WAIT_RT_METRIC,
+                (time.monotonic() - wait_started) * 1000,
+            )
 
     def _claim_and_submit_async(
         self,
@@ -1438,44 +1457,79 @@ class MMProcessEngine:
         request_id: int = 0,
         queue_timeout_ms: Optional[int] = None,
         cancellation_event: Optional[threading.Event] = None,
+        pretrigger: bool = False,
     ) -> List[Tuple[str, MMEmbeddingCacheEntry]]:
         claims: List[Tuple[str, MMEmbeddingCacheEntry]] = []
+        claim_logs: List[Tuple[str, str]] = []
+        merged = False
         pending: List[Tuple[MultimodalInput, str, MMEmbeddingCacheEntry]] = []
-        for mm_input in mm_inputs:
-            if mm_input.url == "":
-                raise ValueError(
-                    "async embedding requires non-empty url for each input"
-                )
-
-            cache_key = mm_input.cache_key()
-            with self._async_task_lock:
+        # Validate before publishing any claims, including later list items.
+        keyed_inputs = [(item, item.cache_key()) for item in mm_inputs]
+        if any(not item.url for item, _ in keyed_inputs):
+            raise ValueError("async embedding requires non-empty url for each input")
+        # Claim, capacity reservation and executor handoff are one transaction
+        # with respect to joiners and cancellation. submit() only enqueues;
+        # no media I/O or embedding wait is performed while holding this lock.
+        with self._async_task_lock:
+            if self._stopped:
+                raise RuntimeError("MMProcessEngine is stopped")
+            self._raise_if_async_request_cancelled(request_id, cancellation_event)
+            for mm_input, cache_key in keyed_inputs:
                 state, entry = self._async_cache.try_acquire(cache_key)
                 claims.append((cache_key, entry))
+                claim_logs.append((cache_key, state))
                 if (
                     state == "complete"
                     and self._embedding_cache.peek(cache_key) is entry
                 ):
                     self._hash_key_cache.get(cache_key, entry.generation)
                 if state == "miss":
+                    entry.pretrigger_initiated = pretrigger
                     self._async_tasks[entry] = _AsyncComputeTask(cache_key, entry)
                     pending.append((mm_input, cache_key, entry))
 
                 if state in ("miss", "in_progress"):
                     task = self._async_tasks.get(entry)
                     if task is not None:
+                        merged |= bool(task.request_ids - {request_id})
                         task.request_ids.add(request_id)
                         self._async_request_tasks.setdefault(request_id, set()).add(
                             entry
                         )
 
-        self._raise_if_async_request_cancelled(request_id, cancellation_event)
+            self._raise_if_async_request_cancelled(request_id, cancellation_event)
 
-        self._submit_async_compute_batch(
-            pending,
-            request_id=request_id,
-            queue_timeout_ms=queue_timeout_ms,
-        )
-        self._raise_if_async_request_cancelled(request_id, cancellation_event)
+            self._submit_async_compute_batch(
+                pending,
+                request_id=request_id,
+                queue_timeout_ms=queue_timeout_ms,
+            )
+            self._raise_if_async_request_cancelled(request_id, cancellation_event)
+
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            for cache_key, state in claim_logs:
+                logging.debug(
+                    "ViT claim request_id=%s cache_key=%s state=%s pretrigger=%s",
+                    request_id,
+                    cache_key,
+                    state,
+                    pretrigger,
+                )
+
+        if merged:
+            _report_async_metric(
+                AccMetrics.VIT_REQUEST_MERGE_QPS_METRIC,
+                1,
+                {"caller": "pretrigger" if pretrigger else "inference"},
+            )
+        if not pretrigger:
+            for _, entry in claims:
+                if entry.claim_pretrigger_reuse():
+                    _report_async_metric(
+                        AccMetrics.VIT_PRETRIGGER_REUSE_QPS_METRIC,
+                        1,
+                        {"state": "complete" if entry.is_done else "in_progress"},
+                    )
         return claims
 
     def _raise_if_async_request_cancelled(
@@ -1565,8 +1619,14 @@ class MMProcessEngine:
             return True, self._async_admitted
         with self._async_admission_lock:
             if self._async_admitted + count > self._async_admission_capacity:
+                _report_async_metric(
+                    AccMetrics.VIT_ADMISSION_QPS_METRIC, count, {"outcome": "rejected"}
+                )
                 return False, self._async_admitted
             self._async_admitted += count
+            _report_async_metric(
+                GaugeMetrics.VIT_ASYNC_ACTIVE_TASKS_METRIC, self._async_admitted
+            )
             return True, self._async_admitted
 
     def _release_async_slots(self, count: int = 1) -> None:
@@ -1580,6 +1640,9 @@ class MMProcessEngine:
                     self._async_admitted,
                 )
                 self._async_admitted = 0
+            _report_async_metric(
+                GaugeMetrics.VIT_ASYNC_ACTIVE_TASKS_METRIC, self._async_admitted
+            )
 
     def _resolve_async_timeout_ms(
         self,
@@ -1671,6 +1734,11 @@ class MMProcessEngine:
                 ExceptionType.GENERATE_TIMEOUT,
                 "ViT queue wait timed out before execution",
             )
+            logging.warning(
+                "ViT queue deadline exceeded request_id=%s cache_key=%s",
+                request_id,
+                cache_key,
+            )
             self._fail_async_compute(cache_key, entry, error)
             return
         self._async_compute(mm_inputs, cache_key, entry, request_id)
@@ -1726,6 +1794,9 @@ class MMProcessEngine:
                         deadline,
                     )
                     self._async_tasks[entry].future = future
+                    _report_async_metric(
+                        AccMetrics.VIT_ADMISSION_QPS_METRIC, 1, {"outcome": "accepted"}
+                    )
                     future.add_done_callback(
                         lambda completed, key=cache_key, cache_entry=entry: self._on_async_compute_done(
                             key, cache_entry, completed
@@ -1780,6 +1851,9 @@ class MMProcessEngine:
                 raise RuntimeError("async embedding did not produce a cache value")
             work_items[0].complete_cache(raw_result, force=True)
         except Exception as e:
+            logging.exception(
+                "ViT background computation failed request_id=%s", request_id
+            )
             # If greennet never decided (preprocess crash etc.), surface a
             # process-error verdict so WaitGreenNetVerdict doesn't hang.
             self._fail_async_compute(cache_key, entry, e)
