@@ -270,6 +270,7 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_lengths: tuple[int, ...] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -294,7 +295,11 @@ class Qwen3_5MoeVisionAttention(nn.Module):
 
         if default_attn_impl == "flash_attention_2":
             # Flash Attention: Use cu_seqlens for variable length attention
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            max_seqlen = (
+                max(sequence_lengths)
+                if sequence_lengths is not None
+                else (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            )
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -312,9 +317,10 @@ class Qwen3_5MoeVisionAttention(nn.Module):
             )
         else:
             # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if sequence_lengths is None:
+                sequence_lengths = tuple((cu_seqlens[1:] - cu_seqlens[:-1]).tolist())
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2)
+                tensor.split(sequence_lengths, dim=2)
                 for tensor in (query_states, key_states, value_states)
             ]
 
@@ -542,6 +548,13 @@ class Qwen3_5MoeVisionModel(PreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        # Preprocessing produces host grids. Keep shape metadata on the host:
+        # reading GPU lengths in every attention block serializes CPU dispatch
+        # with the device. Accept device grids from direct callers as well.
+        grid_thw = grid_thw.cpu()
+        sequence_lengths = tuple(
+            h * w for t, h, w in grid_thw.tolist() for _ in range(t)
+        )
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -566,12 +579,15 @@ class Qwen3_5MoeVisionModel(PreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        if default_attn_impl == "flash_attention_2":
+            cu_seqlens = cu_seqlens.to(hidden_states.device)
 
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
+                sequence_lengths=sequence_lengths,
                 **kwargs,
             )
 

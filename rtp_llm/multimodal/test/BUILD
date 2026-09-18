@@ -79,6 +79,12 @@ py_test(
 )
 
 py_test(
+    name = "qwen35_vision_metadata_test",
+    srcs = ["qwen35_vision_metadata_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
     name = "mm_scheduler_test",
     srcs = [
         "mm_scheduler_test.py",

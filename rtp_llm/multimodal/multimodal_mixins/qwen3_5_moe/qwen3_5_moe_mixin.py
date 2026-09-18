@@ -70,14 +70,14 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
     @torch.inference_mode()
     def embedding(self, data, **kwargs):
         pixel_values = data[0].to(self._device).to(self._data_type)
-        grid_thw = data[1].to(self._device)
+        grid_thw = data[1].cpu()
         vision_output = self.visual(
             pixel_values, grid_thw=grid_thw, return_dict=True, **kwargs
         )
         image_embeds = vision_output.pooler_output
         split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
-        pos_id = self.get_position_ids(grid_thw)[0]
+        pos_id = self.get_position_ids(grid_thw, device=self._device)[0]
         return image_embeds[0].to(self._data_type), pos_id
 
     @torch.inference_mode()
@@ -95,23 +95,26 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
         pixel_values = (
             torch.concat(pixel_values_list, dim=0).to(self._device).to(self._data_type)
         )
-        grid_thw = torch.concat(grid_thw_list, dim=0).to(self._device)
+        grid_thw = torch.concat(grid_thw_list, dim=0).cpu()
         vision_output = self.visual(
             pixel_values, grid_thw=grid_thw, return_dict=True, **kwargs
         )
         image_embeds = vision_output.pooler_output
         split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
-        pos_id = self.get_position_ids(grid_thw)
+        pos_id = self.get_position_ids(grid_thw, device=self._device)
         for e, p in zip(image_embeds, pos_id):
             res_list.append((e.to(self._data_type), p))
         return res_list
 
-    def get_position_ids(self, grid_thw: torch.Tensor = None) -> torch.Tensor:
+    def get_position_ids(
+        self, grid_thw: torch.Tensor = None, device: Optional[torch.device] = None
+    ) -> torch.Tensor:
         spatial_merge_size = self.visual.spatial_merge_size
-        device = grid_thw.device
+        device = grid_thw.device if device is None else device
         dtype = torch.int32
 
+        grid_thw = grid_thw.cpu()
         t_all = grid_thw[:, 0].to(dtype)
         h_all = (grid_thw[:, 1] // spatial_merge_size).to(dtype)
         w_all = (grid_thw[:, 2] // spatial_merge_size).to(dtype)
