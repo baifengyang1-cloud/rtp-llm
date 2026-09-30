@@ -693,7 +693,10 @@ public final class RequestSlot {
             claim.completeCalled = true;
             if (failed) {
                 failureResponse = selectDeliveryFailureLocked(claim.item, result.status(),
-                        "Delivery failed: " + detailOf(result.cause()));
+                        "Delivery failed: " + detailOf(result.cause()),
+                        result.status() == DeliveryResult.Status.NOT_SENT
+                                && result.cause() instanceof VitRouteStaleException
+                                ? StrategyErrorType.VIT_ROUTE_STALE : StrategyErrorType.DISPATCH_FAILED);
             } else if (ownsDeliveryClaimLocked(claim)) {
                 if (result.status() == DeliveryResult.Status.DELIVERED) {
                     claim.item.ctx().setAckAtMs(System.currentTimeMillis());
@@ -773,13 +776,18 @@ public final class RequestSlot {
 
     /** Select the failure now; endpoint cleanup and protocol completion may follow later. */
     private SelectedPublication selectDeliveryFailureLocked(ScheduledRequest exact, DeliveryResult.Status source, String detail) {
+        return selectDeliveryFailureLocked(exact, source, detail, StrategyErrorType.DISPATCH_FAILED);
+    }
+
+    private SelectedPublication selectDeliveryFailureLocked(ScheduledRequest exact, DeliveryResult.Status source,
+                                                            String detail, StrategyErrorType errorType) {
         requireSlotLock("request failure");
         if (!ownsActiveItem(exact) || cleanupProgress != null) { return null; }
         CancelReason cancellation = cancellationReason != null ? cancellationReason : pendingAdmissionCancelReason;
         String message = cancellation == null ? detail : cancellation.getMessage() + "; " + detail;
         TerminalOutcome outcome = cancellation == null ? TerminalOutcome.fail(message)
                 : TerminalOutcome.cancellation(cancellation, message);
-        Response response = cancellation == null ? buildErrorResponse(StrategyErrorType.DISPATCH_FAILED, message)
+        Response response = cancellation == null ? buildErrorResponse(errorType, message)
                 : Response.copyOf(cancellationResponse);
         PublicationPermit permit = publicationWinner == null && !future.isDone()
                 ? requirePublicationPermitLocked(PublicationKind.TERMINAL) : null;

@@ -112,6 +112,13 @@ public class DefaultRouter {
             for (RoleType role : roles) {
                 PlacementResult<SelectedRole, RoleType> result =
                         selectRole(context, role, group, decodeAdmission);
+                if (role == RoleType.VIT && result.status() == PlacementResult.Status.REJECTED
+                        && result.failure().getCode() == StrategyErrorType.VIT_ROUTE_STALE.getErrorCode()) {
+                    SelectedRole replacement = vitSelector.reselect(context, group);
+                    if (replacement != null) {
+                        result = PlacementResult.success(replacement);
+                    }
+                }
                 if (result.status() != PlacementResult.Status.SUCCESS) {
                     Logger.debug(
                             "Failed to select {} worker for request {}",

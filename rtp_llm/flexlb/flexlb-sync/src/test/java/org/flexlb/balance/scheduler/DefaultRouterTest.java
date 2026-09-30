@@ -543,6 +543,37 @@ class DefaultRouterTest {
     }
 
     @Test
+    void staleFrontendVitIsReselectedBeforeAdmissionWithoutChangingRequestId() {
+        when(modelMeta.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.VIT));
+        BalanceContext context = context(49L);
+        ServerStatus stale = new ServerStatus();
+        stale.setRole(RoleType.VIT);
+        stale.setServerIp("old");
+        context.getRequest().setSelectedVit(stale);
+        SelectionFixture prefill = selection(RoleType.PREFILL, 49L, "p", 8001, "g1");
+        var debug = new org.flexlb.dao.loadbalance.DebugInfo();
+        debug.setHitCacheLen(16L);
+        prefill.status.setDebugInfo(debug);
+        SelectionFixture replacement = selection(RoleType.VIT, 49L, "new", 8002, "g1");
+        when(prefillSelector.select(context, RoleType.PREFILL, null))
+                .thenReturn(PlacementResult.success(prefill.selection));
+        when(vitSelector.reselect(context, "g1")).thenReturn(replacement.selection);
+
+        var result = router().select(context);
+        assertEquals(PlacementResult.Status.SUCCESS, result.status());
+        try (var admission = result.value()) {
+            var item = admission.createScheduledRequest(context, new CompletableFuture<>(), System.currentTimeMillis());
+            assertEquals(49L, item.requestId());
+            assertEquals("new", item.routeResponse().getServerStatus().get(1).getServerIp());
+            assertSame(replacement.endpoint, item.vitEp());
+            assertEquals(16L, item.hitCache());
+            assertSame(stale, context.getRequest().getSelectedVit());
+        }
+        verify(replacement.pin).close();
+        verify(prefill.pin).close();
+    }
+
+    @Test
     void laterSelectionFailureClosesEveryEarlierExactPinOwner() {
         when(modelMeta.requiredRoles())
                 .thenReturn(List.of(RoleType.PREFILL, RoleType.VIT));

@@ -76,6 +76,28 @@ class RandomStrategyTest {
     }
 
     @Test
+    void replacementIgnoresStaleFrontendHintAndPreservesGroup() {
+        registerVit("127.0.0.3", 8080, "group-a");
+        registerVit("127.0.0.4", 8080, "group-b");
+        var context = context(5L);
+        var stale = new org.flexlb.dao.loadbalance.ServerStatus();
+        stale.setRole(RoleType.VIT);
+        stale.setServerIp("gone");
+        context.getRequest().setSelectedVit(stale);
+        try (SelectedRole selected = strategy.reselect(context, "group-a")) {
+            assertNotNull(selected);
+            assertEquals("127.0.0.3", selected.serverStatus().getServerIp());
+            assertEquals("gone", context.getRequest().getSelectedVit().getServerIp());
+        }
+        // null here denotes the original unnamed group, not a wildcard.
+        assertNull(strategy.reselect(context, null));
+        registerVit("127.0.0.5", 8080, null);
+        try (SelectedRole selected = strategy.reselect(context, null)) {
+            assertEquals("127.0.0.5", selected.serverStatus().getServerIp());
+        }
+    }
+
+    @Test
     void distributesAcrossRegisteredVitWorkers() {
         registerVit("127.0.0.1", 8080, null);
         registerVit("127.0.0.2", 8080, null);

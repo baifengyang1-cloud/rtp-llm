@@ -223,16 +223,22 @@ public final class BatchDeliveryStrategy implements DeliveryStrategy {
         try {
             for (int index = 0; index < original.size(); index++) {
                 ScheduledRequest item = original.get(index);
+                DeliveryClaim claim = null;
                 try {
-                    DeliveryClaim claim =
-                            requests.claimBatchDelivery(
-                                    item, batch);
+                    claim = requests.claimBatchDelivery(item, batch);
                     if (claim == null) {
                         continue;
                     }
+                    // Validate each independent payload before choosing the final
+                    // membership and prediction. A stale ViT only ends its own claim.
+                    sender.prepareMember(item);
                     claimed.add(new ClaimedMember(item, claim));
                 } catch (Throwable claimFailure) {
-                    requests.failDeliveryPreparation(item, claimFailure);
+                    if (claim != null) {
+                        claim.complete(DeliveryResult.notSent(claimFailure));
+                    } else {
+                        requests.failDeliveryPreparation(item, claimFailure);
+                    }
                 }
             }
 
@@ -789,6 +795,9 @@ public final class BatchDeliveryStrategy implements DeliveryStrategy {
     /** Transport consumes the strategy's final batch; it never selects members. */
     @FunctionalInterface
     public interface BatchSender {
+        /** Validate/prepare one claimed member; failures are settled before final batch prediction. */
+        default void prepareMember(ScheduledRequest item) throws Exception { }
+
         void sendBatch(
                 List<ScheduledRequest> exactItems,
                 long batchId,

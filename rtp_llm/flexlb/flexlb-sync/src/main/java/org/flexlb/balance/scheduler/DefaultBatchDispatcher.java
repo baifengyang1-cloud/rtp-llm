@@ -9,10 +9,14 @@ import io.micrometer.core.instrument.util.NamedThreadFactory;
 import org.flexlb.balance.delivery.CapacityBoundary;
 import org.flexlb.balance.delivery.DeliveryResult;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
+import org.flexlb.balance.endpoint.WorkerEndpoint;
+import org.flexlb.balance.strategy.RandomStrategy;
+import org.flexlb.balance.strategy.SelectedRole;
 import org.flexlb.balance.projection.RouteProjection;
 import org.flexlb.balance.scheduler.BatchDeliveryStrategy.PreparedSubmission;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.DispatcherConfig;
+import org.flexlb.config.ModelMetaConfig;
 import org.flexlb.constant.MetricConstant;
 import org.flexlb.dao.loadbalance.Request;
 import org.flexlb.dao.loadbalance.ServerStatus;
@@ -23,12 +27,14 @@ import org.flexlb.engine.grpc.RoleTypeProtoConverter;
 import org.flexlb.telemetry.FlexlbTrace;
 import org.flexlb.util.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -45,6 +51,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
 /**
  * Default batch-submission execution adapter.
@@ -69,6 +76,8 @@ public class DefaultBatchDispatcher {
 
     private final EngineGrpcClient grpcClient;
     private final ConfigService configService;
+    private final boolean remoteVit;
+    private final Supplier<RandomStrategy> vitSelector;
     private final ThreadPoolExecutor dispatchExecutor;
     private final ThreadPoolExecutor completionExecutor;
     private final int admissionCapacity;
@@ -108,6 +117,21 @@ public class DefaultBatchDispatcher {
 
     @Autowired
     public DefaultBatchDispatcher(EngineGrpcClient grpcClient, ConfigService configService,
+                                  @Autowired(required = false) MeterRegistry meterRegistry,
+                                  ModelMetaConfig modelMetaConfig, ObjectProvider<RandomStrategy> vitSelector) {
+        this(grpcClient, configService, meterRegistry,
+                configService.loadBalanceConfig().getInternalRuntime().getBatchDispatchThreads(),
+                configService.loadBalanceConfig().getInternalRuntime().getBatchDispatchQueueCapacity(),
+                modelMetaConfig.requiredRoles().contains(RoleType.VIT),
+                () -> vitSelector == null ? null : vitSelector.getObject());
+    }
+
+    DefaultBatchDispatcher(EngineGrpcClient grpcClient, ConfigService configService,
+                           MeterRegistry meterRegistry, ModelMetaConfig modelMetaConfig) {
+        this(grpcClient, configService, meterRegistry, modelMetaConfig, null);
+    }
+
+    public DefaultBatchDispatcher(EngineGrpcClient grpcClient, ConfigService configService,
                                   @Autowired(required = false) MeterRegistry meterRegistry) {
         this(grpcClient, configService, meterRegistry,
                 configService.loadBalanceConfig().getInternalRuntime()
@@ -119,6 +143,22 @@ public class DefaultBatchDispatcher {
     /** Package-visible sizing injection keeps integration fixtures bounded and deterministic. */
     DefaultBatchDispatcher(EngineGrpcClient grpcClient, ConfigService configService,
                            MeterRegistry meterRegistry, int poolSize, int queueSize) {
+        this(grpcClient, configService, meterRegistry, poolSize, queueSize, false, (RandomStrategy) null);
+    }
+
+    DefaultBatchDispatcher(EngineGrpcClient grpcClient, ConfigService configService,
+                           MeterRegistry meterRegistry, int poolSize, int queueSize,
+                           boolean remoteVit, RandomStrategy vitSelector) {
+        this(grpcClient, configService, meterRegistry, poolSize, queueSize, remoteVit, () -> vitSelector);
+    }
+
+    private DefaultBatchDispatcher(EngineGrpcClient grpcClient, ConfigService configService,
+                                   MeterRegistry meterRegistry, int poolSize, int queueSize,
+                                   boolean remoteVit, Supplier<RandomStrategy> vitSelector) {
+        // Resolve only during dispatch: WorkerDirectory -> EndpointRegistry ->
+        // DeliveryStrategy already depends on this dispatcher during startup.
+        this.remoteVit = remoteVit;
+        this.vitSelector = vitSelector;
         this.grpcClient = grpcClient;
         this.configService = configService;
         this.meterRegistry = meterRegistry;
@@ -287,9 +327,19 @@ public class DefaultBatchDispatcher {
             }
             try {
                 dispatchExecutor.execute(() -> {
-                    try {
-                        delivery.run((items, batchId, predictedMs, reason, observer) ->
-                                doDispatch(dispatchTask(items, batchId, predictedMs, reason, observer)));
+                    try (DispatchAttempt attempt = new DispatchAttempt()) {
+                        delivery.run(new BatchDeliveryStrategy.BatchSender() {
+                            @Override
+                            public void prepareMember(ScheduledRequest item) throws InvalidProtocolBufferException {
+                                preparedInput(item, attempt.roleAddresses);
+                            }
+
+                            @Override
+                            public void sendBatch(List<ScheduledRequest> items, long batchId, long predictedMs,
+                                                  String reason, BiConsumer<ScheduledRequest, DeliveryResult> observer) {
+                                doDispatch(dispatchTask(items, batchId, predictedMs, reason, observer), attempt);
+                            }
+                        });
                     } catch (Throwable deliveryFailure) {
                         // Delivery owns admission cleanup; do not infer a
                         // second per-request outcome from task failure.
@@ -354,8 +404,7 @@ public class DefaultBatchDispatcher {
 
     // ==================== Internal: dispatch pipeline (runs on executor thread) ====================
 
-    private void doDispatch(DispatchTask task) {
-        DispatchAttempt attempt = new DispatchAttempt();
+    private void doDispatch(DispatchTask task, DispatchAttempt attempt) {
         try {
             doDispatchInternal(task, attempt);
         } catch (Throwable unexpectedFailure) {
@@ -384,11 +433,11 @@ public class DefaultBatchDispatcher {
         // 1. Build gRPC request
         EngineRpcService.EnqueueBatchRequestPB request;
         try {
-            request = buildBatchRequest(batchId, items);
+            request = buildBatchRequest(batchId, items, attempt);
         } catch (Exception e) {
             Logger.error("Failed to build FlexLB batch request batchId: {}", batchId, e);
-            failItems(items, batchId,
-                    "Batch request build failed: " + e.getMessage(), observer);
+            failItems(items, batchId, e instanceof VitRouteStaleException ? e
+                    : new IllegalArgumentException("Batch request build failed: " + e.getMessage(), e), observer);
             return;
         }
 
@@ -654,14 +703,15 @@ public class DefaultBatchDispatcher {
 
     // ==================== gRPC request building ====================
 
-    private EngineRpcService.EnqueueBatchRequestPB buildBatchRequest(long batchId, List<ScheduledRequest> items)
+    private EngineRpcService.EnqueueBatchRequestPB buildBatchRequest(
+            long batchId, List<ScheduledRequest> items, DispatchAttempt attempt)
             throws InvalidProtocolBufferException {
         EngineRpcService.EnqueueBatchRequestPB.Builder builder =
                 EngineRpcService.EnqueueBatchRequestPB.newBuilder()
                         .setBatchId(batchId)
                         .setFetchAttachTimeoutMs(configService.loadBalanceConfig()
                                 .getDispatcher().getFetchAttachTimeoutMs());
-        BatchRoleAddressCache roleAddresses = new BatchRoleAddressCache();
+        BatchRoleAddressCache roleAddresses = attempt.roleAddresses;
         if (!items.isEmpty()) {
             long dpRank = items.get(0).prefill().getDpRank();
             boolean singleDpRank = true;
@@ -701,10 +751,21 @@ public class DefaultBatchDispatcher {
                         .setDpRank((int) dpRank);
         for (ScheduledRequest item : items) {
             slot.addRequests(EngineRpcService.EnqueueBatchExternalInputPB.newBuilder()
-                    .setInput(buildInput(item, roleAddresses))
+                    .setInput(preparedInput(item, roleAddresses))
                     .build());
         }
         return slot.build();
+    }
+
+    /** Build once before membership is finalized; keep the selected generation pinned through send. */
+    private EngineRpcService.GenerateInputPB preparedInput(
+            ScheduledRequest item, BatchRoleAddressCache roleAddresses) throws InvalidProtocolBufferException {
+        var prepared = roleAddresses.attempt.inputs.get(item);
+        if (prepared == null) {
+            prepared = buildInput(item, roleAddresses);
+            roleAddresses.attempt.inputs.put(item, prepared);
+        }
+        return prepared;
     }
 
     private EngineRpcService.GenerateInputPB buildInput(
@@ -742,6 +803,7 @@ public class DefaultBatchDispatcher {
         config.clearRoleAddrs();
         addRoleAddr(config, roleAddresses.prefill(item.prefill()));
         addRoleAddr(config, roleAddresses.decode(item.decode()));
+        addRoleAddr(config, selectedVitAddress(item, input, roleAddresses.attempt));
         // Pass the normalized Auto-TPM priority through to the engine
         // (metrics tagging only). normalize() always sets 1-100, so every
         // dispatched request carries its priority into the proto field.
@@ -750,6 +812,68 @@ public class DefaultBatchDispatcher {
             input.setPriority(request.getPriority());
         }
         return input.build();
+    }
+
+    private EngineRpcService.RoleAddrPB selectedVitAddress(
+            ScheduledRequest item, EngineRpcService.GenerateInputPB.Builder input,
+            DispatchAttempt attempt) {
+        // Topology selection may include ViT even for text-only requests.
+        // Such requests never call remote multimodal processing.
+        if (input.getMultimodalInputsCount() == 0) {
+            return null;
+        }
+        ServerStatus vit = null;
+        if (item.routeResponse() != null && item.routeResponse().getServerStatus() != null) {
+            for (ServerStatus status : item.routeResponse().getServerStatus()) {
+                if (status != null && status.getRole() == RoleType.VIT) {
+                    if (vit != null) {
+                        throw new IllegalArgumentException("multiple selected ViT workers for request " + item.requestId());
+                    }
+                    vit = status;
+                }
+            }
+        }
+        if (vit == null) {
+            if (item.vitEp() != null || item.ctx().getRequest().getSelectedVit() != null
+                    || (remoteVit && input.getMultimodalInputsCount() > 0)) {
+                throw new IllegalArgumentException("missing selected ViT worker for request " + item.requestId());
+            }
+            return null;
+        }
+        if (vit.getServerIp() == null || vit.getServerIp().isBlank() || vit.getGrpcPort() <= 0) {
+            throw new IllegalArgumentException("invalid selected ViT address for request " + item.requestId());
+        }
+        WorkerEndpoint endpoint = item.vitEp();
+        if (endpoint == null || !vit.getServerIp().equals(endpoint.getIp())
+                || vit.getHttpPort() != endpoint.getHttpPort()
+                || vit.getGrpcPort() != endpoint.getGrpcPort()) {
+            throw new IllegalArgumentException("selected ViT address has no matching generation for request "
+                    + item.requestId());
+        }
+        WorkerEndpoint.GenerationPin pin = endpoint.tryPinGeneration();
+        if (pin != null) {
+            attempt.vitPins.add(pin);
+            return buildRoleAddr(vit);
+        }
+        // No bytes have been sent. Preserve admission, deadline and request ID;
+        // only replace the stateless ViT in the already selected model group.
+        RandomStrategy selector = vitSelector.get();
+        try (SelectedRole replacement = selector == null ? null
+                : selector.reselect(item.ctx(), vit.getGroup())) {
+            if (replacement == null) {
+                throw new VitRouteStaleException(item.requestId());
+            }
+            ServerStatus status = replacement.serverStatus();
+            WorkerEndpoint.GenerationPin replacementPin = replacement.takeGenerationPin();
+            attempt.vitPins.add(replacementPin);
+            if (!Objects.equals(vit.getGroup(), status.getGroup())
+                    || status.getGrpcPort() <= 0
+                    || status.getGrpcPort() != replacementPin.endpoint().getGrpcPort()) {
+                throw new IllegalArgumentException("invalid replacement ViT for request " + item.requestId());
+            }
+            item.replaceVitRoute(status, replacementPin.endpoint());
+            return buildRoleAddr(status);
+        }
     }
 
     private static void addRoleAddr(
@@ -785,6 +909,12 @@ public class DefaultBatchDispatcher {
 
     /** Reuses immutable role addresses while building one batch payload. */
     private static final class BatchRoleAddressCache {
+        private final DispatchAttempt attempt;
+
+        private BatchRoleAddressCache(DispatchAttempt attempt) {
+            this.attempt = attempt;
+        }
+
         private EngineRpcService.RoleAddrPB prefill;
         private EngineRpcService.RoleAddrPB decode;
 
@@ -848,7 +978,15 @@ public class DefaultBatchDispatcher {
     }
 
     /** Per-dispatch phase marker used only by the executor thread. */
-    private static final class DispatchAttempt {
+    private static final class DispatchAttempt implements AutoCloseable {
+        private final List<WorkerEndpoint.GenerationPin> vitPins = new ArrayList<>();
+        private final Map<ScheduledRequest, EngineRpcService.GenerateInputPB> inputs = new IdentityHashMap<>();
+        private final BatchRoleAddressCache roleAddresses = new BatchRoleAddressCache(this);
         private boolean rpcInvocationStarted;
+
+        @Override
+        public void close() {
+            vitPins.forEach(WorkerEndpoint.GenerationPin::close);
+        }
     }
 }

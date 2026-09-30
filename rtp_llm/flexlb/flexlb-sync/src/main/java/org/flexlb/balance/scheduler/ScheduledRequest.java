@@ -3,6 +3,7 @@ package org.flexlb.balance.scheduler;
 import org.flexlb.balance.endpoint.DecodeEndpoint;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
 import org.flexlb.balance.endpoint.PrefillState;
+import org.flexlb.balance.endpoint.WorkerEndpoint;
 import org.flexlb.balance.prediction.DecodeCostFormula;
 import org.flexlb.config.DispatcherConfig;
 import org.flexlb.config.FlexlbConfig;
@@ -34,9 +35,10 @@ public final class ScheduledRequest implements Prioritized {
 
     private final BalanceContext ctx;
     private final CompletableFuture<Response> future;
-    private final Response routeResponse;
+    private volatile Response routeResponse;
     private final ServerStatus prefill;
     private final PrefillEndpoint prefillEp;
+    private volatile WorkerEndpoint vitEp;
     private final DecodeBinding decodeBinding;
     private final long enqueuedAtMs;
     private final long enqueueSequence;
@@ -75,6 +77,15 @@ public final class ScheduledRequest implements Prioritized {
                      DecodeEndpoint.ReservationHandle decodeReservation,
                      long enqueuedAtMs,
                      DecodeBinding frozenDecode) {
+        this(ctx, future, routeResponse, prefill, decode, prefillEp, decodeEp, decodeReservation,
+                enqueuedAtMs, frozenDecode, null);
+    }
+
+    ScheduledRequest(BalanceContext ctx, CompletableFuture<Response> future, Response routeResponse,
+                     ServerStatus prefill, ServerStatus decode, PrefillEndpoint prefillEp,
+                     DecodeEndpoint decodeEp, DecodeEndpoint.ReservationHandle decodeReservation,
+                     long enqueuedAtMs, DecodeBinding frozenDecode, WorkerEndpoint vitEp) {
+        this.vitEp = vitEp;
         this.ctx = Objects.requireNonNull(ctx, "ctx");
         this.future = future;
         this.routeResponse = routeResponse;
@@ -104,6 +115,8 @@ public final class ScheduledRequest implements Prioritized {
     public ServerStatus prefill() { return prefill; }
     public ServerStatus decode() { return decodeBinding.status(); }
     public PrefillEndpoint prefillEp() { return prefillEp; }
+    /** Exact selected generation, retained without pinning it throughout queue wait. */
+    public WorkerEndpoint vitEp() { return vitEp; }
     public DecodeEndpoint decodeEp() { return decodeBinding.endpoint(); }
     public DecodeEndpoint.ReservationHandle decodeReservation() {
         return decodeBinding.reservation();
@@ -190,6 +203,22 @@ public final class ScheduledRequest implements Prioritized {
     /** Cache-hit tokens on the assigned prefill endpoint. */
     public long hitCache() {
         return hitCache;
+    }
+
+    /**
+     * Dispatch-thread update, published before any Engine RPC or success response.
+     * Keep the admitted P/D work estimates: routing hashes are advisory; actual
+     * cache lookup uses the hashes returned with the replacement's embeddings.
+     * The same model group and preprocessing input preserve the token count.
+     */
+    void replaceVitRoute(ServerStatus replacement, WorkerEndpoint endpoint) {
+        Response updated = Response.copyOf(routeResponse);
+        updated.setServerStatus(updated.getServerStatus().stream()
+                .map(status -> status != null && status.getRole() == org.flexlb.dao.route.RoleType.VIT
+                        ? ServerStatus.copyOf(replacement) : status)
+                .toList());
+        vitEp = endpoint;
+        routeResponse = updated;
     }
 
     /** Extract cache-hit length from a {@link ServerStatus} debug info. */

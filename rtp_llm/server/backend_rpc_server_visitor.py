@@ -20,11 +20,7 @@ from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
 from rtp_llm.ops import SpeculativeExecutionConfig, VitSeparation, get_block_cache_keys
 from rtp_llm.server.cache_key_routing import route_cache_keys_for_page_rr
 from rtp_llm.server.host_service import HostService, HostServiceArgs
-from rtp_llm.server.master_client import (
-    VIT_ROUTE_STALE_CODE,
-    FlexlbResponse,
-    MasterClient,
-)
+from rtp_llm.server.master_client import FlexlbResponse, MasterClient
 from rtp_llm.server.misc import format_exception
 from rtp_llm.server.mm_cache_routing import multimodal_routing_tokens
 from rtp_llm.server.recent_cache_key_window import RecentCacheKeyWindow
@@ -425,7 +421,6 @@ class BackendRPCServerVisitor:
         self._report_recent_cache_key_metrics(block_cache_keys)
         input_pb = trans_input(input)
 
-        retry_vit = False
         try:
             route_result = await self.master_client.get_backend_role_addrs(
                 block_cache_keys=block_cache_keys,
@@ -435,77 +430,6 @@ class BackendRPCServerVisitor:
                 input_pb=input_pb,
                 **route_args,
             )
-            if (
-                selected_vit is not None
-                and route_result.error_code == VIT_ROUTE_STALE_CODE
-            ):
-                # Expanded length may select a different group; old hashes are
-                # only hints for the old worker and must not survive re-routing.
-                route_args.pop("selected_vit")
-                selected_vit = None
-                route_result = await self.master_client.get_backend_role_addrs(
-                    block_cache_keys=[],
-                    cache_key_block_size=self._cache_key_block_size(),
-                    input=input,
-                    request_id=input.request_id,
-                    media_keys=keys,
-                    vit_only=True,
-                    **route_args,
-                )
-                retry_vit = True
-            if retry_vit and route_result.is_ok:
-                # After fallback/reselection, acquire the chosen worker's
-                # hashes before making the final prefill decision.
-                new_vits = [
-                    a for a in route_result.role_addrs if a.role == RoleType.VIT
-                ]
-                statuses = (route_result.result or {}).get("server_status", [])
-                status = next(
-                    (
-                        s
-                        for s in statuses
-                        if isinstance(s, dict) and s.get("role") == RoleType.VIT.name
-                    ),
-                    None,
-                )
-                if len(new_vits) != 1 or status is None:
-                    raise FtRuntimeException(
-                        ExceptionType.ROUTE_ERROR, "Invalid replacement ViT route"
-                    )
-                selected_vit = new_vits[0]
-                metadata = await self.master_client.get_vit_cache_metadata(
-                    selected_vit, keys, input=input
-                )
-                original_tokens = input.token_ids.reshape(-1).tolist()
-                token_ids, full_length = multimodal_routing_tokens(
-                    original_tokens,
-                    self.mm_model_config.mm_sep_tokens,
-                    self.mm_model_config.include_sep_tokens,
-                    keys,
-                    metadata,
-                    self.max_seq_len,
-                    compact=True,
-                )
-                if full_length is None:
-                    raise FtRuntimeException(
-                        ExceptionType.MM_PROCESS_ERROR,
-                        "Incomplete replacement ViT routing hashes",
-                    )
-                block_cache_keys = self._route_cache_keys(
-                    get_block_cache_keys(token_ids, self.seq_size_per_block)
-                )
-                del metadata, original_tokens, token_ids
-                route_args.update(
-                    selected_vit=status, seq_len=full_length - input.prefix_length
-                )
-                route_result = await self.master_client.get_backend_role_addrs(
-                    block_cache_keys=block_cache_keys,
-                    cache_key_block_size=self._cache_key_block_size(),
-                    input=input,
-                    request_id=input.request_id,
-                    input_pb=input_pb,
-                    **route_args,
-                )
         except BaseException as e:
             exception_json = format_exception(e)
             kmonitor.report(
@@ -516,10 +440,16 @@ class BackendRPCServerVisitor:
             raise
 
         if route_result.is_ok:
-            if selected_vit is not None and selected_vit not in route_result.role_addrs:
+            if (
+                selected_vit is not None
+                and sum(addr.role == RoleType.VIT for addr in route_result.role_addrs)
+                != 1
+            ):
                 raise FtRuntimeException(
-                    ExceptionType.ROUTE_ERROR, "master changed the selected ViT route"
+                    ExceptionType.ROUTE_ERROR, "master returned invalid final ViT route"
                 )
+            # Master owns the final ViT selection, including replacement before
+            # batch dispatch. The initial metadata remains a routing hint.
             input.generate_config.role_addrs = route_result.role_addrs
             input.enqueued_by_master = route_result.enqueued_by_master
             route_logger.debug(

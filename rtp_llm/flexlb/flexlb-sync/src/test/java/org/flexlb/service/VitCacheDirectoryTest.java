@@ -71,6 +71,16 @@ class VitCacheDirectoryTest {
         directory.stop();
     }
 
+    @Test
+    void replacementSelectionKeepsExactGroupIncludingUnnamedGroup() {
+        assertEquals("10.0.0.1", directory.selectReplacement(context("image"), "one").getServerIp());
+        assertFalse(directory.selectReplacement(context("image"), null).isSuccess());
+        WorkerStatus unnamed = worker("10.0.0.3", null);
+        live.put(unnamed.getIpPort(), unnamed);
+        assertEquals("10.0.0.3", directory.selectReplacement(context("image"), null).getServerIp());
+        assertFalse(directory.selectReplacement(context("image"), "missing").isSuccess());
+    }
+
     private WorkerStatus worker(String ip, String group) {
         WorkerStatus worker = mock(WorkerStatus.class);
         when(worker.getIp()).thenReturn(ip);

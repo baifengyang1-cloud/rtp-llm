@@ -6,12 +6,22 @@ import com.google.protobuf.DynamicMessage;
 import org.flexlb.balance.delivery.CapacityBoundary;
 import org.flexlb.balance.delivery.DeliveryResult;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
+import org.flexlb.balance.endpoint.DecodeEndpoint;
+import org.flexlb.balance.endpoint.WorkerEndpoint;
+import org.flexlb.balance.PlacementResult;
+import org.flexlb.balance.strategy.CostBasedPrefillStrategy;
+import org.flexlb.balance.strategy.DecodeSelector;
+import org.flexlb.balance.strategy.RandomStrategy;
+import org.flexlb.balance.strategy.SelectedRole;
 import org.flexlb.balance.scheduler.BatchDeliveryStrategy.PreparedSubmission;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.FlexlbConfig;
+import org.flexlb.config.ModelMetaConfig;
 import org.flexlb.dao.BalanceContext;
 import org.flexlb.dao.loadbalance.DebugInfo;
 import org.flexlb.dao.loadbalance.Request;
+import org.flexlb.dao.loadbalance.Response;
+import org.flexlb.dao.master.WorkerStatus;
 import org.flexlb.dao.loadbalance.ServerStatus;
 import org.flexlb.dao.route.RoleType;
 import org.flexlb.engine.grpc.EngineGrpcClient;
@@ -20,8 +30,11 @@ import org.flexlb.engine.grpc.RoleTypeProtoConverter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -35,6 +48,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.any;
@@ -887,6 +902,225 @@ class DefaultBatchDispatcherTest {
         assertEquals(EngineRpcService.RoleAddrPB.RoleType.PREFILL, addr.getRole());
         assertEquals("PREFILL", addr.getRoleStr());
         assertEquals(RoleType.PREFILL, RoleTypeProtoConverter.fromRoleAddr(addr));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void dispatchCarriesRouterSelectedVitThroughAdmission(boolean frontendPinned) throws Exception {
+        useRemoteVit();
+        ScheduledRequest item = routedVitRequest(frontendPinned);
+        // Incoming addresses are not authoritative, including a stale frontend ViT address.
+        EngineRpcService.GenerateInputPB.Builder input =
+                EngineRpcService.GenerateInputPB.parseFrom(item.ctx().getGenerateInputPb()).toBuilder();
+        input.getGenerateConfigBuilder().addRoleAddrs(EngineRpcService.RoleAddrPB.newBuilder()
+                .setRole(EngineRpcService.RoleAddrPB.RoleType.VIT).setIp("obsolete").setGrpcPort(1));
+        item.ctx().setGenerateInputPb(input.build().toByteString());
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any()))
+                .thenReturn(CompletableFuture.completedFuture(ackResponse(1L, List.of(1L))));
+
+        submit(List.of(item), 1L, 100, "vit", callback);
+
+        assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        ArgumentCaptor<EngineRpcService.EnqueueBatchRequestPB> sent =
+                ArgumentCaptor.forClass(EngineRpcService.EnqueueBatchRequestPB.class);
+        verify(grpcClient).batchEnqueueAsync(anyString(), anyInt(), sent.capture());
+        List<EngineRpcService.RoleAddrPB> addresses = sentInput(sent.getValue())
+                .getGenerateConfig().getRoleAddrsList();
+        assertEquals(List.of(RoleType.PREFILL, RoleType.DECODE, RoleType.VIT),
+                addresses.stream().map(RoleTypeProtoConverter::fromRoleAddr).toList());
+        EngineRpcService.RoleAddrPB vit = addresses.get(2);
+        assertEquals("127.0.0.3", vit.getIp());
+        assertEquals(8092, vit.getGrpcPort());
+        assertEquals(8082, vit.getHttpPort());
+        assertEquals("VIT", vit.getRoleStr());
+        assertEquals(1, sentInput(sent.getValue()).getMultimodalInputsCount());
+        // A completed handoff must release its temporary generation pin.
+        try (PreparedSubmission ignored = reservePermit()) { }
+        item.vitEp().close();
+        item.vitEp().awaitRetirement();
+    }
+
+    @Test
+    void textRouteDoesNotDependOnUnusedVitRetirement() throws Exception {
+        useRemoteVit();
+        ScheduledRequest item = routedVitRequest(false, () -> { }, false);
+        assertNotNull(item.vitEp()); // Real router selects the topology's ViT even for text.
+        item.vitEp().close();
+        assertTimeoutPreemptively(Duration.ofSeconds(5), item.vitEp()::awaitRetirement);
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any()))
+                .thenReturn(CompletableFuture.completedFuture(ackResponse(1L, List.of(1L))));
+        submit(List.of(item), 1L, 100, "text", callback);
+        assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        ArgumentCaptor<EngineRpcService.EnqueueBatchRequestPB> sent =
+                ArgumentCaptor.forClass(EngineRpcService.EnqueueBatchRequestPB.class);
+        verify(grpcClient).batchEnqueueAsync(anyString(), anyInt(), sent.capture());
+        assertEquals(List.of(RoleType.PREFILL, RoleType.DECODE), sentInput(sent.getValue())
+                .getGenerateConfig().getRoleAddrsList().stream().map(RoleTypeProtoConverter::fromRoleAddr).toList());
+    }
+
+    @Test
+    void vitPinLivesThroughRpcInvocationButDoesNotWaitForAck() throws Exception {
+        useRemoteVit();
+        CountDownLatch retired = new CountDownLatch(1);
+        ScheduledRequest item = routedVitRequest(false, retired::countDown);
+        CountDownLatch rpcEntered = new CountDownLatch(1);
+        CountDownLatch allowRpcReturn = new CountDownLatch(1);
+        CompletableFuture<EngineRpcService.EnqueueBatchResponsePB> ack = new CompletableFuture<>();
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any())).thenAnswer(invocation -> {
+            rpcEntered.countDown();
+            assertTrue(allowRpcReturn.await(5, TimeUnit.SECONDS));
+            return ack;
+        });
+        try {
+            submit(List.of(item), 1L, 100, "vit_handoff", callback);
+            assertTrue(rpcEntered.await(5, TimeUnit.SECONDS));
+            // Dispatch is still inside the RPC invocation on another thread.
+            item.vitEp().close();
+            assertEquals(1L, retired.getCount(), "retirement must wait for the RPC handoff pin");
+            allowRpcReturn.countDown();
+            assertTrue(retired.await(5, TimeUnit.SECONDS), "retirement must not wait for the ACK");
+            assertFalse(ack.isDone());
+            ack.complete(ackResponse(1L, List.of(1L)));
+            assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        } finally {
+            allowRpcReturn.countDown();
+            ack.complete(ackResponse(1L, List.of(1L)));
+            item.vitEp().close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "duplicate", "blank_ip", "zero_port", "negative_port", "retired", "mismatch"})
+    void rejectsUnusableVitBeforeEnqueueBatch(String failure) throws Exception {
+        useRemoteVit();
+        ScheduledRequest item = routedVitRequest(false);
+        ServerStatus vit = item.routeResponse().getServerStatus().get(2);
+        switch (failure) {
+            case "missing" -> item.routeResponse().setServerStatus(List.of(item.prefill(), item.decode()));
+            case "duplicate" -> item.routeResponse().setServerStatus(List.of(item.prefill(), vit, vit));
+            case "blank_ip" -> vit.setServerIp(" ");
+            case "zero_port" -> vit.setGrpcPort(0);
+            case "negative_port" -> vit.setGrpcPort(-1);
+            case "retired" -> item.vitEp().close();
+            case "mismatch" -> vit.setServerIp("replacement");
+            default -> throw new AssertionError(failure);
+        }
+
+        submit(List.of(item), 1L, 100, "invalid_vit", callback);
+
+        assertTrue(callback.failureLatch.await(5, TimeUnit.SECONDS));
+        verify(grpcClient, never()).batchEnqueueAsync(anyString(), anyInt(), any());
+        assertTrue(callback.lastError.getMessage().contains("ViT"));
+        if (failure.equals("retired")) {
+            assertTrue(callback.lastError.getMessage().contains("VIT_ROUTE_STALE"));
+        }
+        item.vitEp().close();
+        item.vitEp().awaitRetirement();
+    }
+
+    @Test
+    void remoteMultimodalRequiresVitEvenWithoutFrontendHint() throws Exception {
+        useRemoteVit();
+        ScheduledRequest item = createScheduledRequest(1L, 500, 0, createPrefillEndpoint());
+        addImage(item.ctx());
+        submit(List.of(item), 1L, 100, "missing_vit", callback);
+        assertTrue(callback.failureLatch.await(5, TimeUnit.SECONDS));
+        verify(grpcClient, never()).batchEnqueueAsync(anyString(), anyInt(), any());
+        assertTrue(callback.lastError.getMessage().contains("missing selected ViT"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void requestsWithoutRemoteMultimodalDoNotRequireVit(boolean remoteTopology) throws Exception {
+        if (remoteTopology) {
+            useRemoteVit();
+        }
+        ScheduledRequest item = createScheduledRequest(1L, 500, 0, createPrefillEndpoint());
+        if (!remoteTopology) {
+            addImage(item.ctx()); // Local ViT processing must remain supported.
+        }
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any()))
+                .thenReturn(CompletableFuture.completedFuture(ackResponse(1L, List.of(1L))));
+        submit(List.of(item), 1L, 100, "no_remote_vit", callback);
+        assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        ArgumentCaptor<EngineRpcService.EnqueueBatchRequestPB> sent =
+                ArgumentCaptor.forClass(EngineRpcService.EnqueueBatchRequestPB.class);
+        verify(grpcClient).batchEnqueueAsync(anyString(), anyInt(), sent.capture());
+        assertEquals(1, sentInput(sent.getValue()).getGenerateConfig().getRoleAddrsCount());
+    }
+
+    private void useRemoteVit() {
+        dispatcher.shutdown();
+        ModelMetaConfig topology = mock(ModelMetaConfig.class);
+        when(topology.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.DECODE, RoleType.VIT));
+        dispatcher = new DefaultBatchDispatcher(grpcClient, configService, null, topology);
+    }
+
+    private ScheduledRequest routedVitRequest(boolean frontendPinned) throws Exception {
+        return routedVitRequest(frontendPinned, () -> { });
+    }
+
+    private ScheduledRequest routedVitRequest(boolean frontendPinned, Runnable onRetired) throws Exception {
+        return routedVitRequest(frontendPinned, onRetired, true);
+    }
+
+    private ScheduledRequest routedVitRequest(boolean frontendPinned, Runnable onRetired, boolean multimodal)
+            throws Exception {
+        ScheduledRequest base = createScheduledRequest(1L, 500, 0, createPrefillEndpoint());
+        base.prefill().setRequestId(1L);
+        ServerStatus decode = ServerStatus.copyOf(base.prefill());
+        decode.setRole(RoleType.DECODE);
+        decode.setServerIp("127.0.0.2");
+        ServerStatus vit = ServerStatus.copyOf(base.prefill());
+        vit.setRole(RoleType.VIT);
+        vit.setServerIp("127.0.0.3");
+        vit.setHttpPort(8082);
+        vit.setGrpcPort(8092);
+        vit.setSuccess(true);
+        WorkerEndpoint vitEndpoint = new WorkerEndpoint(WorkerStatus.createDiscovered(
+                RoleType.VIT, "default", vit.getServerIp(), vit.getHttpPort(), vit.getGrpcPort(), "test")) {
+            @Override
+            protected void closeEndpoint() {
+                onRetired.run();
+            }
+        };
+        if (frontendPinned) {
+            base.ctx().getRequest().setSelectedVit(ServerStatus.copyOf(vit));
+        }
+        if (multimodal) {
+            addImage(base.ctx());
+        }
+        CostBasedPrefillStrategy prefillSelector = mock(CostBasedPrefillStrategy.class);
+        DecodeSelector decodeSelector = mock(DecodeSelector.class);
+        RandomStrategy vitSelector = mock(RandomStrategy.class);
+        var selectedPrefill = selectedRole(base.prefill(), base.prefillEp());
+        var selectedDecode = selectedRole(decode, mock(DecodeEndpoint.class));
+        when(prefillSelector.select(any(), any(), any())).thenReturn(PlacementResult.success(selectedPrefill));
+        when(decodeSelector.select(any(), any())).thenReturn(PlacementResult.success(selectedDecode));
+        when(vitSelector.select(any(), any(), any())).thenReturn(
+                SelectedRole.stateless(vitEndpoint.tryPinGeneration(), vit));
+        ModelMetaConfig topology = mock(ModelMetaConfig.class);
+        when(topology.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.DECODE, RoleType.VIT));
+        DefaultRouter router = new DefaultRouter(prefillSelector, decodeSelector, vitSelector, configService, topology);
+        try (RouteAdmission admission = router.select(base.ctx()).value()) {
+            return admission.createScheduledRequest(base.ctx(), base.future(), System.currentTimeMillis());
+        }
+    }
+
+    private SelectedRole selectedRole(ServerStatus status, WorkerEndpoint endpoint) {
+        SelectedRole selected = mock(SelectedRole.class);
+        WorkerEndpoint.GenerationPin pin = mock(WorkerEndpoint.GenerationPin.class);
+        when(pin.endpoint()).thenReturn(endpoint);
+        when(selected.serverStatus()).thenReturn(status);
+        when(selected.takeGenerationPin()).thenReturn(pin);
+        return selected;
+    }
+
+    private void addImage(BalanceContext context) throws Exception {
+        context.setGenerateInputPb(EngineRpcService.GenerateInputPB.parseFrom(context.getGenerateInputPb())
+                .toBuilder().addMultimodalInputs(EngineRpcService.MultimodalInputPB.newBuilder()
+                        .setMultimodalUrl("https://example.test/image.jpg"))
+                .build().toByteString());
     }
 
     private static EngineRpcService.GenerateInputPB sentInput(EngineRpcService.EnqueueBatchRequestPB request) {

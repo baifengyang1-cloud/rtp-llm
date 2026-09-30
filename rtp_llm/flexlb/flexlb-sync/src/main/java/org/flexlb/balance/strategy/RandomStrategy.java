@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Objects;
 import org.flexlb.service.VitCacheDirectory;
 import org.springframework.beans.factory.annotation.Autowired;
 import java.util.concurrent.ThreadLocalRandom;
@@ -32,14 +33,25 @@ public final class RandomStrategy {
 
     public SelectedRole select(
             BalanceContext context, RoleType role, String group) {
+        return select(context, role, group, true);
+    }
+
+    /** Select a live replacement without mutating the frontend's original hint. */
+    public SelectedRole reselect(BalanceContext context, String group) {
+        return select(context, RoleType.VIT, group, false);
+    }
+
+    private SelectedRole select(BalanceContext context, RoleType role, String group, boolean honorSelected) {
         if (role != RoleType.VIT) {
             throw new IllegalArgumentException(
                     "RANDOM endpoint selection is supported only for VIT");
         }
-        if (vitCacheDirectory != null && (context.getRequest().getSelectedVit() != null
+        boolean pinned = honorSelected && context.getRequest().getSelectedVit() != null;
+        if (vitCacheDirectory != null && (pinned
                 || (context.getRequest().getMediaKeys() != null && !context.getRequest().getMediaKeys().isEmpty()))) {
-            ServerStatus route = context.getRequest().getSelectedVit() == null
-                    ? vitCacheDirectory.select(context, group) : vitCacheDirectory.validate(context, group);
+            ServerStatus route = pinned ? vitCacheDirectory.validate(context, group)
+                    : honorSelected ? vitCacheDirectory.select(context, group)
+                    : vitCacheDirectory.selectReplacement(context, group);
             if (!route.isSuccess()) {
                 return null;
             }
@@ -49,7 +61,7 @@ public final class RandomStrategy {
                 return null;
             }
             WorkerStatus status = pin.endpoint().getStatus();
-            if (group != null && !group.equals(status.topologySnapshot().group())) {
+            if ((group != null || !honorSelected) && !Objects.equals(group, status.topologySnapshot().group())) {
                 pin.close();
                 return null;
             }
@@ -73,7 +85,7 @@ public final class RandomStrategy {
                 WorkerStatus status = pin.endpoint().getStatus();
                 WorkerStatus.TopologySnapshot topology =
                         status.topologySnapshot();
-                if (group != null && !group.equals(topology.group())) {
+                if ((group != null || !honorSelected) && !Objects.equals(group, topology.group())) {
                     continue;
                 }
                 WorkerStatus.EngineObservation engine =

@@ -4,12 +4,16 @@ import org.flexlb.balance.delivery.DeliveryMetrics;
 import org.flexlb.balance.endpoint.DecodeEndpoint;
 import org.flexlb.balance.endpoint.DeliverySettlementTestSupport;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
+import org.flexlb.balance.endpoint.WorkerEndpoint;
 import org.flexlb.balance.prediction.FormulaPredictor;
 import org.flexlb.balance.scheduler.ExpirationTimer.InactivityDeadline;
+import org.flexlb.balance.strategy.RandomStrategy;
+import org.flexlb.balance.strategy.SelectedRole;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.FlexlbConfig;
 import org.flexlb.dao.loadbalance.Response;
 import org.flexlb.dao.loadbalance.ServerStatus;
+import org.flexlb.dao.loadbalance.StrategyErrorType;
 import org.flexlb.dao.master.WorkerStatus;
 import org.flexlb.dao.route.RoleType;
 import org.flexlb.engine.grpc.EngineGrpcClient;
@@ -24,6 +28,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
@@ -38,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -63,6 +69,8 @@ class QueuedBatchDeliveryTest {
     private PrefillEndpoint prefill;
     private DecodeEndpoint decode;
     private BatchDeliveryStrategy strategy;
+    private BatchSchedulerReporter reporter;
+    private RandomStrategy vitSelector;
     private final java.util.concurrent.CopyOnWriteArrayList<EngineRpcService.EnqueueBatchRequestPB> sent =
             new java.util.concurrent.CopyOnWriteArrayList<>();
 
@@ -72,14 +80,15 @@ class QueuedBatchDeliveryTest {
         config.getRequestLifecycle().getRequest().setTimeoutMs(TIMEOUT_MS);
         ConfigService service = mock(ConfigService.class);
         when(service.loadBalanceConfig()).thenReturn(config);
-        BatchSchedulerReporter reporter = mock(BatchSchedulerReporter.class);
+        reporter = mock(BatchSchedulerReporter.class);
         registry = new RequestRegistry(service, reporter, mock(RequestSchedulerReporter.class));
         grpc = mock(EngineGrpcClient.class);
         when(grpc.batchEnqueueAsync(anyString(), anyInt(), any())).thenAnswer(call -> {
             sent.add(call.getArgument(2));
             return reply;
         });
-        dispatcher = new DefaultBatchDispatcher(grpc, service, null, 1, 1);
+        vitSelector = mock(RandomStrategy.class);
+        dispatcher = new DefaultBatchDispatcher(grpc, service, null, 1, 1, true, vitSelector);
         strategy = new BatchDeliveryStrategy(dispatcher::tryPrepareSubmission, () -> 201L,
                 registry, new DeliveryMetrics(reporter));
         prefill = mock(PrefillEndpoint.class);
@@ -117,6 +126,150 @@ class QueuedBatchDeliveryTest {
             registry.closeExpiration();
             registry.closePublisher();
         }
+    }
+
+    @Test
+    void vitRetirementWhileQueuedReturnsStaleRouteAndReleasesReservations() throws Exception {
+        WorkerEndpoint vit = new WorkerEndpoint(WorkerStatus.createDiscovered(
+                RoleType.VIT, "default", "127.0.0.3", 8082, 8092, "test"));
+        ScheduledRequest item = item(1L, vit);
+        submit(List.of(item));
+        vit.close();
+        vit.awaitRetirement(); // Queue wait must not keep the old generation pinned.
+        releaseExecutor.countDown();
+        awaitDispatchTasks();
+
+        Response response = item.future().get(5, TimeUnit.SECONDS);
+        assertEquals(StrategyErrorType.VIT_ROUTE_STALE.getErrorCode(), response.getCode());
+        assertTrue(sent.isEmpty());
+        assertOccupancy(0, 0);
+        assertEquals(0, decode.routingView().engineCapacityUsed());
+        assertEquals(0, decode.routingView().inflightHardKv());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void staleVitIsReplacedInsideMasterWithSameAdmission(boolean sameAddress, boolean mixed) throws Exception {
+        WorkerEndpoint oldVit = vitEndpoint();
+        var replacementRetired = new java.util.concurrent.atomic.AtomicBoolean();
+        WorkerEndpoint replacement = new WorkerEndpoint(WorkerStatus.createDiscovered(
+                RoleType.VIT, "default", sameAddress ? oldVit.getIp() : "127.0.0.4", 8082, 8092, "test")) {
+            @Override
+            protected void closeEndpoint() { replacementRetired.set(true); }
+        };
+        try {
+            ScheduledRequest item = item(1L, oldVit, true, 8L);
+            long deadline = item.expiresAtMs();
+            var reservation = item.decodeReservation();
+            ServerStatus selected = ServerStatus.copyOf(item.routeResponse().getServerStatus().get(1));
+            item.ctx().getRequest().setSelectedVit(selected);
+            selected = ServerStatus.copyOf(selected);
+            selected.setServerIp(replacement.getIp());
+            selected.setSuccess(true);
+            ServerStatus replacementStatus = selected;
+            when(vitSelector.reselect(item.ctx(), "default")).thenAnswer(call ->
+                    SelectedRole.stateless(replacement.tryPinGeneration(), replacementStatus));
+            ScheduledRequest text = mixed ? item(2L) : null;
+            int members = mixed ? 2 : 1;
+            doAnswer(call -> {
+                sent.add(call.getArgument(2));
+                replacement.close();
+                assertFalse(replacementRetired.get()); // Pin must survive synchronous RPC handoff.
+                return reply;
+            }).when(grpc).batchEnqueueAsync(anyString(), anyInt(), any());
+            submit(mixed ? List.of(item, text) : List.of(item), "100 * batchSize - totalHitCacheTokens");
+            oldVit.close();
+            assertTimeoutPreemptively(Duration.ofSeconds(5), oldVit::awaitRetirement);
+            releaseExecutor.countDown();
+            awaitDispatchTasks();
+            assertEquals(1, sent.size());
+            var wire = sent.getFirst().getDpSlots(0).getRequests(0).getInput();
+            assertEquals(1L, wire.getRequestId());
+            assertEquals(replacement.getIp(), wire.getGenerateConfig().getRoleAddrs(1).getIp());
+            assertSame(replacement, item.vitEp());
+            assertSame(reservation, item.decodeReservation());
+            assertEquals(deadline, item.expiresAtMs());
+            assertEquals(8L, item.hitCache());
+            assertFalse(item.future().isDone());
+            assertOccupancy(1, members);
+            assertEquals(members, decode.routingView().engineCapacityUsed());
+            verify(reporter).reportBatchPredictedTimeMs("PREFILL", "127.0.0.1", 100L * members - 8L);
+            assertTrue(replacementRetired.get()); // No need to wait for ACK.
+            replacement.close();
+            assertTimeoutPreemptively(Duration.ofSeconds(5), replacement::awaitRetirement);
+            var ack = ack(1L).toBuilder();
+            if (mixed) {
+                ack.addSuccesses(EngineRpcService.EnqueueBatchSuccessPB.newBuilder().setRequestId(2L));
+            }
+            reply.complete(ack.build());
+            if (mixed) { assertTrue(text.future().get(5, TimeUnit.SECONDS).isSuccess()); }
+            Response response = item.future().get(5, TimeUnit.SECONDS);
+            assertTrue(response.isSuccess());
+            assertEquals(replacement.getIp(), response.getServerStatus().get(1).getServerIp());
+            assertEquals(StrategyErrorType.INVALID_REQUEST.getErrorCode(), registry.register(
+                    RequestLifecycleTestSupport.context(config, 1L)).get(5, TimeUnit.SECONDS).getCode());
+            verify(vitSelector, times(1)).reselect(item.ctx(), "default");
+        } finally {
+            oldVit.close();
+            replacement.close();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false, false", "false, false, true", "false, true, false", "false, true, true",
+            "true, false, false", "true, false, true", "true, true, false", "true, true, true"})
+    void invalidMemberDoesNotFailHealthyMembers(boolean retired, boolean text, boolean invalidFirst) throws Exception {
+        WorkerEndpoint firstVit = vitEndpoint();
+        WorkerEndpoint secondVit = new WorkerEndpoint(WorkerStatus.createDiscovered(
+                RoleType.VIT, "default", "127.0.0.4", 8082, 8092, "test"));
+        try {
+            ScheduledRequest first = item(1L, firstVit, !text);
+            ScheduledRequest second = item(2L, secondVit);
+            if (retired) {
+                secondVit.close();
+            } else {
+                second.ctx().setGenerateInputPb(com.google.protobuf.ByteString.EMPTY);
+            }
+            submit(invalidFirst ? List.of(second, first) : List.of(first, second));
+            releaseExecutor.countDown();
+            awaitDispatchTasks();
+            Response failed = second.future().get(5, TimeUnit.SECONDS);
+            assertFalse(failed.isSuccess());
+            if (retired) {
+                assertEquals(StrategyErrorType.VIT_ROUTE_STALE.getErrorCode(), failed.getCode());
+            }
+            assertFalse(first.future().isDone());
+            verify(reporter).reportBatchPredictedTimeMs("PREFILL", "127.0.0.1", 100L);
+            verify(reporter).reportBatchSize("PREFILL", "127.0.0.1", "queued-race", 1);
+            assertEquals(1, sent.size());
+            assertEquals(List.of(1L), sent.getFirst().getDpSlotsList().stream()
+                    .flatMap(dp -> dp.getRequestsList().stream()).map(input -> input.getInput().getRequestId()).toList());
+            assertOccupancy(1, 1);
+            assertEquals(1, decode.routingView().engineCapacityUsed());
+            // Retirement completes before ACK: successful member pins are released at RPC handoff.
+            firstVit.close();
+            assertTimeoutPreemptively(Duration.ofSeconds(5), firstVit::awaitRetirement);
+            registry.cancelRequest(2L, 0L, CancelReason.CLIENT_CANCELLED);
+            assertOccupancy(1, 1);
+            reply.complete(ack(1L));
+            assertTrue(first.future().get(5, TimeUnit.SECONDS).isSuccess());
+            ledger.finish(201L, first).forEach(fact -> registry.processPrefillStatus(prefill, RoleType.PREFILL, fact));
+            DeliverySettlementTestSupport.decodeStatus(decode, 1L, true);
+            assertOccupancy(0, 0);
+            assertEquals(0, decode.routingView().engineCapacityUsed());
+            assertEquals(0, decode.routingView().inflightHardKv());
+            assertEquals(0, decode.routingView().inflightExpectedKv());
+        } finally {
+            firstVit.close();
+            secondVit.close();
+            assertTimeoutPreemptively(Duration.ofSeconds(5), firstVit::awaitRetirement);
+            assertTimeoutPreemptively(Duration.ofSeconds(5), secondVit::awaitRetirement);
+        }
+    }
+
+    private static WorkerEndpoint vitEndpoint() {
+        return new WorkerEndpoint(WorkerStatus.createDiscovered(
+                RoleType.VIT, "default", "127.0.0.3", 8082, 8092, "test"));
     }
 
     @ParameterizedTest
@@ -275,9 +428,26 @@ class QueuedBatchDeliveryTest {
     }
 
     private ScheduledRequest item(long id) {
+        return item(id, null);
+    }
+
+    private ScheduledRequest item(long id, WorkerEndpoint vit) {
+        return item(id, vit, vit != null);
+    }
+
+    private ScheduledRequest item(long id, WorkerEndpoint vit, boolean multimodal) {
+        return item(id, vit, multimodal, 0L);
+    }
+
+    private ScheduledRequest item(long id, WorkerEndpoint vit, boolean multimodal, long hitCache) {
         var context = RequestLifecycleTestSupport.context(config, id);
-        context.setGenerateInputPb(EngineRpcService.GenerateInputPB.newBuilder().setRequestId(id)
-                .setGenerateConfig(EngineRpcService.GenerateConfigPB.newBuilder()).build().toByteString());
+        var input = EngineRpcService.GenerateInputPB.newBuilder().setRequestId(id)
+                .setGenerateConfig(EngineRpcService.GenerateConfigPB.newBuilder());
+        if (multimodal) {
+            input.addMultimodalInputs(EngineRpcService.MultimodalInputPB.newBuilder()
+                    .setMultimodalUrl("https://example.test/image.jpg"));
+        }
+        context.setGenerateInputPb(input.build().toByteString());
         var future = registry.register(context);
         DecodeEndpoint.ReservationHandle reservation;
         try (var pin = decode.tryPinGeneration()) {
@@ -290,15 +460,33 @@ class QueuedBatchDeliveryTest {
         status.setServerIp("127.0.0.1");
         status.setHttpPort(8080);
         status.setGrpcPort(8090);
-        var item = new ScheduledRequest(context, future, new Response(), status, null,
-                prefill, decode, reservation, System.currentTimeMillis());
+        var debug = new org.flexlb.dao.loadbalance.DebugInfo();
+        debug.setHitCacheLen(hitCache);
+        status.setDebugInfo(debug);
+        Response response = new Response();
+        if (vit != null) {
+            ServerStatus vitStatus = new ServerStatus();
+            vitStatus.setRole(RoleType.VIT);
+            vitStatus.setGroup(vit.getStatus().getGroup());
+            vitStatus.setServerIp(vit.getIp());
+            vitStatus.setHttpPort(vit.getHttpPort());
+            vitStatus.setGrpcPort(vit.getGrpcPort());
+            response.setServerStatus(List.of(status, vitStatus));
+        }
+        var item = new ScheduledRequest(context, future, response, status, null,
+                prefill, decode, reservation, System.currentTimeMillis(),
+                ScheduledRequest.DecodeBinding.capture(context), vit);
         RequestLifecycleTestSupport.bind(registry, new RequestLifecycleTestSupport.Registered(item, future));
         ledger.enqueue(item);
         return item;
     }
 
     private void submit(List<ScheduledRequest> items) {
-        try (var transaction = strategy.prepare(items, new FormulaPredictor("100 * batchSize"), OptionalLong.empty())) {
+        submit(items, "100 * batchSize");
+    }
+
+    private void submit(List<ScheduledRequest> items, String formula) {
+        try (var transaction = strategy.prepare(items, new FormulaPredictor(formula), OptionalLong.empty())) {
             assertEquals(items, transaction.items());
             var preceding = transaction.commitUnderLock();
             transaction.handoff("queued-race", 0, preceding);

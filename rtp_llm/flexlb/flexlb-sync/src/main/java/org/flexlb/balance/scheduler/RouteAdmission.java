@@ -56,6 +56,7 @@ public final class RouteAdmission implements AutoCloseable {
         ServerStatus prefillStatus = null;
         long prefillPlacementVersion = 0L;
         long prefillWorkMs = 0L;
+        WorkerEndpoint vitEndpoint = null;
         DecodeEndpoint decodeEndpoint = null;
         WorkerEndpoint.GenerationPin decodePin = null;
         ServerStatus decodeStatus = null;
@@ -100,9 +101,16 @@ public final class RouteAdmission implements AutoCloseable {
                     decodePlacementVersion = placementVersion;
                     continue;
                 }
-                // Stateless roles need no owner after their response metadata
-                // has been frozen.
-                pin.close();
+                try (pin) {
+                    if (role == RoleType.VIT) {
+                        if (vitEndpoint != null) {
+                            throw new IllegalStateException("route requires at most one exact ViT selection");
+                        }
+                        // Retain the exact generation without delaying retirement.
+                        // Dispatch re-pins it or explicitly selects a live replacement.
+                        vitEndpoint = endpoint;
+                    }
+                }
             }
             if (prefillPin == null || prefillEndpoint == null
                     || prefillStatus == null) {
@@ -119,7 +127,8 @@ public final class RouteAdmission implements AutoCloseable {
                             prefillPlacementVersion,
                             prefillWorkMs,
                             decodePin,
-                            decodePlacementVersion),
+                            decodePlacementVersion,
+                            vitEndpoint),
                     decodeRequest.bind(decodeStatus, decodeEndpoint, null));
         } catch (RuntimeException | Error failure) {
             WorkerEndpoint.GenerationPin ownedPrefillPin = prefillPin;
@@ -247,7 +256,8 @@ public final class RouteAdmission implements AutoCloseable {
         }
         return new ScheduledRequest(context, future, response,
                 ServerStatus.copyOf(prefillStatus()), ServerStatus.copyOf(decodeStatus()),
-                prefillEndpoint(), decodeEndpoint(), decodeBinding.reservation(), enqueuedAtMs, decodeBinding);
+                prefillEndpoint(), decodeEndpoint(), decodeBinding.reservation(), enqueuedAtMs, decodeBinding,
+                selection.vitEndpoint());
     }
 
     /** The caller has registered the same canonical request before selecting this route. */
@@ -378,5 +388,6 @@ public final class RouteAdmission implements AutoCloseable {
 
     private record Selection(PrefillEndpoint prefillEndpoint, WorkerEndpoint.GenerationPin prefillPin,
                              ServerStatus prefillStatus, long prefillPlacementVersion, long prefillWorkMs,
-                             WorkerEndpoint.GenerationPin decodePin, long decodePlacementVersion) { }
+                             WorkerEndpoint.GenerationPin decodePin, long decodePlacementVersion,
+                             WorkerEndpoint vitEndpoint) { }
 }

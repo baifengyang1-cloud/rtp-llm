@@ -237,6 +237,14 @@ public class VitCacheDirectory {
     }
 
     public synchronized ServerStatus select(BalanceContext ctx, String group) {
+        return select(ctx, group, false);
+    }
+
+    public synchronized ServerStatus selectReplacement(BalanceContext ctx, String group) {
+        return select(ctx, group, true);
+    }
+
+    private ServerStatus select(BalanceContext ctx, String group, boolean exactGroup) {
         var keys = ctx.getRequest().getMediaKeys();
         if (keys == null || keys.isEmpty() || keys.size() > 256
                 || keys.stream().anyMatch(k -> k == null || k.isEmpty() || k.length() > 4096)) {
@@ -248,7 +256,7 @@ public class VitCacheDirectory {
         List<WorkerStatus> best = new ArrayList<>();
         MatchScore bestScore = null;
         for (WorkerStatus worker : liveWorkers(RoleType.VIT, group).values()) {
-            if (!available(ctx, worker)) {
+            if (!available(ctx, worker) || (exactGroup && !Objects.equals(group, worker.getGroup()))) {
                 continue;
             }
             int hashHits = 0;

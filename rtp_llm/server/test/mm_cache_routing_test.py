@@ -361,52 +361,67 @@ class MMCacheRoutingIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         self.visitor.master_client.get_vit_cache_metadata.assert_not_awaited()
 
-    async def test_master_cannot_change_the_selected_vit(self):
+    async def test_master_cannot_omit_the_selected_vit(self):
         self.visitor.master_client.get_backend_role_addrs.side_effect = [
             FlexlbResponse(
                 role_addrs=[self.vit], result={"server_status": [self.status]}
             ),
             FlexlbResponse.ok([self.prefill]),
         ]
-        with self.assertRaisesRegex(Exception, "changed the selected ViT"):
+        with self.assertRaisesRegex(Exception, "invalid final ViT route"):
             await self.visitor.get_master_route_addrs(self.request)
         self.assertFalse(self.request.generate_config.role_addrs)
 
-    async def test_stale_vit_reselection_acquires_new_hashes_before_prefill(self):
-        new_vit = self.vit.model_copy(update={"ip": "127.0.0.3"})
-        new_status = {**self.status, "server_ip": new_vit.ip}
+    async def test_master_replaces_vit_without_frontend_retry_or_new_identity(self):
+        replacement = self.vit.model_copy(update={"ip": "127.0.0.3"})
+        self.request.request_info.request_id = "external-request"
+        self.request.request_info.trace_id = "original-trace"
+        for enqueued in (False, True):
+            with self.subTest(enqueued=enqueued):
+                self.visitor.master_client.get_backend_role_addrs.reset_mock()
+                self.visitor.master_client.get_vit_cache_metadata.reset_mock()
+                self.visitor.master_client.get_backend_role_addrs.side_effect = [
+                    FlexlbResponse(
+                        role_addrs=[self.vit], result={"server_status": [self.status]}
+                    ),
+                    FlexlbResponse.ok(
+                        [self.prefill, replacement], enqueued_by_master=enqueued
+                    ),
+                ]
+                self.assertIsNone(
+                    await self.visitor.get_master_route_addrs(self.request)
+                )
+                calls = self.visitor.master_client.get_backend_role_addrs.call_args_list
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1].kwargs["request_id"], 123)
+                wire = calls[1].kwargs["input_pb"]
+                self.assertEqual(wire.request_id, 123)
+                self.assertEqual(wire.request_info.request_id, "external-request")
+                self.assertEqual(wire.request_info.trace_id, "original-trace")
+                self.assertEqual(self.request.request_id, 123)
+                self.assertEqual(
+                    self.request.generate_config.role_addrs, [self.prefill, replacement]
+                )
+                self.assertEqual(self.request.enqueued_by_master, enqueued)
+                self.visitor.master_client.get_vit_cache_metadata.assert_awaited_once()
+                self.assertEqual(
+                    self.visitor.master_client.get_vit_cache_metadata.call_args.args[0],
+                    self.vit,
+                )
+
+    async def test_master_stale_failure_is_not_resubmitted_with_same_id(self):
         self.visitor.master_client.get_backend_role_addrs.side_effect = [
             FlexlbResponse(
                 role_addrs=[self.vit], result={"server_status": [self.status]}
             ),
             FlexlbResponse.error_response(VIT_ROUTE_STALE_CODE),
-            FlexlbResponse(
-                role_addrs=[self.prefill, new_vit],
-                result={"server_status": [new_status]},
-            ),
-            FlexlbResponse.ok([self.prefill, new_vit]),
         ]
-        keys = multimodal_cache_keys(self.request)
-        self.visitor.master_client.get_vit_cache_metadata.side_effect = [
-            metadata(keys, [[-10, 11]]),
-            metadata(keys, [[31, 32, 33, 34]]),
-        ]
-        self.assertIsNone(await self.visitor.get_master_route_addrs(self.request))
-        calls = self.visitor.master_client.get_backend_role_addrs.call_args_list
-        self.assertTrue(calls[2].kwargs["vit_only"])
-        self.assertNotIn("input_pb", calls[2].kwargs)
-        self.assertIn("input_pb", calls[3].kwargs)
-        last = calls[-1].kwargs
-        self.assertEqual(last["selected_vit"], new_status)
-        self.assertTrue(last["block_cache_keys"])
-        self.assertEqual(last["seq_len"], 6)
+        result = await self.visitor.get_master_route_addrs(self.request)
+        self.assertEqual(result.error_code, VIT_ROUTE_STALE_CODE)
+        self.assertEqual(self.request.request_id, 123)
         self.assertEqual(
-            self.visitor.master_client.get_vit_cache_metadata.call_args.args[0], new_vit
+            self.visitor.master_client.get_backend_role_addrs.await_count, 2
         )
-        self.assertEqual(
-            self.request.generate_config.role_addrs, [self.prefill, new_vit]
-        )
-        self.assertEqual(self.request.token_ids.tolist(), [1, 99, 2])
 
     async def test_short_http_timeout_does_not_shorten_pending_placement_ttl(self):
         client = MasterClient(
