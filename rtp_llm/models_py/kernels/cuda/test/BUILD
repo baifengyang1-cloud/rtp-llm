@@ -43,7 +43,15 @@ py_test (
 py_test (
     name = "per_tensor_scaled_fp8_quant_test",
     srcs = ["per_tensor_scaled_fp8_quant_test.py"],
+    deps = py_test (
+    name = "per_tensor_scaled_fp8_quant_fused_test",
+    srcs = ["per_tensor_scaled_fp8_quant_fused_test.py"],
     deps = py_test_deps,
+    tags = ["open_skip"],
+    exec_properties = {'gpu':'A10'},
+)
+
+py_test_deps,
     # Verified on L20_CU13 (sm89): bit-exact (torch.equal) vs the torch
     # float8_e4m3fn reference across 18 shapes, 0 skips. The CUDA13 AOT arch
     # list covers 8.9.

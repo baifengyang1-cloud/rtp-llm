@@ -11,6 +11,9 @@
 #include <cub/block/block_reduce.cuh>
 
 #include <cmath>
+#include <algorithm>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 #ifdef ENABLE_FP8
 using namespace tensorrt_llm::common;
@@ -147,9 +150,10 @@ void invokeComputeFP8Quantize128(__nv_fp8_e4m3*       fp8_output,
     }
 }
 
+// Original implementation retained only for same-build performance comparisons.
 template<typename T>
 __global__ void
-per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output_s, const int64_t num_elements) {
+per_tensor_absmax_baseline_kernel(const T* __restrict__ input, float* __restrict__ output_s, const int64_t num_elements) {
     float        max_value = 0.0f;
     unsigned int tid       = threadIdx.x;
     unsigned int gid       = blockIdx.x * blockDim.x + threadIdx.x;
@@ -185,7 +189,7 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
 }
 
 template<typename T, typename DST_DTYPE>
-__global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
+__global__ void per_tensor_quant_fp8_baseline_kernel(const T* __restrict__ input,
                                             DST_DTYPE* __restrict__ output,
                                             const float* __restrict__ scale,
                                             const int64_t num_elements) {
@@ -220,6 +224,218 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
         float val   = fmax(-tensorrt_llm::common::FP8_E4M3_MAX,
                          fmin(static_cast<float>(input[idx]) * scale_val, tensorrt_llm::common::FP8_E4M3_MAX));
         output[idx] = static_cast<DST_DTYPE>(val);
+    }
+}
+
+
+template<typename T, bool VECTORIZED>
+__global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
+                                           __nv_fp8_e4m3* __restrict__ output,
+                                           const float* __restrict__ scale,
+                                           const int64_t num_elements) {
+    constexpr int VEC_SIZE = 16 / sizeof(T);
+    const int64_t begin = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * VEC_SIZE;
+    const float multiplier = 1.0f / fmax(1e-9, *scale);
+    if constexpr (VECTORIZED) {
+        if (begin + VEC_SIZE <= num_elements) {
+            rtp_llm::vec_t<T, VEC_SIZE> values;
+            rtp_llm::vec_t<__nv_fp8_e4m3, VEC_SIZE> quantized;
+            values.cast_load(input + begin);
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; ++j) {
+                const float value = fmax(fmin(static_cast<float>(values[j]) * multiplier,
+                                              tensorrt_llm::common::FP8_E4M3_MAX),
+                                         -tensorrt_llm::common::FP8_E4M3_MAX);
+                quantized[j] = static_cast<__nv_fp8_e4m3>(value);
+            }
+            quantized.store(output + begin);
+            return;
+        }
+    }
+    for (int64_t j = begin; j < num_elements && j < begin + VEC_SIZE; ++j) {
+        const float value = fmax(fmin(static_cast<float>(input[j]) * multiplier,
+                                      tensorrt_llm::common::FP8_E4M3_MAX),
+                                 -tensorrt_llm::common::FP8_E4M3_MAX);
+        output[j] = static_cast<__nv_fp8_e4m3>(value);
+    }
+}
+
+// Fixed capacity and fully unrolled indexing let the compiler retain each
+// thread's input values across the reduction instead of reloading global memory.
+constexpr int64_t PER_TENSOR_SMALL_INPUT_LIMIT = 8192;
+constexpr int PER_TENSOR_FUSED_BLOCK_SIZE = 256;
+
+template<typename T, bool VECTORIZED>
+__global__ void per_tensor_quant_fp8_fused_kernel(const T* __restrict__ input,
+                                                 __nv_fp8_e4m3* __restrict__ output,
+                                                 float* __restrict__ scale,
+                                                 int64_t count) {
+    constexpr int VEC = 16 / sizeof(T);
+    constexpr int ITEMS = (PER_TENSOR_SMALL_INPUT_LIMIT + PER_TENSOR_FUSED_BLOCK_SIZE * VEC - 1)
+                          / (PER_TENSOR_FUSED_BLOCK_SIZE * VEC);
+    // FP32 preserves the same conversion/multiplication semantics as the old
+    // path. At 8192 elements this holds 32 floats per thread for every dtype.
+    float cached[ITEMS][VEC];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int item = 0; item < ITEMS; ++item) {
+        const int64_t begin = (static_cast<int64_t>(item) * PER_TENSOR_FUSED_BLOCK_SIZE + threadIdx.x) * VEC;
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            cached[item][j] = 0.0f;
+        }
+        if constexpr (VECTORIZED) {
+            if (begin + VEC <= count) {
+                rtp_llm::vec_t<T, VEC> values;
+                values.cast_load(input + begin);
+#pragma unroll
+                for (int j = 0; j < VEC; ++j) {
+                    cached[item][j] = static_cast<float>(values[j]);
+                    maximum = fmaxf(maximum, fabsf(cached[item][j]));
+                }
+                continue;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            if (begin + j < count) {
+                cached[item][j] = static_cast<float>(input[begin + j]);
+                maximum = fmaxf(maximum, fabsf(cached[item][j]));
+            }
+        }
+    }
+    maximum = blockReduceMax(maximum);
+    __shared__ float multiplier;
+    if (threadIdx.x == 0) {
+        *scale = maximum / tensorrt_llm::common::FP8_E4M3_MAX;
+        multiplier = 1.0f / fmax(1e-9, *scale);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int item = 0; item < ITEMS; ++item) {
+        const int64_t begin = (static_cast<int64_t>(item) * PER_TENSOR_FUSED_BLOCK_SIZE + threadIdx.x) * VEC;
+        if constexpr (VECTORIZED) {
+            if (begin + VEC <= count) {
+                rtp_llm::vec_t<__nv_fp8_e4m3, VEC> quantized;
+#pragma unroll
+                for (int j = 0; j < VEC; ++j) {
+                    quantized[j] = static_cast<__nv_fp8_e4m3>(
+                        fmax(fmin(cached[item][j] * multiplier, tensorrt_llm::common::FP8_E4M3_MAX),
+                             -tensorrt_llm::common::FP8_E4M3_MAX));
+                }
+                quantized.store(output + begin);
+                continue;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            if (begin + j < count) {
+                output[begin + j] = static_cast<__nv_fp8_e4m3>(
+                    fmax(fmin(cached[item][j] * multiplier, tensorrt_llm::common::FP8_E4M3_MAX),
+                         -tensorrt_llm::common::FP8_E4M3_MAX));
+            }
+        }
+    }
+}
+
+// Large inputs use an occupancy-independent bounded grid for absmax and
+// a separate row-wise quantization grid. Scale remains shared by all rows.
+template<typename T, bool VECTORIZED>
+__global__ void per_tensor_absmax_large_kernel(const T* __restrict__ input,
+                                              float* __restrict__ scale,
+                                              int64_t count) {
+    constexpr int VEC = 16;
+    const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    float maximum = 0.0f;
+    for (int64_t v = gid; v < count / VEC; v += stride) {
+        rtp_llm::vec_t<T, VEC> values;
+        if constexpr (VECTORIZED) {
+            values.cast_load(input + v * VEC);
+        } else {
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                values[j] = input[v * VEC + j];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            maximum = fmaxf(maximum, fabsf(static_cast<float>(values[j])));
+        }
+    }
+    for (int64_t i = count / VEC * VEC + gid; i < count; i += stride) {
+        maximum = fmaxf(maximum, fabsf(static_cast<float>(input[i])));
+    }
+    maximum = blockReduceMax(maximum);
+    if (threadIdx.x == 0) {
+        scale[blockIdx.x] = maximum / tensorrt_llm::common::FP8_E4M3_MAX;
+    }
+}
+
+template<typename T, bool VECTORIZED>
+__global__ void per_tensor_quant_fp8_row_kernel(const T* __restrict__ input,
+                                               __nv_fp8_e4m3* __restrict__ output,
+                                               float* __restrict__ scale,
+                                               int64_t hidden_size,
+                                               const float* __restrict__ partial_scales,
+                                               int partial_count) {
+    input += static_cast<int64_t>(blockIdx.x) * hidden_size;
+    output += static_cast<int64_t>(blockIdx.x) * hidden_size;
+    __shared__ float shared_multiplier;
+    if (partial_count > 0) {
+        // Every token block computes the same scale. No block reads scale
+        // while block 0 writes it, and every scratch entry was overwritten
+        // by the preceding absmax launch on this stream.
+        float maximum = 0.0f;
+        for (int i = threadIdx.x; i < partial_count; i += blockDim.x) {
+            maximum = fmaxf(maximum, partial_scales[i]);
+        }
+        maximum = blockReduceMax(maximum);
+        if (threadIdx.x == 0) {
+            if (blockIdx.x == 0) {
+                *scale = maximum;
+            }
+            shared_multiplier = 1.0f / fmax(1e-9, maximum);
+        }
+        __syncthreads();
+    } else {
+        if (threadIdx.x == 0) {
+            shared_multiplier = 1.0f / fmax(1e-9, *scale);
+        }
+        __syncthreads();
+    }
+    const float multiplier = shared_multiplier;
+    for (int64_t v = threadIdx.x; v < hidden_size / 16; v += blockDim.x) {
+        rtp_llm::vec_t<T, 16> values;
+        rtp_llm::vec_t<__nv_fp8_e4m3, 16> quantized;
+        if constexpr (VECTORIZED) {
+            values.cast_load(input + v * 16);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                values[j] = input[v * 16 + j];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const float value = fmax(fmin(static_cast<float>(values[j]) * multiplier,
+                                          tensorrt_llm::common::FP8_E4M3_MAX),
+                                     -tensorrt_llm::common::FP8_E4M3_MAX);
+            quantized[j] = static_cast<__nv_fp8_e4m3>(value);
+        }
+        if constexpr (VECTORIZED) {
+            quantized.store(output + v * 16);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                output[v * 16 + j] = quantized[j];
+            }
+        }
+    }
+    for (int64_t i = hidden_size / 16 * 16 + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        output[i] = static_cast<__nv_fp8_e4m3>(
+            fmax(fmin(static_cast<float>(input[i]) * multiplier, tensorrt_llm::common::FP8_E4M3_MAX),
+                 -tensorrt_llm::common::FP8_E4M3_MAX));
     }
 }
 
@@ -369,7 +585,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(const T* __restrict__ inp
     }
 }
 
-void per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, bool is_static) {
+void per_tensor_quant_fp8_baseline(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, bool is_static) {
     CHECK_INPUT(input);
     CHECK_INPUT(output_q);
     CHECK_INPUT(output_s);
@@ -389,14 +605,103 @@ void per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Te
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
         if (is_static == false) {
-            per_tensor_absmax_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            per_tensor_absmax_baseline_kernel<scalar_t><<<grid, block, 0, stream>>>(
                 static_cast<scalar_t*>(input.data_ptr()), static_cast<float*>(output_s.data_ptr()), num_elements);
         }
-        per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3>
+        per_tensor_quant_fp8_baseline_kernel<scalar_t, __nv_fp8_e4m3>
             <<<grid, block, 0, stream>>>(static_cast<scalar_t*>(input.data_ptr()),
                                          static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                                          static_cast<float*>(output_s.data_ptr()),
                                          num_elements);
+        return true;
+    });
+}
+
+
+void per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, bool is_static) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output_q);
+    CHECK_INPUT(output_s);
+    CHECK_EQ(output_s.numel(), 1);
+    TORCH_CHECK(input.device() == output_q.device() && input.device() == output_s.device(),
+                "FP8 quantization tensors must be on the same device");
+    const c10::cuda::CUDAGuard device_guard(input.device());
+    const int block_size = 256;
+    const int64_t num_elements = input.numel();
+    TORCH_CHECK(num_elements > 0 && input.dim() > 0 && input.size(-1) > 0,
+                "Per-tensor FP8 quantization requires non-empty input");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+        constexpr int vector_size = 16 / sizeof(scalar_t);
+        const int64_t elements_per_block = block_size * vector_size;
+        const int64_t num_blocks = (num_elements + elements_per_block - 1) / elements_per_block;
+        TORCH_CHECK(num_blocks <= 2147483647LL, "Per-tensor FP8 input exceeds CUDA grid capacity");
+        const dim3 grid(static_cast<unsigned int>(num_blocks));
+        const bool aligned = reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0
+                             && reinterpret_cast<uintptr_t>(output_q.data_ptr()) % vector_size == 0;
+        // Single-CTA fusion covers inputs up to 8192 elements.
+        constexpr int64_t small_input_limit = PER_TENSOR_SMALL_INPUT_LIMIT;
+        if (!is_static && num_elements <= small_input_limit) {
+            if (aligned) {
+                per_tensor_quant_fp8_fused_kernel<scalar_t, true><<<1, PER_TENSOR_FUSED_BLOCK_SIZE, 0, stream>>>(
+                    static_cast<const scalar_t*>(input.data_ptr()),
+                    static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()), output_s.data_ptr<float>(), num_elements);
+            } else {
+                per_tensor_quant_fp8_fused_kernel<scalar_t, false><<<1, PER_TENSOR_FUSED_BLOCK_SIZE, 0, stream>>>(
+                    static_cast<const scalar_t*>(input.data_ptr()),
+                    static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()), output_s.data_ptr<float>(), num_elements);
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return true;
+        }
+        const int64_t hidden_size = input.size(-1);
+        if (num_elements > small_input_limit) {
+            const int64_t num_tokens = num_elements / hidden_size;
+            TORCH_CHECK(num_tokens <= 2147483647LL, "FP8 row grid exceeds CUDA capacity");
+            const bool absmax_aligned = reinterpret_cast<uintptr_t>(input.data_ptr()) % (16 * sizeof(scalar_t)) == 0;
+            const bool rows_aligned = absmax_aligned && hidden_size % 16 == 0
+                                      && reinterpret_cast<uintptr_t>(output_q.data_ptr()) % 16 == 0;
+            torch::Tensor partial_scales;
+            float* partial_ptr = nullptr;
+            int absmax_blocks = 0;
+            if (!is_static) {
+                const int64_t max_blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 8;
+                absmax_blocks = static_cast<int>(std::min<int64_t>(
+                    max_blocks, ((num_elements + 15) / 16 + block_size - 1) / block_size));
+                partial_scales = torch::empty({absmax_blocks}, output_s.options());
+                partial_ptr = partial_scales.data_ptr<float>();
+                if (absmax_aligned) {
+                    per_tensor_absmax_large_kernel<scalar_t, true><<<absmax_blocks, block_size, 0, stream>>>(
+                        static_cast<const scalar_t*>(input.data_ptr()), partial_ptr, num_elements);
+                } else {
+                    per_tensor_absmax_large_kernel<scalar_t, false><<<absmax_blocks, block_size, 0, stream>>>(
+                        static_cast<const scalar_t*>(input.data_ptr()), partial_ptr, num_elements);
+                }
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
+            if (rows_aligned) {
+                per_tensor_quant_fp8_row_kernel<scalar_t, true><<<static_cast<unsigned int>(num_tokens), block_size, 0, stream>>>(
+                    static_cast<const scalar_t*>(input.data_ptr()),
+                    static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()), output_s.data_ptr<float>(), hidden_size, partial_ptr, absmax_blocks);
+            } else {
+                per_tensor_quant_fp8_row_kernel<scalar_t, false><<<static_cast<unsigned int>(num_tokens), block_size, 0, stream>>>(
+                    static_cast<const scalar_t*>(input.data_ptr()),
+                    static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()), output_s.data_ptr<float>(), hidden_size, partial_ptr, absmax_blocks);
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return true;
+        }
+        if (aligned) {
+            per_tensor_quant_fp8_kernel<scalar_t, true><<<grid, block_size, 0, stream>>>(
+                static_cast<const scalar_t*>(input.data_ptr()),
+                static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()), output_s.data_ptr<float>(), num_elements);
+        } else {
+            per_tensor_quant_fp8_kernel<scalar_t, false><<<grid, block_size, 0, stream>>>(
+                static_cast<const scalar_t*>(input.data_ptr()),
+                static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()), output_s.data_ptr<float>(), num_elements);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     });
 }

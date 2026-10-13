@@ -13,6 +13,8 @@ namespace rtp_llm {
 
 // Existing function
 void per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
+// Original path for correctness/performance A/B tests; dynamic scale must be zeroed by the caller.
+void per_tensor_quant_fp8_baseline(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 
 void invokeComputeFP8Quantize128(__nv_fp8_e4m3*       fp8_output,

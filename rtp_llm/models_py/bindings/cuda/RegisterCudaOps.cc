@@ -27,6 +27,10 @@ void registerPyModuleOps(py::module& rtp_ops_m) {
                   py::arg("output_s"),
                   py::arg("is_static"));
 
+    rtp_ops_m.def("per_tensor_quant_fp8_baseline",
+                  &per_tensor_quant_fp8_baseline,
+                  py::arg("input"), py::arg("output_q"), py::arg("output_s"), py::arg("is_static"));
+
     rtp_ops_m.def(
         "per_token_quant_fp8", &per_token_quant_fp8, py::arg("input"), py::arg("output_q"), py::arg("output_s"));
 
