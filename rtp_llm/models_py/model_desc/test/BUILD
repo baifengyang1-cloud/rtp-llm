@@ -184,6 +184,14 @@ py_test(
     },
 )
 
+# Keep the broader Bert model integration suite on H20. The focused operator
+# contract is exercised by the CUDA target below.
+py_test(
+    name = "bert_encoder_graph_metadata_test",
+    srcs = ["bert_encoder_graph_metadata_test.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+)
+
 py_test(
     name = "qwen3_next_qkvz_ba_fusion_test_rocm",
     srcs = ["qwen3_next_qkvz_ba_fusion_test.py"],

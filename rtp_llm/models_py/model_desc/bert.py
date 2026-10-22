@@ -187,9 +187,79 @@ class BertModel(GptModelBase):
             ]
         )
 
+    def validate_embedding_input_features(self, inputs):
+        mm = inputs.multimodal_inputs
+        mask = inputs.embedding_inputs.text_tokens_mask
+        features = bool(mm.multimodal_features)
+        locs = mm.mm_features_locs is not None and mm.mm_features_locs.numel() > 0
+        has_mask = mask is not None and mask.numel() > 0
+        if not (features == locs == has_mask):
+            return False
+        # Metadata-only canRun calls may omit IDs. Actual forward must provide
+        # one position and token-type ID for every token before embedding lookup.
+        input_ids = getattr(inputs, "input_ids", None)
+        tokens = input_ids.numel() if input_ids is not None else 0
+        if tokens:
+            for ids in (
+                inputs.bert_embedding_inputs.combo_position_ids,
+                inputs.bert_embedding_inputs.combo_tokens_type_ids,
+            ):
+                if (
+                    ids is None
+                    or ids.numel() != tokens
+                    or ids.dtype != torch.int32
+                    or not ids.is_contiguous()
+                    or ids.device != inputs.input_ids.device
+                ):
+                    return False
+        return True
+
+
+
+    def prepare_embedding_graph_attention(self, inputs, is_cuda_graph=True):
+        return self.prepare_fmha_impl(inputs, is_cuda_graph=True)
+
+
+
+
+    def prepare_fmha_impl(self, inputs, is_cuda_graph=False):
+        if is_cuda_graph:
+            if self.kv_cache is not None:
+                raise ValueError("BERT Transformer graph requires an encoder without KV cache")
+            return super().prepare_fmha_impl(inputs, True, "embedding_graph")
+        return super().prepare_fmha_impl(inputs, False)
+
     def forward(
-        self, inputs: PyModelInputs, fmha_impl: FMHAImplBase = None
+        self,
+        inputs: PyModelInputs,
+        fmha_impl: FMHAImplBase = None,
     ) -> PyModelOutputs:
+        hidden_states = inputs.input_hiddens
+        if fmha_impl is None:
+            fmha_impl = self.prepare_fmha_impl(inputs)
+        quantized_hidden_states = None
+        for i, decoder_layer in enumerate(self.layers[: self.layer_num]):
+            next_layer_uses_quantized_input = (
+                i + 1 < self.layer_num
+                and self.layers[
+                    i + 1
+                ].self_attn.qkv_proj.supports_prequantized_activation
+            )
+            hidden_states, quantized_hidden_states = decoder_layer(
+                hidden_states,
+                fmha_impl,
+                kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
+                quantized_hidden_states=quantized_hidden_states,
+                quantize_output=next_layer_uses_quantized_input,
+            )
+        return PyModelOutputs(hidden_states)
+
+    def prepare_forward_inputs(self, inputs: PyModelInputs) -> None:
+        """Prepare request-owned embeddings before the eager Transformer call."""
+        inputs.input_hiddens = self.prepare_transformer_inputs(inputs)
+
+    def prepare_transformer_inputs(self, inputs: PyModelInputs) -> torch.Tensor:
+        """Request-owned embedding and visual injection, always outside graphs."""
         input_ids: torch.Tensor = inputs.input_ids
         bert_embedding_inputs = inputs.bert_embedding_inputs
         # Image slots contain cache hashes, not word-table IDs. Validate the
@@ -219,21 +289,5 @@ class BertModel(GptModelBase):
         hidden_states = self.multimodal_embedding_injector(
             hidden_states, multimodal_features, multimodal_locs
         )
-        if fmha_impl is None:
-            fmha_impl = self.prepare_fmha_impl(inputs)
-        quantized_hidden_states = None
-        for i, decoder_layer in enumerate(self.layers[: self.layer_num]):
-            next_layer_uses_quantized_input = (
-                i + 1 < self.layer_num
-                and self.layers[
-                    i + 1
-                ].self_attn.qkv_proj.supports_prequantized_activation
-            )
-            hidden_states, quantized_hidden_states = decoder_layer(
-                hidden_states,
-                fmha_impl,
-                kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
-                quantized_hidden_states=quantized_hidden_states,
-                quantize_output=next_layer_uses_quantized_input,
-            )
-        return PyModelOutputs(hidden_states)
+
+        return hidden_states

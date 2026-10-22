@@ -1,4 +1,6 @@
-from unittest import SkipTest, TestCase, main
+import os
+from types import SimpleNamespace
+from unittest import SkipTest, TestCase, main, mock
 
 import torch
 from bert_embedding_test_utils import (
@@ -19,6 +21,11 @@ from rtp_llm.utils.model_weight import W
 _ONE_LAYER_HIDDEN_SIZE = 128
 
 
+def _eager_forward(model, inputs, *args, **kwargs):
+    model.prepare_forward_inputs(inputs)
+    return model.forward(inputs, *args, **kwargs)
+
+
 class _UnusedFmhaImpl:
     """Fail explicitly if a zero-layer test unexpectedly reaches attention."""
 
@@ -35,6 +42,35 @@ class BertMultimodalEmbeddingTest(TestCase):
     def setUp(self) -> None:
         if not torch.cuda.is_available():
             raise SkipTest("CUDA is not available")
+
+    def test_split_forward_preserves_visual_injection(self):
+        model = self._build_one_layer_model()
+        inputs = _build_inputs(hidden_size=_ONE_LAYER_HIDDEN_SIZE)
+        inputs.multimodal_inputs.multimodal_features = [
+            torch.randn(1, _ONE_LAYER_HIDDEN_SIZE, dtype=torch.float16, device="cuda")
+        ]
+        inputs.multimodal_inputs.mm_features_locs = torch.tensor([1], dtype=torch.int32)
+        inputs.embedding_inputs.text_tokens_mask = torch.tensor(
+            [1, 0, 1, 1], device="cuda", dtype=torch.int32
+        )
+
+        # A simple independent attention function keeps this focused on the
+        # split boundary, including the one-layer residual/MLP path.
+        class IdentityAttention:
+            def forward(self, qkv, kv_cache, layer_idx=0):
+                return qkv[:, :_ONE_LAYER_HIDDEN_SIZE]
+
+        attention = IdentityAttention()
+        expected = _eager_forward(model, inputs, attention).hidden_states
+        prepared = model.prepare_transformer_inputs(inputs)
+        torch.testing.assert_close(
+            prepared[1], inputs.multimodal_inputs.multimodal_features[0][0]
+        )
+        inputs.input_hiddens = prepared
+        actual = model.forward(inputs, attention).hidden_states
+        torch.testing.assert_close(actual, expected)
+
+
 
     def _build_model(
         self,
@@ -181,8 +217,8 @@ class BertMultimodalEmbeddingTest(TestCase):
     def test_forward_splices_post_layernorm_features_and_preserves_text(self):
         model = self._build_model()
         baseline_inputs = _build_inputs(with_text_tokens_mask=False)
-        baseline = model.forward(
-            baseline_inputs, fmha_impl=_FMHA_NOT_USED
+        baseline = _eager_forward(
+            model, baseline_inputs, fmha_impl=_FMHA_NOT_USED
         ).hidden_states
 
         multimodal_inputs = _build_inputs()
@@ -208,8 +244,8 @@ class BertMultimodalEmbeddingTest(TestCase):
         multimodal_inputs.multimodal_inputs.mm_features_locs = torch.tensor(
             [0, 2], dtype=torch.int32, device="cuda"
         )
-        output = model.forward(
-            multimodal_inputs, fmha_impl=_FMHA_NOT_USED
+        output = _eager_forward(
+            model, multimodal_inputs, fmha_impl=_FMHA_NOT_USED
         ).hidden_states
 
         torch.testing.assert_close(output[0:1], first_feature)
@@ -304,7 +340,7 @@ class BertMultimodalEmbeddingTest(TestCase):
             [1], dtype=torch.int32, device="cuda"
         )
 
-        actual = model.forward(inputs, fmha_impl=_FMHA_NOT_USED).hidden_states
+        actual = _eager_forward(model, inputs, fmha_impl=_FMHA_NOT_USED).hidden_states
 
         text_rows = torch.tensor([0, 2, 3], dtype=torch.long, device="cuda")
         text_input_ids = inputs.input_ids.index_select(0, text_rows).long()
@@ -373,8 +409,8 @@ class BertMultimodalEmbeddingTest(TestCase):
             lambda _module, args: decoder_inputs.append(args[0].detach().clone())
         )
         try:
-            baseline = model.forward(baseline_inputs).hidden_states
-            actual = model.forward(multimodal_inputs).hidden_states
+            baseline = _eager_forward(model, baseline_inputs).hidden_states
+            actual = _eager_forward(model, multimodal_inputs).hidden_states
         finally:
             hook.remove()
 
@@ -398,7 +434,7 @@ class BertMultimodalEmbeddingTest(TestCase):
             ValueError,
             "features, locations, and text_tokens_mask must be provided together",
         ):
-            model.forward(masked_inputs, fmha_impl=_FMHA_NOT_USED)
+            _eager_forward(model, masked_inputs, fmha_impl=_FMHA_NOT_USED)
 
     def test_forward_rejects_multimodal_features_without_mask(self):
         model = self._build_model()
@@ -411,7 +447,7 @@ class BertMultimodalEmbeddingTest(TestCase):
             [0], dtype=torch.int32, device="cuda"
         )
         with self.assertRaisesRegex(ValueError, "must be provided together"):
-            model.forward(inputs, fmha_impl=_FMHA_NOT_USED)
+            _eager_forward(model, inputs, fmha_impl=_FMHA_NOT_USED)
 
     def test_forward_rejects_multimodal_features_with_empty_mask(self):
         model = self._build_model()
@@ -427,7 +463,7 @@ class BertMultimodalEmbeddingTest(TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "must be provided together"):
-            model.forward(inputs, fmha_impl=_FMHA_NOT_USED)
+            _eager_forward(model, inputs, fmha_impl=_FMHA_NOT_USED)
 
     def test_forward_rejects_locations_without_features_and_mask(self):
         model = self._build_model()
@@ -437,7 +473,7 @@ class BertMultimodalEmbeddingTest(TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "must be provided together"):
-            model.forward(inputs, fmha_impl=_FMHA_NOT_USED)
+            _eager_forward(model, inputs, fmha_impl=_FMHA_NOT_USED)
 
 
 if __name__ == "__main__":
