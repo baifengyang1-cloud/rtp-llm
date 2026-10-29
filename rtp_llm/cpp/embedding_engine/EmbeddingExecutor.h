@@ -24,6 +24,7 @@ enum class Arg : uint32_t {
     ATTENTION_MASK,
     MOE_GATING,
     TEXT_TOKENS_MASK,
+    STAGE_LOG_BATCH_ID,
     // reserve as number marker
     NUM_INPUT_TYPES
 };

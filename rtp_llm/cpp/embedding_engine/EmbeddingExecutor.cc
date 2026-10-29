@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include "rtp_llm/cpp/utils/DebugUtils.h"
+#include "rtp_llm/cpp/utils/EmbeddingStageLog.h"
 using namespace std;
 using namespace at::indexing;
 
@@ -32,6 +33,7 @@ static const char* names[] = {
     "attention_mask",
     "moe_gating",
     "text_tokens_mask",
+    "stage_log_batch_id",
 };
 static_assert(sizeof(names) / sizeof(names[0]) <= NUM_INPUT_TYPES, "redundant handler arg name");
 static_assert(sizeof(names) / sizeof(names[0]) >= NUM_INPUT_TYPES, "missing handler arg name");
@@ -437,6 +439,11 @@ absl::StatusOr<py::object> EmbeddingExecutor::postProcess(const ModelRequest&   
             kwargs[get_name(Arg::MOE_GATING)] = moe_gating;
         }
 
+        if (has_arg(handler_args_, Arg::STAGE_LOG_BATCH_ID)) {
+            if (auto* stage_log = EmbeddingStageLog::current()) {
+                kwargs[get_name(Arg::STAGE_LOG_BATCH_ID)] = py::int_(stage_log->batchId());
+            }
+        }
         py::object output = handler_.attr("extend_forward")(**kwargs);
         return output;
     } catch (const exception& e) {
@@ -445,22 +452,41 @@ absl::StatusOr<py::object> EmbeddingExecutor::postProcess(const ModelRequest&   
 }
 
 absl::Status EmbeddingExecutor::process(const std::list<EmbeddingStreamPtr>& streams) {
+    EmbeddingStageLog stage_log(streams.size());
+    if (EmbeddingStageLog::current() == &stage_log) {
+        for (const auto& stream : streams) {
+            stage_log.addRequest(stream->streamId());
+        }
+    }
+    EmbeddingStageSpan gather_span("gather_cpu_us");
     CHECK_AND_RETURN_REF(model_input, gatherModelInput(streams));
+    gather_span.finish();
+    stage_log.setShape(model_input.input_lengths.size(0), model_input.combo_tokens.numel());
     auto            merged_output = std::make_unique<MergedOutput>();
     GptModelOutputs model_output;
+    EmbeddingStageSpan handler_input_span("handler_input_cpu_us");
     ModelRequest    model_request    = generateOldModelRequest(model_input);
+    handler_input_span.finish();
     auto            total_batch_size = model_request.context_batch_size;
     model_->releaseBuffers();
+    EmbeddingStageSpan model_span("model_forward_cpu_us");
     model_output = std::move(model_->forward(model_input));
+    model_span.finish();
     std::chrono::steady_clock::time_point result_process_start;
     if (requires_host_input_metadata_ && metrics_reporter_) {
         result_process_start = std::chrono::steady_clock::now();
     }
+    EmbeddingStageSpan     gil_span("post_gil_wait_cpu_us");
     py::gil_scoped_acquire acquire;
+    gil_span.finish();
     // for py::list, handler should ensure object to cpu in the python impl,
     // for torch::Tensor, we manually move it to cpu during updateStreams()
+    EmbeddingStageSpan post_span("postprocess_cpu_us");
     CHECK_AND_RETURN_REF(post, postProcess(model_request, model_output, model_input.text_tokens_mask));
+    post_span.finish();
+    EmbeddingStageSpan update_span("update_streams_cpu_us");
     auto res = updateStreams(post, streams, total_batch_size);
+    update_span.finish();
     if (requires_host_input_metadata_ && metrics_reporter_) {
         RtpEmbeddingStageMetricsCollector collector;
         collector.result_process_latency_us =
@@ -468,6 +494,7 @@ absl::Status EmbeddingExecutor::process(const std::list<EmbeddingStreamPtr>& str
         metrics_reporter_->report<RtpEmbeddingStageMetrics, RtpEmbeddingStageMetricsCollector>(nullptr, &collector);
     }
     model_->releaseBuffers();
+    stage_log.finish(res.ok());
     return res;
 }
 

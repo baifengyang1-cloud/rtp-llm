@@ -29,6 +29,7 @@ cc_library(
     name = "core_utils",
     hdrs = [
         "AssertUtils.h",
+        "EmbeddingStageLog.h",
         "Logger.h",
         "StringUtil.h",
         "StatusUtil.h",
@@ -37,6 +38,7 @@ cc_library(
     ],
     srcs = [
         "AssertUtils.cc",
+        "EmbeddingStageLog.cc",
         "Logger.cc",
         "Exception.cc"
     ],

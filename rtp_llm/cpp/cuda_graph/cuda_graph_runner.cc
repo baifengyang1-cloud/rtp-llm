@@ -13,6 +13,7 @@
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/utils/EmbeddingStageLog.h"
 #include "rtp_llm/cpp/utils/TorchCudaOom.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -334,6 +335,7 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
 }
 
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
+    EmbeddingStageSpan stage_span("graph_prepare_input_cpu_us");
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputData");
     const size_t graph_idx =
         is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
@@ -343,9 +345,13 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
     if (isEmbeddingStylePrefillCudaGraph()) {
         // The previous graph can still be reading this bucket's input on a
         // different stream. Order the graph-external producer before reuse.
+        EmbeddingStageSpan wait_span("graph_input_wait_previous_cpu_us");
         forward_event_.synchronize();
+        wait_span.finish();
+        EmbeddingStageSpan     embedding_span("graph_embedding_prepare_cpu_us");
         py::gil_scoped_acquire gil;
         auto                   hidden = py_prepare_transformer_inputs_(inputs).cast<torch::Tensor>();
+        embedding_span.finish();
         auto&                  buffer = graph_instances_[graph_idx].mem_hold_.transformer_input_;
         RTP_LLM_CHECK_WITH_INFO(hidden.dim() == 2 && hidden.size(0) == token_num && hidden.size(1) == hidden_size_
                                     && hidden.scalar_type() == buffer.scalar_type()
@@ -353,6 +359,7 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
                                 "invalid Transformer-only CUDA graph input");
         // Request-owned visual tensors never enter the captured graph. Clear
         // the unused token tail so alternating batch lengths cannot leak data.
+        EmbeddingStageSpan copy_span("graph_input_copy_submit_cpu_us");
         buffer.narrow(0, 0, token_num).copy_(hidden, /*non_blocking=*/true);
         buffer.slice(0, token_num).zero_();
         return;
@@ -440,6 +447,7 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
 void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                                              CudaGraphState&      state,
                                              bool                 skip_forward_event_sync) {
+    EmbeddingStageSpan stage_span("graph_prepare_attention_cpu_us");
     // Captured buffers are created under InferenceMode in initCapture(). Keep
     // preparation self-contained so callers cannot accidentally mutate an
     // inference tensor from normal autograd mode (which PyTorch rejects).
@@ -471,6 +479,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         }
     } else if (isEmbeddingStylePrefillCudaGraph() || !skip_forward_event_sync || !streamAsyncReplayPrepEnabled()) {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_forward_event)");
+        EmbeddingStageSpan wait_span("graph_attention_wait_previous_cpu_us");
         forward_event_.synchronize();
     }
 
@@ -624,6 +633,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
 #if USING_CUDA || USING_ROCM
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(fused_fill)");
+        EmbeddingStageSpan         fill_span("graph_fill_submit_cpu_us");
         CudaGraphPrepareFillParams fill_params;
         if (!has_tagged_cache) {
             addCudaGraphPrepareFillRegion(fill_params,
@@ -862,6 +872,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
 
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(host_mirror_copy)");
+        EmbeddingStageSpan mirror_span("graph_host_mirror_cpu_us");
 
         // H2H copies (common to both modes)
         //
@@ -1094,6 +1105,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     // a Python args tuple via PyTuple_New, which segfaults without the GIL.
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(prepare_cuda_graph)");
+        EmbeddingStageSpan plan_span("graph_attention_plan_cpu_us");
         if (pending_host_mirror_d2h) {
             // Wait for the async D2H metadata copies above so the CPU-side
             // fill/plan paths inside prepare_cuda_graph read this step's
@@ -1180,6 +1192,7 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     if (is_prefill_cuda_graph_mode_) {
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayPrefill)");
+            EmbeddingStageSpan replay_span("graph_replay_submit_cpu_us");
             replayPrefill(state.current_real_graph_seq_len);
         }
         if (isGenerationPrefillCudaGraph()) {

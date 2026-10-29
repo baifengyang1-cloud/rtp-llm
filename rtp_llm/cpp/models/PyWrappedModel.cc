@@ -20,6 +20,7 @@
 #include <numeric>
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/utils/EmbeddingStageLog.h"
 #if USING_CUDA
 #include <c10/cuda/CUDAStream.h>
 #include "rtp_llm/models_py/bindings/cuda/Bf16GemmOp.h"
@@ -219,6 +220,7 @@ std::optional<std::string> PyWrappedModel::takeDeferredHiddenStateCaptureError()
 
 // Helper function to build PyAttentionInputs from GptModelInputs
 torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptModelInputs& inputs) {
+    EmbeddingStageSpan stage_span("build_attention_cpu_us");
     RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs");
     DevicePerfWrapper            wrapper(enable_device_perf_, "py model buildPyAttentionInputs");
     torch_ext::PyAttentionInputs py_attn_inputs;
@@ -402,6 +404,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
 
     if (host_input_metadata_builder_) {
         RTP_LLM_PROFILE_SCOPE("py_model.buildHostInputMetadata");
+        EmbeddingStageSpan stage_span("build_host_metadata_cpu_us");
         RTP_LLM_CHECK_WITH_INFO(py_attn_inputs.is_prefill, "native host input metadata requires prefill");
         py_attn_inputs.host_model_metadata = host_input_metadata_builder_->build(
             inputs.combo_tokens, py_attn_inputs.input_lengths, inputs.text_tokens_mask, py_attn_inputs.cu_seqlens);
@@ -547,6 +550,7 @@ PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs& py_
 
 // Helper function to build BertEmbeddingInputs from GptModelInputs
 torch_ext::BertEmbeddingInputs PyWrappedModel::buildBertEmbeddingInputs(const GptModelInputs& inputs) {
+    EmbeddingStageSpan stage_span("build_bert_inputs_cpu_us");
     RTP_LLM_PROFILE_SCOPE("py_model.buildBertEmbeddingInputs");
     DevicePerfWrapper              wrapper(enable_device_perf_, "py model buildBertEmbeddingInputs");
     torch_ext::BertEmbeddingInputs bert_embedding_inputs;
@@ -920,6 +924,7 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
 }
 
 void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync) {
+    EmbeddingStageSpan stage_span("prepare_attention_cpu_us");
     RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs");
     PreparedAttentionInputsGuard prepared_guard(prepared_attention_inputs_);
     d2d_copies_.clear();
@@ -1149,8 +1154,16 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             && generation_prefill_graph_runner_ != nullptr && !is_generation_prefill_runner) {
             generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::MIXED_PREFILL_DECODE_NOT_SUPPORTED;
         }
+        EmbeddingStageSpan graph_check_span("graph_check_cpu_us");
         const bool can_run_graph = !capture_hidden_states && enable_cuda_graph_ && graph_runner != nullptr
                                    && graph_runner->canRun(py_model_inputs, graph_state);
+        graph_check_span.finish();
+        if (auto* stage_log = EmbeddingStageLog::current()) {
+            stage_log->setExecution(can_run_graph      ? "graph" :
+                                    enable_cuda_graph_ ? "eager_fallback" :
+                                                         "eager",
+                                    can_run_graph ? graph_state.current_real_graph_seq_len : 0);
+        }
         if (!capture_hidden_states && is_generation_prefill_runner && !can_run_graph) {
             generation_prefill_cuda_graph_status =
                 graph_state.generation_prefill_status == GenerationPrefillCudaGraphStatus::NOT_REQUESTED ?
@@ -1158,7 +1171,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                     graph_state.generation_prefill_status;
         }
         if (can_run_graph) {
+            EmbeddingStageSpan     gil_span("model_gil_wait_cpu_us");
             py::gil_scoped_acquire gil;
+            gil_span.finish();
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
             RTP_LLM_LOG_DEBUG(
@@ -1172,21 +1187,28 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::REPLAYED;
             }
         } else {
+            EmbeddingStageSpan     gil_span("model_gil_wait_cpu_us");
             py::gil_scoped_acquire gil;
+            gil_span.finish();
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
             DevicePerfWrapper wrapper(enable_device_perf_, "normal forward");
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,
                               py_model_inputs.attention_inputs.is_prefill);
             if (py::hasattr(py_model_, "prepare_forward_inputs")) {
+                EmbeddingStageSpan stage_span("eager_embedding_prepare_cpu_us");
                 // Preparation replaces input_hiddens; mutate this request's C++
                 // object rather than a Python-owned copy of PyModelInputs.
                 py_model_.attr("prepare_forward_inputs")(
                     py::cast(&py_model_inputs, py::return_value_policy::reference));
             }
+            EmbeddingStageSpan attention_span("eager_attention_plan_cpu_us");
             held_attn_pyobj_ = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
+            attention_span.finish();
+            EmbeddingStageSpan forward_span("eager_backbone_submit_cpu_us");
             auto outputs     = py_forward_method_(py_model_inputs, held_attn_pyobj_);
             py_model_outputs = outputs.cast<PyModelOutputs>();
+            forward_span.finish();
         }
 
         if (capture_hidden_states) {
@@ -1195,6 +1217,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             // publish() validates the restored/local packed tensor once before store.
             hidden_states = py_model_outputs.hidden_states;
         } else {
+            EmbeddingStageSpan stage_span("output_clone_submit_cpu_us");
             hidden_states = py_model_outputs.hidden_states.clone();
         }
 
