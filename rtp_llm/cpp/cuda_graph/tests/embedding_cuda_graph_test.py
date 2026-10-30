@@ -111,6 +111,29 @@ class TransformerOnlyCudaGraphEmbeddingModel(EmbeddingGraphTestModel):
 
 class TestEmbeddingCudaGraph(unittest.TestCase):
 
+    def test_large_item_capacity_replays_changing_lists_and_rejects_overflow(self):
+        runner = CudaGraphRunner()
+        model = TransformerOnlyCudaGraphEmbeddingModel()
+        runner.init_prefill(model, 256, 8, 8, [512], HIDDEN_SIZE, GROUP_TAGS)
+        # More item rows than the online HTTP concurrency of 128. Token
+        # capacity is held fixed while item count changes across replays.
+        for count in (96, 128, 160, 198, 256, 32, 198):
+            inputs = _build_prefill_inputs(
+                GROUP_TAGS, {"full": 1, "aux": 2}, [1] * count
+            )
+            self.assertTrue(runner.canRun(inputs))
+            actual = runner.forward(inputs).hidden_states.clone()
+            hidden = (
+                inputs.input_ids.to(torch.bfloat16).unsqueeze(1).expand(-1, HIDDEN_SIZE)
+            )
+            torch.testing.assert_close(actual, hidden * 2 + hidden.sum(dim=0))
+        overflow = _build_prefill_inputs(GROUP_TAGS, {"full": 1, "aux": 2}, [1] * 257)
+        self.assertFalse(runner.canRun(overflow))
+        token_overflow = _build_prefill_inputs(
+            GROUP_TAGS, {"full": 1, "aux": 2}, [3] * 198
+        )
+        self.assertFalse(runner.canRun(token_overflow))
+
     def test_complete_request_is_validated_once_before_preparation(self):
         class CountingModel(TransformerOnlyCudaGraphEmbeddingModel):
             validation_calls = 0

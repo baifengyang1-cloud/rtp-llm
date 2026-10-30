@@ -26,6 +26,21 @@ cc_library(
 
 # New modular targets
 cc_library(
+    name = "embedding_gpu_timing_pool",
+    hdrs = ["EmbeddingGpuTimingPool.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "embedding_gpu_stage_timer",
+    hdrs = ["EmbeddingGpuStageTimer.h"],
+    srcs = ["EmbeddingGpuStageTimer.cc"],
+    deps = [":core_utils", ":embedding_gpu_timing_pool"] + torch_deps(),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "core_utils",
     hdrs = [
         "AssertUtils.h",

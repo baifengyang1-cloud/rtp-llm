@@ -15,6 +15,38 @@ from rtp_llm.utils import backend_registry
 from rtp_llm.utils.backend_registry import register_backend_hook
 
 
+class EmbeddingGraphArgumentsTest(TestCase):
+    def test_embedding_graph_item_capacity_cli_env_and_default(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                server_args.setup_args(
+                    []
+                ).py_hw_kernel_config.embedding_graph_max_items,
+                0,
+            )
+        with patch.dict(os.environ, {"EMBEDDING_GRAPH_MAX_ITEMS": "256"}, clear=True):
+            configs = server_args.setup_args(["--concurrency_limit", "128"])
+            self.assertEqual(configs.py_hw_kernel_config.embedding_graph_max_items, 256)
+            self.assertEqual(configs.concurrency_config.concurrency_limit, 128)
+            override = server_args.setup_args(["--embedding_graph_max_items", "198"])
+            self.assertEqual(
+                override.py_hw_kernel_config.embedding_graph_max_items, 198
+            )
+
+    def test_embedding_graph_item_capacity_rejects_invalid_values(self):
+        from argparse import ArgumentTypeError
+
+        from rtp_llm.server.server_args.hw_kernel_group_args import (
+            _embedding_graph_max_items,
+        )
+
+        for value in ("-1", "abc", str(2**31 - 1)):
+            with self.subTest(value=value), self.assertRaises(ArgumentTypeError):
+                _embedding_graph_max_items(value)
+
+
 class CustomAllReduceArgumentsTest(TestCase):
     def test_explicit_cli_value_is_preserved_for_python_collectives(self):
         from rtp_llm.server.server_args import server_args

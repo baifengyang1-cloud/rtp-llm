@@ -166,10 +166,26 @@ class GptModelBase(nn.Module):
                 or lengths.ndim != 1
                 or not lengths.is_contiguous()
                 or lengths.numel() == 0
-                or bool((lengths < 0).any())
-                or bool((lengths > self.config.max_seq_len).any())
             ):
                 return False
+            if (
+                prefix is None
+                or prefix.is_cuda
+                or prefix.dtype != torch.int32
+                or prefix.ndim != 1
+                or prefix.numel() != lengths.numel()
+                or not prefix.is_contiguous()
+            ):
+                return False
+            # Request-local CPU vectors: avoid several Torch comparison,
+            # reduction and scalar-extraction dispatches for tiny metadata.
+            # Reuse these same lengths for model-specific bounds validation.
+            length_values = lengths.tolist()
+            total_tokens = 0
+            for length, cached in zip(length_values, prefix.tolist()):
+                if length < 0 or length > self.config.max_seq_len or cached != 0:
+                    return False
+                total_tokens += length
             tokens = getattr(inputs, "input_ids", None)
             if tokens is not None and tokens.numel():
                 if (
@@ -177,23 +193,16 @@ class GptModelBase(nn.Module):
                     or tokens.dtype != torch.int32
                     or not tokens.is_cuda
                     or not tokens.is_contiguous()
-                    or tokens.numel() != int(lengths.sum())
+                    or tokens.numel() != total_tokens
                 ):
                     return False
-            if (
-                prefix is None
-                or prefix.is_cuda
-                or prefix.dtype != torch.int32
-                or prefix.ndim != 1
-            ):
-                return False
-            if (
-                prefix.numel() != lengths.numel()
-                or not prefix.is_contiguous()
-                or bool(prefix.any())
-            ):
+            if not self.validate_embedding_attention_metadata(attn, length_values):
                 return False
         return self.validate_embedding_input_features(inputs)
+
+    def validate_embedding_attention_metadata(self, attn_inputs, lengths) -> bool:
+        """Model hook using the CPU lengths already checked for this request."""
+        return True
 
     def validate_embedding_input_features(self, inputs):
         # The default adapter reconstructs positions from zero for each sequence.

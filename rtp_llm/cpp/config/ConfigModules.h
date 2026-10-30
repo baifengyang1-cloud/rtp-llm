@@ -301,6 +301,9 @@ struct HWKernelConfig {
     bool        use_swizzleA                 = false;
     bool        enable_cuda_graph            = false;
     bool        enable_cuda_graph_debug_mode = false;
+    // Embedding item rows per graph, independent of admitted HTTP requests.
+    // Zero retains the historical concurrency_limit capacity.
+    int embedding_graph_max_items = 0;
     // Generation-prefill graph is enabled only when the CUDA graph master
     // switch is on and this capture bucket list is explicitly configured.
     int              generation_prefill_cuda_graph_max_requests = 1;

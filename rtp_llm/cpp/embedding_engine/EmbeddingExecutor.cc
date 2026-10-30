@@ -19,6 +19,7 @@
 #include <chrono>
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/utils/EmbeddingStageLog.h"
+#include "rtp_llm/cpp/utils/EmbeddingGpuStageTimer.h"
 using namespace std;
 using namespace at::indexing;
 
@@ -469,6 +470,10 @@ absl::Status EmbeddingExecutor::process(const std::list<EmbeddingStreamPtr>& str
     handler_input_span.finish();
     auto            total_batch_size = model_request.context_batch_size;
     model_->releaseBuffers();
+    EmbeddingGpuStageScope gpu_stage({EmbeddingStageLog::current() ? stage_log.batchId() : 0,
+                                      static_cast<int64_t>(streams.size()),
+                                      model_input.input_lengths.size(0),
+                                      model_input.combo_tokens.numel()});
     EmbeddingStageSpan model_span("model_forward_cpu_us");
     model_output = std::move(model_->forward(model_input));
     model_span.finish();
@@ -495,6 +500,7 @@ absl::Status EmbeddingExecutor::process(const std::list<EmbeddingStreamPtr>& str
     }
     model_->releaseBuffers();
     stage_log.finish(res.ok());
+    gpu_stage.finish(res.ok());
     return res;
 }
 

@@ -240,6 +240,37 @@ class EmbeddingGraphContractTest(unittest.TestCase):
         for tag, impl in attention.items():
             impl.prepare_cuda_graph.assert_called_once_with(groups[tag])
 
+    def test_validation_shares_current_lengths_with_model_hook_and_checks_each_group(
+        self,
+    ):
+        from rtp_llm.ops.compute_ops import PyAttentionInputs
+
+        class SegmentModel(GptModelBase):
+            seen = []
+
+            def validate_embedding_attention_metadata(self, attention, lengths):
+                self.seen.append(lengths)
+                return lengths[-1] <= 3
+
+            def validate_embedding_input_features(self, inputs):
+                return True
+
+        model = SegmentModel.__new__(SegmentModel)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(max_seq_len=8)
+        groups = {tag: PyAttentionInputs() for tag in ("full", "aux")}
+        for attention in groups.values():
+            attention.is_prefill = True
+            attention.input_lengths = torch.tensor([3, 2], dtype=torch.int32)
+            attention.prefix_lengths = torch.zeros(2, dtype=torch.int32)
+        inputs = SimpleNamespace(attention_inputs=groups)
+        self.assertTrue(model.validate_embedding_graph_inputs(inputs))
+        self.assertEqual(model.seen, [[3, 2], [3, 2]])
+        groups["aux"].input_lengths[1] = 4
+        self.assertFalse(model.validate_embedding_graph_inputs(inputs))
+        groups["aux"].input_lengths[1] = 2
+        self.assertTrue(model.validate_embedding_graph_inputs(inputs))
+
     def test_missing_split_contract_is_unsupported(self):
         model = GptModelBase.__new__(GptModelBase)
         torch.nn.Module.__init__(model)

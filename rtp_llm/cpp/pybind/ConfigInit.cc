@@ -857,6 +857,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("use_swizzleA", &HWKernelConfig::use_swizzleA)
         .def_readwrite("enable_cuda_graph", &HWKernelConfig::enable_cuda_graph)
         .def_readwrite("enable_cuda_graph_debug_mode", &HWKernelConfig::enable_cuda_graph_debug_mode)
+        .def_readwrite("embedding_graph_max_items", &HWKernelConfig::embedding_graph_max_items)
         .def_readwrite("generation_prefill_cuda_graph_max_requests",
                        &HWKernelConfig::generation_prefill_cuda_graph_max_requests)
         .def_readwrite("generation_prefill_capture_token_buckets",
@@ -885,10 +886,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.disable_dpc_random,
                                       self.rocm_disable_custom_ag,
                                       self.generation_prefill_cuda_graph_max_requests,
-                                      self.generation_prefill_capture_token_buckets);
+                                      self.generation_prefill_capture_token_buckets,
+                                      self.embedding_graph_max_items);
             },
             [](py::tuple t) {
-                if (t.size() != 14 && t.size() != 16)
+                if (t.size() != 14 && t.size() != 16 && t.size() != 17)
                     throw std::runtime_error("Invalid state!");
                 HWKernelConfig c;
                 try {
@@ -906,9 +908,12 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.decode_capture_batch_sizes   = t[11].cast<std::vector<int>>();
                     c.disable_dpc_random           = t[12].cast<bool>();
                     c.rocm_disable_custom_ag       = t[13].cast<bool>();
-                    if (t.size() == 16) {
+                    if (t.size() >= 16) {
                         c.generation_prefill_cuda_graph_max_requests = t[14].cast<int>();
                         c.generation_prefill_capture_token_buckets   = t[15].cast<std::vector<int>>();
+                    }
+                    if (t.size() == 17) {
+                        c.embedding_graph_max_items = t[16].cast<int>();
                     }
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("HWKernelConfig unpickle error: ") + e.what());

@@ -137,6 +137,7 @@ cc_library(
         "//rtp_llm/cpp/multimodal_processor:multimodal_processor",
         ":config_extract",
         "//rtp_llm/cpp/utils:signal_utils",
+        "//rtp_llm/cpp/utils:embedding_gpu_stage_timer",
         "//:rtp_compute_ops",
         "@xgrammar//:xgrammar",
     ] + torch_deps() + select({

@@ -21,6 +21,7 @@
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/utils/EmbeddingStageLog.h"
+#include "rtp_llm/cpp/utils/EmbeddingGpuStageTimer.h"
 #if USING_CUDA
 #include <c10/cuda/CUDAStream.h>
 #include "rtp_llm/models_py/bindings/cuda/Bf16GemmOp.h"
@@ -1158,6 +1159,10 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         const bool can_run_graph = !capture_hidden_states && enable_cuda_graph_ && graph_runner != nullptr
                                    && graph_runner->canRun(py_model_inputs, graph_state);
         graph_check_span.finish();
+        setEmbeddingGpuExecution(can_run_graph      ? "graph" :
+                                 enable_cuda_graph_ ? "eager_fallback" :
+                                                      "eager",
+                                 can_run_graph ? graph_state.current_real_graph_seq_len : 0);
         if (auto* stage_log = EmbeddingStageLog::current()) {
             stage_log->setExecution(can_run_graph      ? "graph" :
                                     enable_cuda_graph_ ? "eager_fallback" :
@@ -1206,7 +1211,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             held_attn_pyobj_ = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
             attention_span.finish();
             EmbeddingStageSpan forward_span("eager_backbone_submit_cpu_us");
+            markEmbeddingGpuStage(EmbeddingGpuPoint::BackboneBegin);
             auto outputs     = py_forward_method_(py_model_inputs, held_attn_pyobj_);
+            markEmbeddingGpuStage(EmbeddingGpuPoint::BackboneEnd);
             py_model_outputs = outputs.cast<PyModelOutputs>();
             forward_span.finish();
         }

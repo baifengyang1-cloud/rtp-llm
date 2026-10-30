@@ -62,6 +62,12 @@ class _LegacyHWKernelConfig:
         return _new_hw_kernel_config, (), legacy_state
 
 
+class _PreviousHWKernelConfig:
+    def __reduce__(self):
+        state = _LegacyHWKernelConfig().__reduce__()[2] + (5, [32, 64])
+        return _new_hw_kernel_config, (), state
+
+
 class _LegacyMoeConfig:
     def __reduce__(self):
         legacy_state = (
@@ -214,6 +220,12 @@ class GrammarConfigPickleTest(unittest.TestCase):
 
 
 class HWKernelConfigPickleTest(unittest.TestCase):
+    def test_previous_16_tuple_defaults_embedding_graph_item_capacity(self):
+        restored = pickle.loads(pickle.dumps(_PreviousHWKernelConfig()))
+        self.assertEqual(restored.embedding_graph_max_items, 0)
+        self.assertEqual(restored.generation_prefill_cuda_graph_max_requests, 5)
+        self.assertEqual(restored.generation_prefill_capture_token_buckets, [32, 64])
+
     def test_current_format_round_trip(self):
         config = HWKernelConfig()
         config.deep_gemm_num_sm = 7
@@ -225,6 +237,7 @@ class HWKernelConfigPickleTest(unittest.TestCase):
         config.enable_cuda_graph = True
         config.enable_cuda_graph_debug_mode = True
         config.generation_prefill_cuda_graph_max_requests = 5
+        config.embedding_graph_max_items = 256
         config.generation_prefill_capture_token_buckets = [32, 64, 96]
         config.enable_native_cuda_graph = True
         config.num_native_cuda_graph = 41
@@ -244,6 +257,7 @@ class HWKernelConfigPickleTest(unittest.TestCase):
         self.assertTrue(restored.enable_cuda_graph)
         self.assertTrue(restored.enable_cuda_graph_debug_mode)
         self.assertEqual(restored.generation_prefill_cuda_graph_max_requests, 5)
+        self.assertEqual(restored.embedding_graph_max_items, 256)
         self.assertEqual(
             restored.generation_prefill_capture_token_buckets, [32, 64, 96]
         )
@@ -258,6 +272,7 @@ class HWKernelConfigPickleTest(unittest.TestCase):
         restored = pickle.loads(pickle.dumps(_LegacyHWKernelConfig()))
 
         self.assertEqual(restored.generation_prefill_cuda_graph_max_requests, 1)
+        self.assertEqual(restored.embedding_graph_max_items, 0)
         self.assertEqual(restored.prefill_capture_seq_lens, [64, 128])
         self.assertEqual(restored.decode_capture_batch_sizes, [1, 8])
         self.assertEqual(restored.num_native_cuda_graph, 37)
@@ -267,7 +282,7 @@ class HWKernelConfigPickleTest(unittest.TestCase):
         )
 
     def test_unsupported_tuple_sizes_are_rejected(self):
-        for size in (15, 17, 18):
+        for size in (15, 18, 19):
             with self.subTest(size=size), self.assertRaisesRegex(
                 RuntimeError, "Invalid state"
             ):

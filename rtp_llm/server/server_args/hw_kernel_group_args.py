@@ -52,6 +52,12 @@ def _generation_prefill_cuda_graph_max_requests(value: str) -> int:
     return parsed
 
 
+def _embedding_graph_max_items(value: str) -> int:
+    if str(value).strip() == "0":
+        return 0
+    return _positive_int(value, "embedding_graph_max_items")
+
+
 def validate_hw_kernel_group_args(
     hw_kernel_config: HWKernelConfig,
     *,
@@ -116,6 +122,18 @@ def init_hw_kernel_group_args(parser, hw_kernel_config):
     # 硬件/Kernel 特定优化
     ##############################################################################################################
     hw_kernel_group = parser.add_argument_group("硬件/Kernel 特定优化")
+
+    hw_kernel_group.add_argument(
+        "--embedding_graph_max_items",
+        env_name="EMBEDDING_GRAPH_MAX_ITEMS",
+        bind_to=(hw_kernel_config, "embedding_graph_max_items"),
+        type=_embedding_graph_max_items,
+        default=0,
+        help=(
+            "Embedding CUDA Graph 商品/sequence 行容量，独立于请求并发数；"
+            "0 沿用 concurrency_limit。不改变 scheduler token 预算或 capture token buckets。"
+        ),
+    )
 
     hw_kernel_group.add_argument(
         "--enable_cuda_graph",

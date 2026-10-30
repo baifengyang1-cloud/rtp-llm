@@ -498,6 +498,16 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                                                                      CudaGraphRole::MTP_DRAFT_PREFILL) :
                                             CudaGraphRole::DECODE;
         graph_role_ = graph_params.role;
+        RTP_LLM_CHECK_WITH_INFO(params.hw_kernel_config.embedding_graph_max_items >= 0,
+                                "embedding_graph_max_items must be nonnegative");
+        if (graph_role_ == CudaGraphRole::EMBEDDING_PREFILL && params.hw_kernel_config.embedding_graph_max_items > 0) {
+            graph_params.max_context_batch_size = params.hw_kernel_config.embedding_graph_max_items;
+        }
+        if (graph_role_ == CudaGraphRole::EMBEDDING_PREFILL) {
+            RTP_LLM_LOG_INFO("embedding CUDA graph item capacity=%zu concurrency_limit=%d",
+                             graph_params.max_context_batch_size,
+                             params.concurrency_config.concurrency_limit);
+        }
         graph_params.kernel_block_table_width = params.kernel_block_table_width;
         RTP_LLM_CHECK_WITH_INFO(graph_params.kernel_block_table_width > 0,
                                 "CUDA graph requires Executor to provide a positive kernel block table width");

@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/utils/EmbeddingStageLog.h"
+#include "rtp_llm/cpp/utils/EmbeddingGpuStageTimer.h"
 #include "rtp_llm/cpp/utils/TorchCudaOom.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -1075,13 +1076,42 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
             .fill_(num_tokens_per_bs_);
 #endif
     } else if (has_padded_rows && is_prefill_cuda_graph_mode_ && !isGenerationPrefillCudaGraph()) {
-        py_model_inputs_.attention_inputs.prefix_lengths.slice(0, state.current_batch_size, selected_graph_batch_size)
-            .fill_(0);
-        py_model_inputs_.attention_inputs.input_lengths.slice(0, state.current_batch_size, selected_graph_batch_size)
-            .fill_(0);
-        py_model_inputs_.attention_inputs.cu_seqlens
-            .slice(0, state.current_batch_size + 1, selected_graph_batch_size + 1)
-            .fill_(state.current_seq_len);
+        if (isEmbeddingStylePrefillCudaGraph()) {
+            // forward_event_ was waited above before any host mirror mutation.
+            // These fixed contiguous CPU int32 vectors are planner inputs:
+            // fill tails directly, without allocating slice tensors and
+            // dispatching three tiny Torch fill operations on every replay.
+            const auto fill_host_tail = [](torch::Tensor& tensor, int begin, int end, int32_t value) {
+                RTP_LLM_CHECK_WITH_INFO(tensor.defined() && tensor.device().is_cpu()
+                                            && tensor.scalar_type() == torch::kInt32 && tensor.dim() == 1
+                                            && tensor.is_contiguous() && begin >= 0 && end >= begin
+                                            && end <= tensor.numel(),
+                                        "invalid embedding graph host mirror");
+                std::fill(tensor.data_ptr<int32_t>() + begin, tensor.data_ptr<int32_t>() + end, value);
+            };
+            fill_host_tail(py_model_inputs_.attention_inputs.prefix_lengths,
+                           state.current_batch_size,
+                           selected_graph_batch_size,
+                           0);
+            fill_host_tail(py_model_inputs_.attention_inputs.input_lengths,
+                           state.current_batch_size,
+                           selected_graph_batch_size,
+                           0);
+            fill_host_tail(py_model_inputs_.attention_inputs.cu_seqlens,
+                           state.current_batch_size + 1,
+                           selected_graph_batch_size + 1,
+                           state.current_seq_len);
+        } else {
+            py_model_inputs_.attention_inputs.prefix_lengths
+                .slice(0, state.current_batch_size, selected_graph_batch_size)
+                .fill_(0);
+            py_model_inputs_.attention_inputs.input_lengths
+                .slice(0, state.current_batch_size, selected_graph_batch_size)
+                .fill_(0);
+            py_model_inputs_.attention_inputs.cu_seqlens
+                .slice(0, state.current_batch_size + 1, selected_graph_batch_size + 1)
+                .fill_(state.current_seq_len);
+        }
 #if !USING_CUDA && !USING_ROCM
         py_model_inputs_.attention_inputs.prefix_lengths_device
             .slice(0, state.current_batch_size, selected_graph_batch_size)
@@ -1193,7 +1223,13 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayPrefill)");
             EmbeddingStageSpan replay_span("graph_replay_submit_cpu_us");
+            if (isEmbeddingStylePrefillCudaGraph()) {
+                markEmbeddingGpuStage(EmbeddingGpuPoint::BackboneBegin);
+            }
             replayPrefill(state.current_real_graph_seq_len);
+            if (isEmbeddingStylePrefillCudaGraph()) {
+                markEmbeddingGpuStage(EmbeddingGpuPoint::BackboneEnd);
+            }
         }
         if (isGenerationPrefillCudaGraph()) {
             const uint64_t replay_count =
