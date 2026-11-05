@@ -1068,6 +1068,7 @@ class DefaultBatchDispatcherTest {
             throws Exception {
         ScheduledRequest base = createScheduledRequest(1L, 500, 0, createPrefillEndpoint());
         base.prefill().setRequestId(1L);
+        base.prefill().setGroup("default");
         ServerStatus decode = ServerStatus.copyOf(base.prefill());
         decode.setRole(RoleType.DECODE);
         decode.setServerIp("127.0.0.2");
@@ -1094,14 +1095,25 @@ class DefaultBatchDispatcherTest {
         DecodeSelector decodeSelector = mock(DecodeSelector.class);
         RandomStrategy vitSelector = mock(RandomStrategy.class);
         var selectedPrefill = selectedRole(base.prefill(), base.prefillEp());
-        var selectedDecode = selectedRole(decode, mock(DecodeEndpoint.class));
-        when(prefillSelector.select(any(), any(), any())).thenReturn(PlacementResult.success(selectedPrefill));
-        when(decodeSelector.select(any(), any())).thenReturn(PlacementResult.success(selectedDecode));
-        when(vitSelector.select(any(), any(), any())).thenReturn(
+        var decodeEndpoint = mock(DecodeEndpoint.class);
+        when(decodeEndpoint.getStatus()).thenReturn(WorkerStatus.createDiscovered(
+                RoleType.DECODE, decode.getGroup(), decode.getServerIp(), decode.getHttpPort(), decode.getGrpcPort(), "test"));
+        var selectedDecode = selectedRole(decode, decodeEndpoint);
+        when(prefillSelector.select(any(), any(), any(), any())).thenReturn(PlacementResult.success(selectedPrefill));
+        when(decodeSelector.select(any(), any(), any())).thenReturn(PlacementResult.success(selectedDecode));
+        when(vitSelector.select(any(), any(), any(), any())).thenReturn(
                 SelectedRole.stateless(vitEndpoint.tryPinGeneration(), vit));
         ModelMetaConfig topology = mock(ModelMetaConfig.class);
         when(topology.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.DECODE, RoleType.VIT));
-        DefaultRouter router = new DefaultRouter(prefillSelector, decodeSelector, vitSelector, configService, topology);
+        var workers = mock(org.flexlb.sync.status.WorkerDirectory.class);
+        when(workers.prefillRoutingSnapshot(RoleType.PREFILL)).thenReturn(List.of(
+                new org.flexlb.balance.endpoint.EndpointRegistry.PrefillRoutingEntry("127.0.0.1:8080", base.prefillEp())));
+        var decodeView = new DecodeEndpoint(decodeEndpoint.getStatus(), mock(EndpointEventProjector.class)).routingView();
+        when(workers.decodeRoutingSnapshot(any())).thenReturn(List.of(decodeView));
+        when(workers.routingStatusSnapshot(any(), any())).thenAnswer(call ->
+                List.of(base.prefillEp().getStatus(), decodeEndpoint.getStatus(), vitEndpoint.getStatus()).stream()
+                        .filter(w -> w.getRole() == call.getArgument(0)).toList());
+        DefaultRouter router = new DefaultRouter(prefillSelector, decodeSelector, vitSelector, configService, topology, workers);
         try (RouteAdmission admission = router.select(base.ctx()).value()) {
             return admission.createScheduledRequest(base.ctx(), base.future(), System.currentTimeMillis());
         }
@@ -1112,6 +1124,7 @@ class DefaultBatchDispatcherTest {
         WorkerEndpoint.GenerationPin pin = mock(WorkerEndpoint.GenerationPin.class);
         when(pin.endpoint()).thenReturn(endpoint);
         when(selected.serverStatus()).thenReturn(status);
+        when(selected.endpoint()).thenReturn(endpoint);
         when(selected.takeGenerationPin()).thenReturn(pin);
         return selected;
     }
@@ -1185,6 +1198,9 @@ class DefaultBatchDispatcherTest {
         when(endpoint.getIp()).thenReturn("127.0.0.1");
         when(endpoint.getHttpPort()).thenReturn(8080);
         when(endpoint.getGrpcPort()).thenReturn(8090);
+        when(endpoint.getStatus()).thenReturn(WorkerStatus.createDiscovered(
+                RoleType.PREFILL, "default", "127.0.0.1", 8080, 8090, "test"));
+        when(endpoint.canAcceptRequest()).thenReturn(true);
         return endpoint;
     }
 

@@ -1057,6 +1057,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("force_score_context_attention", &SpeculativeExecutionConfig::force_score_context_attention)
         .def_readwrite("quantization", &SpeculativeExecutionConfig::quantization)
         .def_readwrite("checkpoint_path", &SpeculativeExecutionConfig::checkpoint_path)
+        .def_readwrite("model_identity", &SpeculativeExecutionConfig::model_identity)
         .def_readwrite("sp_dspark_mask_token_id", &SpeculativeExecutionConfig::sp_dspark_mask_token_id)
         .def_readwrite("sp_dspark_sample_from_anchor", &SpeculativeExecutionConfig::sp_dspark_sample_from_anchor)
         .def("to_string", [](const SpeculativeExecutionConfig& self) { return self.to_string(); })
@@ -1073,10 +1074,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.quantization,
                                       self.checkpoint_path,
                                       self.sp_dspark_mask_token_id,
-                                      self.sp_dspark_sample_from_anchor);
+                                      self.sp_dspark_sample_from_anchor,
+                                      self.model_identity);
             },
             [](py::tuple t) {
-                if (t.size() != 10 && t.size() != 11 && t.size() != 12)
+                if (t.size() < 10 || t.size() > 13)
                     throw std::runtime_error("Invalid state!");
                 SpeculativeExecutionConfig c;
                 try {
@@ -1093,9 +1095,12 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     if (t.size() == 11) {
                         c.sp_dspark_mask_token_id = t[10].cast<int64_t>();
                     }
-                    if (t.size() == 12) {
+                    if (t.size() >= 12) {
                         c.sp_dspark_mask_token_id      = t[10].cast<int64_t>();
                         c.sp_dspark_sample_from_anchor = t[11].cast<bool>();
+                    }
+                    if (t.size() >= 13) {
+                        c.model_identity = t[12].cast<std::string>();
                     }
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("SpeculativeExecutionConfig unpickle error: ") + e.what());
@@ -2050,6 +2055,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("kv_cache_spec_descs", &ModelConfig::kv_cache_spec_descs)
         // task_type is defined as property below
         .def_readwrite("ckpt_path", &ModelConfig::ckpt_path)
+        .def_readwrite("model_identity", &ModelConfig::model_identity)
+        .def_readwrite("vision_model_identity", &ModelConfig::vision_model_identity)
         .def_readwrite("tokenizer_path", &ModelConfig::tokenizer_path)
         .def_readwrite("position_ids_style", &ModelConfig::position_ids_style)
         .def_readwrite("pre_seq_len", &ModelConfig::pre_seq_len)

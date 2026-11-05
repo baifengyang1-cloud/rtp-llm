@@ -65,6 +65,8 @@ class DefaultRouterTest {
     private ConfigService configService;
     private ModelMetaConfig modelMeta;
     private RequestRegistry requests;
+    private org.flexlb.sync.status.WorkerDirectory workers;
+    private final List<org.flexlb.dao.master.WorkerStatus> routingWorkers = new ArrayList<>();
 
     @BeforeEach
     void setUp() {
@@ -73,6 +75,29 @@ class DefaultRouterTest {
         vitSelector = mock(RandomStrategy.class);
         configService = mock(ConfigService.class);
         modelMeta = mock(ModelMetaConfig.class);
+        workers = mock(org.flexlb.sync.status.WorkerDirectory.class);
+        when(workers.routingStatusSnapshot(any(), any())).thenAnswer(call -> routingWorkers.stream()
+                .filter(w -> w.getRole() == call.getArgument(0)
+                        && (call.getArgument(1) == null || call.getArgument(1).equals(w.getGroup()))).toList());
+        when(workers.prefillRoutingSnapshot(any())).thenAnswer(call -> routingWorkers.stream()
+                .filter(w -> w.getRole() == call.getArgument(0)).map(w -> {
+                    var endpoint = mock(PrefillEndpoint.class);
+                    when(endpoint.getStatus()).thenReturn(w);
+                    when(endpoint.canAcceptRequest()).thenReturn(true);
+                    return new org.flexlb.balance.endpoint.EndpointRegistry.PrefillRoutingEntry(w.getIpPort(), endpoint);
+                }).toList());
+        when(workers.decodeRoutingSnapshot(any())).thenAnswer(call -> routingWorkers.stream()
+                .filter(w -> w.getRole() == RoleType.DECODE
+                        && (call.getArgument(0) == null || call.getArgument(0).equals(w.getGroup())))
+                .map(w -> new DecodeEndpoint(w, mock(EndpointEventProjector.class)).routingView()).toList());
+        when(prefillSelector.select(any(), any(), any(), any())).thenAnswer(call ->
+                prefillSelector.select(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
+        when(decodeSelector.select(any(), any(), any())).thenAnswer(call ->
+                decodeSelector.select(call.getArgument(0), call.getArgument(1)));
+        when(vitSelector.select(any(), any(), any(), any())).thenAnswer(call ->
+                vitSelector.select(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
+        when(vitSelector.reselect(any(), any(), any())).thenAnswer(call ->
+                vitSelector.reselect(call.getArgument(0), call.getArgument(1)));
         requests = mock(RequestRegistry.class);
         when(requests.claimAdmissionHandle(anyLong(), any())).thenReturn(mock(AdmissionHandle.class));
         when(requests.register(any())).thenReturn(new CompletableFuture<>());
@@ -287,6 +312,8 @@ class DefaultRouterTest {
     @ValueSource(booleans = {false, true})
     void directSelectionExceptionPublishesFailureAndClosesLifecycle(boolean fatal) throws Exception {
         when(modelMeta.requiredRoles()).thenReturn(List.of(RoleType.PREFILL));
+        routingWorkers.add(org.flexlb.dao.master.WorkerStatus.createDiscovered(
+                RoleType.PREFILL, null, "127.0.0.1", 8080, 8081, "test"));
         BalanceContext context = context(10L);
         context.getConfig().setScheduler(org.flexlb.config.SchedulerConfig.direct());
         SchedulingTestConfig.useNonBatchDispatcher(context.getConfig());
@@ -423,6 +450,8 @@ class DefaultRouterTest {
 
     @Test
     void projectedDecodeBlockUsesDecodeWaitDomain() {
+        routingWorkers.add(org.flexlb.dao.master.WorkerStatus.createDiscovered(
+                RoleType.PREFILL, null, "p", 8080, 8081, null));
         when(modelMeta.requiredRoles()).thenReturn(List.of(RoleType.PREFILL));
         DefaultRouter router = router();
         BalanceContext context = context(111L);
@@ -433,8 +462,7 @@ class DefaultRouterTest {
         PlacementResult<RouteAdmission, PlacementKey> blocked = router.select(context);
         assertEquals(PlacementResult.Status.BLOCKED, blocked.status());
 
-        assertEquals(new PlacementKey(RoleType.DECODE, null),
-                blocked.blocker());
+        assertTrue(blocked.blocker().dependencies().contains(new PlacementKey(RoleType.DECODE, null)));
     }
 
     @Test
@@ -524,9 +552,9 @@ class DefaultRouterTest {
         when(groupSelector.resolveTargetGroup(context.getRequest()))
                 .thenReturn(Optional.of("forced"));
         SelectionFixture prefill = selection(
-                RoleType.PREFILL, 41L, "p", 8001, "other");
+                RoleType.PREFILL, 41L, "p", 8001, "forced");
         SelectionFixture vit = selection(
-                RoleType.VIT, 41L, "v", 8002, "other");
+                RoleType.VIT, 41L, "v", 8002, "forced");
         when(prefillSelector.select(
                 context, RoleType.PREFILL, "forced"))
                 .thenReturn(PlacementResult.success(prefill.selection));
@@ -590,8 +618,7 @@ class DefaultRouterTest {
         PlacementResult<RouteAdmission, PlacementKey> blocked = router.select(context);
         assertEquals(PlacementResult.Status.BLOCKED, blocked.status());
 
-        assertEquals(new PlacementKey(RoleType.VIT, "g1"),
-                blocked.blocker());
+        assertTrue(blocked.blocker().dependencies().contains(new PlacementKey(RoleType.VIT, "g1")));
         verify(prefill.selection).close();
     }
 
@@ -613,8 +640,7 @@ class DefaultRouterTest {
         PlacementResult<RouteAdmission, PlacementKey> blocked = router.select(context);
         assertEquals(PlacementResult.Status.BLOCKED, blocked.status());
 
-        assertEquals(new PlacementKey(RoleType.DECODE, "g1"),
-                blocked.blocker());
+        assertTrue(blocked.blocker().dependencies().contains(new PlacementKey(RoleType.DECODE, "g1")));
         verify(prefill.selection).close();
         verify(prefill.selection, never()).takeGenerationPin();
     }
@@ -674,7 +700,7 @@ class DefaultRouterTest {
                 decodeSelector,
                 vitSelector,
                 configService,
-                modelMeta);
+                modelMeta, workers);
     }
 
     private void stubQueueSelection(
@@ -707,7 +733,7 @@ class DefaultRouterTest {
         return context;
     }
 
-    private static SelectionFixture selection(
+    private SelectionFixture selection(
             RoleType role,
             long requestId,
             String ip,
@@ -728,6 +754,14 @@ class DefaultRouterTest {
         status.setHttpPort(httpPort);
         status.setGroup(group);
         when(selection.serverStatus()).thenReturn(status);
+        var worker = org.flexlb.dao.master.WorkerStatus.createDiscovered(role, group, ip, httpPort, httpPort + 1, null);
+        when(endpoint.getStatus()).thenReturn(worker);
+        when(selection.endpoint()).thenReturn(endpoint);
+        routingWorkers.add(worker);
+        for (RoleType required : List.of(RoleType.PREFILL, RoleType.DECODE, RoleType.VIT, RoleType.PDFUSION)) {
+            routingWorkers.add(org.flexlb.dao.master.WorkerStatus.createDiscovered(
+                    required, group, "unselected-" + required, 9000, 9001, null));
+        }
         when(selection.prefillWorkMs()).thenReturn(1L);
         when(selection.takeGenerationPin()).thenReturn(pin);
         when(pin.endpoint()).thenReturn(endpoint);

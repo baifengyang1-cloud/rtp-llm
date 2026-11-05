@@ -100,6 +100,14 @@ def _rdma_port(value):
 
 
 def init_vit_group_args(parser, vit_config):
+    parser.add_argument(
+        "--vit_model_identity",
+        env_name="VIT_MODEL_IDENTITY",
+        bind_to=(vit_config, "model_identity"),
+        type=str,
+        default="",
+        help="Vision model compatibility identity; defaults to its original checkpoint path.",
+    )
     ##############################################################################################################
     # Vit Configuration
     ##############################################################################################################

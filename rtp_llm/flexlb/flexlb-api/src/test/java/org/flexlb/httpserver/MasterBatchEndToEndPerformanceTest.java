@@ -342,7 +342,7 @@ class MasterBatchEndToEndPerformanceTest extends FlexLBMockTestBase {
                 new DecodeSelector(engineWorkerStatus),
                 new RandomStrategy(engineWorkerStatus),
                 configService,
-                modelMeta);
+                modelMeta, engineWorkerStatus);
     }
 
     @BeforeEach

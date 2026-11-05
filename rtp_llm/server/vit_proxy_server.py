@@ -883,7 +883,12 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
             request, context
         )
         if worker_status:
-            return worker_status
+            response = WorkerStatusPB()
+            response.CopyFrom(worker_status)
+            # The homogeneous proxy is one routing unit. Child probe cursors
+            # can arrive out of order and are not the proxy's status cursor.
+            response.status_version = time.monotonic_ns()
+            return response
         if status_check_timed_out:
             self._set_status_check_timeout(context)
         else:

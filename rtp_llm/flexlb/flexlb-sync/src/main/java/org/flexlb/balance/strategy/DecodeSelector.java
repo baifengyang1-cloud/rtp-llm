@@ -21,6 +21,7 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.LongPredicate;
 
 @Component
 public class DecodeSelector {
@@ -36,8 +37,14 @@ public class DecodeSelector {
 
     public PlacementResult<SelectedRole, RoleType> select(
             DecodeBinding request, String group) {
+        return select(request, group, ignored -> true);
+    }
+
+    public PlacementResult<SelectedRole, RoleType> select(
+            DecodeBinding request, String group, LongPredicate eligible) {
         for (int attempt = 0; attempt < MAX_SELECTION_ATTEMPTS; attempt++) {
-            List<DecodeRoutingView> snapshots = workerDirectory.decodeRoutingSnapshot(group);
+            List<DecodeRoutingView> snapshots = workerDirectory.decodeRoutingSnapshot(group).stream()
+                    .filter(view -> eligible.test(view.generationId())).toList();
             if (snapshots.isEmpty()) {
                 return PlacementResult.blocked(RoleType.DECODE);
             }
@@ -185,6 +192,23 @@ public class DecodeSelector {
         };
         return request.capacity().evaluate(usage, request.hardKvTokens(), request.expectedKvTokens()).fits()
                 ? Availability.READY : Availability.BUSY;
+    }
+
+    /** BUSY remains eligible for the existing queued/preemptible placement modes. */
+    public static boolean eligible(DecodeBinding request, DecodeRoutingView view) {
+        Availability state = availability(request, view);
+        return state == Availability.READY || state == Availability.BUSY && request.mode() != DecodeMode.IMMEDIATE;
+    }
+
+    public PlacementResult<SelectedRole, RoleType> unavailable(DecodeBinding request, String group, LongPredicate scope) {
+        List<DecodeRoutingView> snapshots = workerDirectory.decodeRoutingSnapshot(group).stream()
+                .filter(view -> scope.test(view.generationId())).toList();
+        if (snapshots.isEmpty()) { return PlacementResult.blocked(RoleType.DECODE); }
+        if (snapshots.stream().allMatch(view -> availability(request, view) == Availability.IMPOSSIBLE)) {
+            long maximum = snapshots.stream().mapToLong(view -> request.capacity().kvBudget(view.totalKv())).max().orElse(0L);
+            return PlacementResult.rejected(oversizedRequestFailure(request.expectedKvTokens(), maximum));
+        }
+        return classifyCapacityFailure(request, snapshots);
     }
 
     private static Response oversizedRequestFailure(long required, long maximum) {

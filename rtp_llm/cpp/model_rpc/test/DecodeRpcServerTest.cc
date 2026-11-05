@@ -5,6 +5,9 @@
 
 #include "rtp_llm/cpp/model_rpc/DecodeRpcServer.h"
 #include "rtp_llm/cpp/model_rpc/RpcErrorCode.h"
+#include "rtp_llm/cpp/model_rpc/RoleCompatibility.h"
+#include "rtp_llm/cpp/model_rpc/test/RoleCompatibilityFixtures.h"
+#include "rtp_llm/cpp/cache/SingleConfigCreator.h"
 #include "rtp_llm/cpp/cache/MHAKVCacheSpec.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/testing/TestLogCapture.h"
@@ -262,6 +265,60 @@ TEST(DecodeRpcServerTest, CPShardedLoadRequestReadsFromEveryPrefillPeer) {
     EXPECT_EQ(request.cache_keys(1), 102);
 }
 
+TEST(DecodeRpcServerTest, CPShardedMhaDoesNotPartitionHeadsForDecodeAttentionTp) {
+    EngineInitParams params;
+    params.model_id                                   = 0;
+    params.model_config_.model_identity               = "target";
+    params.model_config_.num_layers                   = 2;
+    params.model_config_.data_type                    = DataType::TYPE_BF16;
+    params.model_config_.attn_config.head_num         = 12;
+    params.model_config_.attn_config.kv_head_num      = 12;
+    params.model_config_.attn_config.size_per_head    = 64;
+    params.model_config_.attn_config.tokens_per_block = 64;
+    KVCacheSpecDesc desc;
+    desc.tag                                    = "default";
+    desc.cache_type                             = KVCacheSpecType::MultiHeadAttention;
+    desc.dtype                                  = DataType::TYPE_BF16;
+    params.model_config_.kv_cache_spec_descs    = {{desc}, {desc}};
+    auto& parallel                              = params.parallelism_config;
+    parallel.tp_size                            = 4;
+    parallel.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+    parallel.prefill_cp_config.kv_cache_sharded = true;
+    params.pd_sep_config.role_type              = RoleType::PREFILL;
+    parallel.role_type                          = RoleType::PREFILL;
+    auto       config = SingleConfigCreator::createSingleConfig(params.model_config_, parallel);
+    const auto p      = makeRoleCompatibility(params, &config);
+    ASSERT_EQ(p.kv_transfer().tp_size(), 1);
+    ASSERT_EQ(p.kv_transfer().groups(0).wire_bytes(0), 98304);
+    expectCompatibilityFixture("cp4_prefill.pbtxt", p);
+
+    const std::vector<std::string>  peers       = {"prefill-0", "prefill-1", "prefill-2", "prefill-3"};
+    const std::string               request_key = "request";
+    const std::vector<CacheKeyType> cache_keys  = {101};
+    const GroupBlockIds             block_ids_by_group;
+    const auto                      load = makeLoadContext(request_key, peers, cache_keys, block_ids_by_group, 4);
+    for (int tp : {1, 2}) {
+        params.pd_sep_config.role_type             = RoleType::DECODE;
+        parallel.role_type                         = RoleType::DECODE;
+        parallel.tp_size                           = tp;
+        parallel.prefill_cp_config.method          = CPRotateMethod::PREFILL_CP;
+        parallel.prefill_cp_config.prefill_cp_size = 4;
+        config       = SingleConfigCreator::createSingleConfig(params.model_config_, parallel);
+        const auto d = makeRoleCompatibility(params, &config);
+        EXPECT_EQ(d.kv_transfer().groups(0).wire_bytes(0), 98304 / tp);
+        expectCompatibilityFixture(tp == 1 ? "cp4_decode_tp1.pbtxt" : "cp4_decode_tp2.pbtxt", d);
+        DecodeRpcServer server;
+        server.maga_init_params_ = params;
+        server.resource_.workers.resize(tp);
+        for (int rank = 0; rank < tp; rank++) {
+            const auto request = server.constructRemoteLoadRequest(load, rank, peers);
+            EXPECT_EQ(request.partition_count(), 1);
+            EXPECT_EQ(request.partition_id(), 0);
+            EXPECT_EQ(request.peer_addrs_size(), 4);
+        }
+    }
+}
+
 TEST(DecodeRpcServerTest, CPShardedMlaLoadRequestReadsFromEveryPrefillPeer) {
     DecodeRpcServer server;
     server.resource_.workers = {"decode-0", "decode-1"};
@@ -286,7 +343,7 @@ TEST(DecodeRpcServerTest, CPShardedMlaLoadRequestReadsFromEveryPrefillPeer) {
 
 TEST(DecodeRpcServerTest, TaggedBlockRowsResolveByLocalTagOrder) {
     auto                   topology = CacheTopology::create({makeRpcGroup("linear", {0}), makeRpcGroup("full", {1})},
-                                          {{0, {"linear"}}, {1, {"full"}}});
+                                                            {{0, {"linear"}}, {1, {"full"}}});
     BroadcastLoadRequestPB request;
     auto*                  full = request.add_tagged_group_block_ids();
     full->set_tag("full");

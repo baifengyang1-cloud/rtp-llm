@@ -125,8 +125,10 @@ public:
     bool reverse_e_h_norm = false;
 
     // Model loading and quantization
-    std::string   tokenizer_path = "";
-    std::string   ckpt_path      = "";
+    std::string   tokenizer_path        = "";
+    std::string   ckpt_path             = "";
+    std::string   model_identity        = "";
+    std::string   vision_model_identity = "";
     SpecialTokens special_tokens;
     QuantAlgo     quant_algo;
 

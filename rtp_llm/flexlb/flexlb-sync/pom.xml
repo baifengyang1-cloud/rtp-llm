@@ -88,6 +88,16 @@
         </dependency>
     </dependencies>
     <build>
+        <testResources>
+            <testResource>
+                <directory>src/test/resources</directory>
+            </testResource>
+            <testResource>
+                <directory>${project.basedir}/../../cpp/model_rpc/test/testdata/compatibility</directory>
+                <targetPath>compatibility</targetPath>
+                <includes><include>*.pbtxt</include></includes>
+            </testResource>
+        </testResources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

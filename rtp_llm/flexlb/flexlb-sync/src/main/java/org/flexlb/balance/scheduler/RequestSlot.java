@@ -672,6 +672,7 @@ public final class RequestSlot {
             effect = acknowledgeDeliveryLocked(claim.correlationId, null);
         }
         executeEngineObservationEffects(new EngineObservation(effect, obsolete));
+        claim.item.observeCompatibilityDispatch("route_published");
     }
 
     private void completeDelivery(DeliveryClaim claim, DeliveryResult result) {
@@ -679,6 +680,7 @@ public final class RequestSlot {
         SelectedPublication failureResponse = null;
         RequestEffect acknowledgement = RequestEffect.DEFERRED;
         boolean failed = result.failed();
+        boolean awaitingConfirmation = false;
         synchronized (this) {
             if (claim == null || claim.slot != this) {
                 throw new IllegalArgumentException("foreign delivery claim");
@@ -704,11 +706,13 @@ public final class RequestSlot {
                 } else if (!decodeOwnsRequestLocked()) {
                     markAwaitingConfirmationLocked((result.status() == DeliveryResult.Status.TIMED_OUT
                             ? "Delivery timed out: " : "Delivery outcome uncertain: ") + detailOf(result.cause()));
-                    return;
+                    awaitingConfirmation = true;
                 }
-                acknowledgement = acknowledgeDeliveryLocked(claim.correlationId, null);
+                if (!awaitingConfirmation) { acknowledgement = acknowledgeDeliveryLocked(claim.correlationId, null); }
             }
         }
+        claim.item.observeCompatibilityDispatch(result.status().name());
+        if (awaitingConfirmation) { return; }
         if (failed) {
             SelectedPublication response = failureResponse;
             Throwable failure = runStep(null,

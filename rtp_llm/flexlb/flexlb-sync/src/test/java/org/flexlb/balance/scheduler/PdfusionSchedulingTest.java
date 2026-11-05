@@ -109,7 +109,7 @@ class PdfusionSchedulingTest {
         ModelMetaConfig model = mock(ModelMetaConfig.class);
         when(model.requiredRoles()).thenReturn(List.of(RoleType.PDFUSION));
         DefaultRouter router = new DefaultRouter(new CostBasedPrefillStrategy(directory, cache, mock(EngineHealthReporter.class)),
-                new DecodeSelector(directory), new RandomStrategy(directory), service, model);
+                new DecodeSelector(directory), new RandomStrategy(directory), service, model, directory);
         RequestScheduler scheduler = new RequestScheduler(service, router, endpoints, reporter,
                 mock(EvictionManager.class), lifecycle, availability);
         SchedulerRuntime runtime = direct

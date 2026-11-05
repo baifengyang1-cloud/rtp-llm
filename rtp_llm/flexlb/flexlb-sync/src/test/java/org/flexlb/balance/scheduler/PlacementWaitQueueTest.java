@@ -2,6 +2,8 @@ package org.flexlb.balance.scheduler;
 
 import org.flexlb.dao.route.RoleType;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -15,6 +17,84 @@ class PlacementWaitQueueTest {
     private long sequence;
     private static final PlacementKey A = PlacementKey.exact(RoleType.PREFILL, "g", "a:8000");
     private static final PlacementKey B = PlacementKey.exact(RoleType.PREFILL, "g", "b:8000");
+
+    @Test
+    void alternativeRecoveryWakesOnceAndCancellationRemovesEveryDependency() {
+        var entry = entry(50);
+        var vit = new PlacementKey(RoleType.VIT, "g");
+        var decode = new PlacementKey(RoleType.DECODE, "g");
+        var dependencies = PlacementKey.anyOf(List.of(vit, decode, vit));
+        assertTrue(queue.park(entry, dependencies, availability.sequence()));
+        queue.capacityChanged(vit);
+        queue.capacityChanged(decode);
+        assertEquals(List.of(entry), drain(10));
+        assertTrue(drain(10).isEmpty());
+        queue.remove(entry);
+        queue.capacityChanged(vit);
+        queue.capacityChanged(decode);
+        assertTrue(drain(10).isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void enqueueOnUnreleasedAlternativePreservesReadyHead(boolean priority, boolean reverse) {
+        var waiting = new PlacementWaitQueue(priority, availability);
+        var first = entry(50);
+        var second = entry(50);
+        var cancelled = entry(90);
+        var alternatives = PlacementKey.anyOf(reverse ? List.of(B, A) : List.of(A, B));
+        var traversal = List.copyOf(alternatives.dependencies());
+        var recovered = reverse ? traversal.getLast() : traversal.getFirst();
+        var blocked = reverse ? traversal.getFirst() : traversal.getLast();
+        assertTrue(waiting.park(first, alternatives, 0));
+        waiting.capacityChanged(recovered);
+        assertTrue(waiting.park(second, blocked, 0));
+        List<GlobalQueueEntry> resumed = new ArrayList<>();
+        waiting.resumeReady(10, resumed::add);
+        assertEquals(List.of(first), resumed);
+        assertTrue(waiting.park(cancelled, alternatives, 0));
+        waiting.remove(cancelled);
+        assertFalse(waiting.isWaiting(first));
+        assertTrue(waiting.isWaiting(second));
+        waiting.remove(first);
+        waiting.resumeReady(10, resumed::add);
+        assertEquals(List.of(first), resumed);
+        waiting.capacityChanged(blocked);
+        waiting.resumeReady(10, resumed::add);
+        assertEquals(List.of(first, second), resumed);
+        waiting.remove(second);
+        waiting.capacityChanged(A);
+        waiting.capacityChanged(B);
+        waiting.resumeReady(10, resumed::add);
+        assertEquals(List.of(first, second), resumed);
+        assertFalse(waiting.isWaiting(cancelled));
+    }
+
+    @Test
+    void anyAlternativeEdgeBetweenPlanAndParkPreventsLostWakeup() {
+        var vit = new PlacementKey(RoleType.VIT, "g");
+        var decode = new PlacementKey(RoleType.DECODE, "g");
+        for (PlacementKey recovered : List.of(vit, decode)) {
+            long observed = availability.sequence();
+            availability.topologyChanged(recovered);
+            assertFalse(queue.park(entry(50), PlacementKey.anyOf(List.of(vit, decode)), observed));
+        }
+    }
+
+    @Test
+    void overlappingDependenciesPreserveOtherWaitersAndFreshReplanning() {
+        var first = entry(50);
+        var second = entry(50);
+        queue.park(first, PlacementKey.anyOf(List.of(A, B)), 0);
+        queue.park(second, B, 0);
+        queue.capacityChanged(B);
+        assertEquals(List.of(first), drain(10));
+        queue.remove(first);
+        assertEquals(List.of(second), drain(10));
+        queue.park(second, PlacementKey.anyOf(List.of(A, B)), 0);
+        queue.capacityChanged(A);
+        assertEquals(List.of(second), drain(10));
+    }
 
     @Test
     void oneCapacityEdgeDoesNotReplayAnEntireBacklog() {

@@ -7,6 +7,11 @@ import org.flexlb.balance.strategy.CostBasedPrefillStrategy;
 import org.flexlb.balance.strategy.DecodeSelector;
 import org.flexlb.balance.strategy.RandomStrategy;
 import org.flexlb.balance.strategy.SelectedRole;
+import org.flexlb.balance.strategy.CompatibilityCandidates;
+import org.flexlb.balance.strategy.CompatibilityGroupBalancer;
+import org.flexlb.balance.strategy.CompatibilityPlanner;
+import org.flexlb.service.monitor.CompatibilityGroupReporter;
+import org.flexlb.sync.status.WorkerDirectory;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.FlexlbConfig;
 import org.flexlb.config.ModelMetaConfig;
@@ -32,6 +37,13 @@ public class DefaultRouter {
     private final RandomStrategy vitSelector;
     private final ConfigService configService;
     private final List<RoleType> requiredRoles;
+    private final WorkerDirectory workerDirectory;
+    private final CompatibilityGroupBalancer groupBalancer = new CompatibilityGroupBalancer();
+    private final CompatibilityPlanner compatibilityPlanner;
+    private CompatibilityGroupReporter groupReporter;
+
+    @Autowired(required = false)
+    public void setCompatibilityGroupReporter(CompatibilityGroupReporter reporter) { this.groupReporter = reporter; }
 
     @Autowired
     public DefaultRouter(
@@ -39,7 +51,8 @@ public class DefaultRouter {
             DecodeSelector decodeSelector,
             RandomStrategy vitSelector,
             ConfigService configService,
-            ModelMetaConfig modelMetaConfig) {
+            ModelMetaConfig modelMetaConfig,
+            WorkerDirectory workerDirectory) {
         this.prefillSelector = Objects.requireNonNull(
                 prefillSelector, "prefillSelector");
         this.decodeSelector = Objects.requireNonNull(
@@ -48,9 +61,11 @@ public class DefaultRouter {
                 vitSelector, "vitSelector");
         this.configService = Objects.requireNonNull(
                 configService, "configService");
+        this.workerDirectory = Objects.requireNonNull(workerDirectory, "workerDirectory");
         this.requiredRoles = List.copyOf(
                 Objects.requireNonNull(
                         modelMetaConfig, "modelMetaConfig").requiredRoles());
+        this.compatibilityPlanner = new CompatibilityPlanner(workerDirectory, requiredRoles);
     }
 
     public Response routeVit(BalanceContext context) {
@@ -77,14 +92,24 @@ public class DefaultRouter {
         if (validationFailure != null) { return PlacementResult.rejected(validationFailure); }
         DecodeBinding decodeAdmission = DecodeBinding.capture(context);
         try (PinnedRouting routing = selectAll(context, requiredRoles, policyGroup, decodeAdmission)) {
+            if (routing.attempt != null) {
+                routing.attempt.workerSelection(routing.blocker() != null ? "blocked" : routing.failure() != null ? "rejected" : "selected");
+            }
             if (routing.blocker() != null) {
                 return PlacementResult.blocked(routing.blocker(), routing.failure(), routing.diagnostics);
             }
             if (routing.failure() != null) {
                 return PlacementResult.rejected(routing.failure(), routing.diagnostics);
             }
-            return PlacementResult.success(RouteAdmission.prepare(context, routing.selections(),
-                    buildSuccessResponse(routing.serverStatuses()), decodeAdmission));
+            try {
+                RouteAdmission admission = RouteAdmission.prepare(context, routing.selections(),
+                        buildSuccessResponse(routing.serverStatuses()), decodeAdmission);
+                admission.observeCompatibilityGroup(routing.attempt);
+                return PlacementResult.success(admission);
+            } catch (RuntimeException | Error failure) {
+                if (routing.attempt != null) { routing.attempt.admission(false); }
+                throw failure;
+            }
         }
     }
 
@@ -99,6 +124,29 @@ public class DefaultRouter {
     private PinnedRouting selectAll(BalanceContext context, List<RoleType> roles, String policyGroup,
                                    DecodeBinding decodeAdmission) {
         List<SelectedRole> selected = new ArrayList<>(roles.size());
+        CompatibilityCandidates compatibility = compatibilityPlanner.prepare(context, decodeAdmission, policyGroup);
+        var complete = compatibility.completeGroups();
+        var chosen = groupBalancer.select(policyGroup, roles, complete);
+        CompatibilityGroupReporter.Attempt attempt = groupReporter == null ? null
+                : groupReporter.selected(policyGroup, roles, complete, chosen);
+        if (chosen == null) {
+            for (RoleType role : roles) {
+                if (!compatibility.anyEligible(role)) {
+                    var failure = switch (role) {
+                        case PREFILL, PDFUSION -> prefillSelector.unavailable(context, role, policyGroup, compatibility.filter(role));
+                        case DECODE -> decodeSelector.unavailable(decodeAdmission, policyGroup, compatibility.filter(role));
+                        default -> PlacementResult.<SelectedRole, RoleType>blocked(role);
+                    };
+                    if (failure != null && failure.status() == PlacementResult.Status.REJECTED) {
+                        return new PinnedRouting(selected, null, failure.failure(), failure.diagnostics());
+                    }
+                    return new PinnedRouting(selected, compatibilityBlocker(roles, role, policyGroup),
+                            failure == null ? null : failure.failure(), failure == null ? null : failure.diagnostics());
+                }
+            }
+            return new PinnedRouting(selected, compatibilityBlocker(roles, roles.getFirst(), policyGroup), null, null);
+        }
+        compatibility.restrictTo(chosen);
         String group = policyGroup;
         if (StringUtils.isNotBlank(policyGroup)) {
             Logger.info(
@@ -111,10 +159,10 @@ public class DefaultRouter {
         try {
             for (RoleType role : roles) {
                 PlacementResult<SelectedRole, RoleType> result =
-                        selectRole(context, role, group, decodeAdmission);
+                        selectRole(context, role, group, decodeAdmission, compatibility);
                 if (role == RoleType.VIT && result.status() == PlacementResult.Status.REJECTED
                         && result.failure().getCode() == StrategyErrorType.VIT_ROUTE_STALE.getErrorCode()) {
-                    SelectedRole replacement = vitSelector.reselect(context, group);
+                    SelectedRole replacement = vitSelector.reselect(context, group, compatibility.filter(role));
                     if (replacement != null) {
                         result = PlacementResult.success(replacement);
                     }
@@ -125,13 +173,13 @@ public class DefaultRouter {
                             role.getCode(), context.getRequestId());
                     if (result.status() == PlacementResult.Status.REJECTED) {
                         return new PinnedRouting(
-                                selected, null, result.failure(), result.diagnostics());
+                                selected, null, result.failure(), result.diagnostics(), attempt);
                     }
                     if (result.status() == PlacementResult.Status.BLOCKED) {
                         return new PinnedRouting(
                                 selected,
-                                new PlacementKey(result.blocker(), group),
-                                result.failure(), result.diagnostics());
+                                compatibilityBlocker(roles, result.blocker(), group),
+                                result.failure(), result.diagnostics(), attempt);
                     }
                     throw new IllegalStateException("unexpected selector result: "
                             + result.status());
@@ -143,12 +191,16 @@ public class DefaultRouter {
                     closeSelection(selection, appendFailure);
                     throw appendFailure;
                 }
+                if (!compatibility.select(role, selection.endpoint().getStatus())) {
+                    return new PinnedRouting(selected, compatibilityBlocker(roles, role, group), null, null, attempt);
+                }
                 if (StringUtils.isBlank(policyGroup)) {
                     group = selection.serverStatus().getGroup();
                 }
             }
-            return new PinnedRouting(selected, null, null, null);
+            return new PinnedRouting(selected, null, null, null, attempt);
         } catch (RuntimeException | Error failure) {
+            if (attempt != null) { attempt.workerSelection("error"); }
             closeSelections(selected, failure);
             throw failure;
         }
@@ -169,14 +221,22 @@ public class DefaultRouter {
                 .orElse(null);
     }
 
+    private static PlacementKey compatibilityBlocker(List<RoleType> roles, RoleType failedRole, String group) {
+        List<PlacementKey> keys = new ArrayList<>();
+        keys.add(new PlacementKey(failedRole, group));
+        for (RoleType role : roles) { keys.add(new PlacementKey(role, group)); }
+        return PlacementKey.anyOf(keys);
+    }
+
     private PlacementResult<SelectedRole, RoleType> selectRole(
-            BalanceContext context, RoleType role, String group, DecodeBinding decodeAdmission) {
+            BalanceContext context, RoleType role, String group, DecodeBinding decodeAdmission,
+            CompatibilityCandidates compatibility) {
         return switch (role) {
             case PREFILL, PDFUSION ->
-                    prefillSelector.select(context, role, group);
-            case DECODE -> decodeSelector.select(decodeAdmission, group);
+                    prefillSelector.select(context, role, group, compatibility.filter(role));
+            case DECODE -> decodeSelector.select(decodeAdmission, group, compatibility.filter(role));
             case VIT -> {
-                SelectedRole selected = vitSelector.select(context, role, group);
+                SelectedRole selected = vitSelector.select(context, role, group, compatibility.filter(role));
                 if (selected == null && context.getRequest().getSelectedVit() != null) {
                     yield PlacementResult.rejected(Response.error(StrategyErrorType.VIT_ROUTE_STALE));
                 }
@@ -259,15 +319,22 @@ public class DefaultRouter {
         private final PlacementKey blocker;
         private final Response failure;
         private final Map<String, Object> diagnostics;
+        private final CompatibilityGroupReporter.Attempt attempt;
 
         private PinnedRouting(
                 List<SelectedRole> selections,
                 PlacementKey blocker,
                 Response failure, Map<String, Object> diagnostics) {
+            this(selections, blocker, failure, diagnostics, null);
+        }
+
+        private PinnedRouting(List<SelectedRole> selections, PlacementKey blocker, Response failure,
+                              Map<String, Object> diagnostics, CompatibilityGroupReporter.Attempt attempt) {
             this.selections = selections;
             this.blocker = blocker;
             this.failure = failure;
             this.diagnostics = diagnostics;
+            this.attempt = attempt;
         }
 
         private PlacementKey blocker() {

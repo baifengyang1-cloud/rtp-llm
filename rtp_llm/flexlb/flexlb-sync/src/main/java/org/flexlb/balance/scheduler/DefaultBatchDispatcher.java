@@ -859,7 +859,7 @@ public class DefaultBatchDispatcher {
         // only replace the stateless ViT in the already selected model group.
         RandomStrategy selector = vitSelector.get();
         try (SelectedRole replacement = selector == null ? null
-                : selector.reselect(item.ctx(), vit.getGroup())) {
+                : selector.reselectCompatible(item.ctx(), vit.getGroup(), endpoint.getStatus().compatibility())) {
             if (replacement == null) {
                 throw new VitRouteStaleException(item.requestId());
             }
@@ -867,6 +867,7 @@ public class DefaultBatchDispatcher {
             WorkerEndpoint.GenerationPin replacementPin = replacement.takeGenerationPin();
             attempt.vitPins.add(replacementPin);
             if (!Objects.equals(vit.getGroup(), status.getGroup())
+                    || !Objects.equals(endpoint.getStatus().compatibility(), replacementPin.endpoint().getStatus().compatibility())
                     || status.getGrpcPort() <= 0
                     || status.getGrpcPort() != replacementPin.endpoint().getGrpcPort()) {
                 throw new IllegalArgumentException("invalid replacement ViT for request " + item.requestId());

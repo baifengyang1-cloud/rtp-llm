@@ -39,6 +39,15 @@ public final class ScheduledRequest implements Prioritized {
     private final ServerStatus prefill;
     private final PrefillEndpoint prefillEp;
     private volatile WorkerEndpoint vitEp;
+    private org.flexlb.service.monitor.CompatibilityGroupReporter.Attempt groupAttempt;
+
+    void observeCompatibilityGroup(org.flexlb.service.monitor.CompatibilityGroupReporter.Attempt attempt) {
+        this.groupAttempt = attempt;
+    }
+
+    public void observeCompatibilityDispatch(String outcome) {
+        if (groupAttempt != null) { groupAttempt.dispatch(outcome); }
+    }
     private final DecodeBinding decodeBinding;
     private final long enqueuedAtMs;
     private final long enqueueSequence;

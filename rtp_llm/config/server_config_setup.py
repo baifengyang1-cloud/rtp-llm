@@ -473,6 +473,15 @@ def fetch_model_files_to_local(py_env_configs: PyEnvConfigs):
     """Fetch remote model files to local and update py_env_configs in place."""
     # Fetch checkpoint_path from model_args
     model_args = py_env_configs.model_args
+    model_args.model_identity = model_args.model_identity or model_args.ckpt_path
+    vit_config = py_env_configs.vit_config
+    vit_config.model_identity = (
+        vit_config.model_identity or vit_config.extra_data_path or model_args.ckpt_path
+    )
+    sp_config = py_env_configs.sp_config
+    sp_config.model_identity = (
+        sp_config.model_identity or sp_config.checkpoint_path or ""
+    )
     if model_args.ckpt_path:
         model_args.ckpt_path = fetch_remote_file_to_local(model_args.ckpt_path)
 
@@ -482,7 +491,6 @@ def fetch_model_files_to_local(py_env_configs: PyEnvConfigs):
         model_args.tokenizer_path = fetch_remote_file_to_local(tokenizer_path)
 
     # Fetch extra_data_path from vit_config
-    vit_config = py_env_configs.vit_config
     if vit_config.extra_data_path:
         local_extra_data_path = fetch_remote_file_to_local(vit_config.extra_data_path)
         vit_config.local_extra_data_path = local_extra_data_path
@@ -509,7 +517,6 @@ def fetch_model_files_to_local(py_env_configs: PyEnvConfigs):
             )
 
     # Fetch checkpoint_path if exists
-    sp_config = py_env_configs.sp_config
     if sp_config.checkpoint_path:
         sp_config.checkpoint_path = fetch_remote_file_to_local(
             sp_config.checkpoint_path

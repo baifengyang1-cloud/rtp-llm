@@ -16,6 +16,7 @@ import org.flexlb.dao.loadbalance.Response;
 import org.flexlb.dao.loadbalance.ServerStatus;
 import org.flexlb.dao.loadbalance.StrategyErrorType;
 import org.flexlb.dao.route.RoleType;
+import org.flexlb.service.monitor.CompatibilityGroupReporter;
 
 import java.util.List;
 import java.util.Objects;
@@ -32,6 +33,9 @@ public final class RouteAdmission implements AutoCloseable {
     private DecodeBinding decodeBinding;
     private WorkerEndpoint blockedEndpoint;
     private Ownership ownership = Ownership.PROVISIONAL;
+    private CompatibilityGroupReporter.Attempt groupAttempt;
+
+    void observeCompatibilityGroup(CompatibilityGroupReporter.Attempt attempt) { this.groupAttempt = attempt; }
 
     private RouteAdmission(long requestId, Response response, Selection selection,
                            DecodeBinding decodeRequest) {
@@ -57,6 +61,7 @@ public final class RouteAdmission implements AutoCloseable {
         long prefillPlacementVersion = 0L;
         long prefillWorkMs = 0L;
         WorkerEndpoint vitEndpoint = null;
+        WorkerEndpoint.GenerationPin vitPin = null;
         DecodeEndpoint decodeEndpoint = null;
         WorkerEndpoint.GenerationPin decodePin = null;
         ServerStatus decodeStatus = null;
@@ -101,15 +106,15 @@ public final class RouteAdmission implements AutoCloseable {
                     decodePlacementVersion = placementVersion;
                     continue;
                 }
-                try (pin) {
-                    if (role == RoleType.VIT) {
-                        if (vitEndpoint != null) {
-                            throw new IllegalStateException("route requires at most one exact ViT selection");
-                        }
-                        // Retain the exact generation without delaying retirement.
-                        // Dispatch re-pins it or explicitly selects a live replacement.
-                        vitEndpoint = endpoint;
+                if (role == RoleType.VIT) {
+                    if (vitEndpoint != null) {
+                        pin.close();
+                        throw new IllegalStateException("route requires at most one exact ViT selection");
                     }
+                    vitEndpoint = endpoint;
+                    vitPin = pin;
+                } else {
+                    pin.close();
                 }
             }
             if (prefillPin == null || prefillEndpoint == null
@@ -128,12 +133,13 @@ public final class RouteAdmission implements AutoCloseable {
                             prefillWorkMs,
                             decodePin,
                             decodePlacementVersion,
-                            vitEndpoint),
+                            vitEndpoint, vitPin),
                     decodeRequest.bind(decodeStatus, decodeEndpoint, null));
         } catch (RuntimeException | Error failure) {
             WorkerEndpoint.GenerationPin ownedPrefillPin = prefillPin;
             WorkerEndpoint.GenerationPin ownedDecodePin = decodePin;
-            try (ownedPrefillPin; ownedDecodePin) {
+            WorkerEndpoint.GenerationPin ownedVitPin = vitPin;
+            try (ownedPrefillPin; ownedDecodePin; ownedVitPin) {
                 throw failure;
             }
         }
@@ -254,10 +260,12 @@ public final class RouteAdmission implements AutoCloseable {
         if (context.getRequestId() != requestId) {
             throw new IllegalArgumentException("admission cannot build another request");
         }
-        return new ScheduledRequest(context, future, response,
+        ScheduledRequest item = new ScheduledRequest(context, future, response,
                 ServerStatus.copyOf(prefillStatus()), ServerStatus.copyOf(decodeStatus()),
                 prefillEndpoint(), decodeEndpoint(), decodeBinding.reservation(), enqueuedAtMs, decodeBinding,
                 selection.vitEndpoint());
+        item.observeCompatibilityGroup(groupAttempt);
+        return item;
     }
 
     /** The caller has registered the same canonical request before selecting this route. */
@@ -362,6 +370,7 @@ public final class RouteAdmission implements AutoCloseable {
     private void markCommitted() {
         requireProvisional();
         ownership = Ownership.COMMITTED;
+        if (groupAttempt != null) { groupAttempt.admission(true); }
         closePins();
     }
 
@@ -373,6 +382,7 @@ public final class RouteAdmission implements AutoCloseable {
     public void close() {
         if (ownership != Ownership.PROVISIONAL) { return; }
         ownership = Ownership.CLOSED;
+        if (groupAttempt != null) { groupAttempt.admission(false); }
         try {
             if (decodeBinding.reservation() != null) { decodeEndpoint().release(
                     decodeBinding.reservation(),
@@ -383,11 +393,11 @@ public final class RouteAdmission implements AutoCloseable {
     }
 
     private void closePins() {
-        try (var prefill = prefillPin(); var decode = decodePin()) { }
+        try (var prefill = prefillPin(); var decode = decodePin(); var vit = selection.vitPin()) { }
     }
 
     private record Selection(PrefillEndpoint prefillEndpoint, WorkerEndpoint.GenerationPin prefillPin,
                              ServerStatus prefillStatus, long prefillPlacementVersion, long prefillWorkMs,
                              WorkerEndpoint.GenerationPin decodePin, long decodePlacementVersion,
-                             WorkerEndpoint vitEndpoint) { }
+                             WorkerEndpoint vitEndpoint, WorkerEndpoint.GenerationPin vitPin) { }
 }

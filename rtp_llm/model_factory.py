@@ -475,6 +475,9 @@ class ModelFactory:
         # Create ModelArgs for propose model (reuse main model args, but override ckpt_path)
         propose_model_args = ModelArgs()
         propose_model_args.ckpt_path = sp_config.checkpoint_path
+        propose_model_args.model_identity = (
+            sp_config.model_identity or sp_config.checkpoint_path
+        )
         propose_model_args.tokenizer_path = model_args.tokenizer_path
         propose_model_args.model_type = sp_config.model_type
         propose_model_args.act_type = model_args.act_type

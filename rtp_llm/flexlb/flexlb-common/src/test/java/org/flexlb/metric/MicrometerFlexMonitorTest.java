@@ -19,6 +19,30 @@ class MicrometerFlexMonitorTest {
     }
 
     @Test
+    void removalReleasesOnlyTheRequestedSeriesAndAllowsFreshRegistration() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        MicrometerFlexMonitor monitor = new MicrometerFlexMonitor(registry);
+        try {
+            var tags = FlexMetricTags.of("compatibility_group", "retired");
+            var other = FlexMetricTags.of("compatibility_group", "current");
+            for (var type : new FlexMetricType[]{FlexMetricType.GAUGE, FlexMetricType.COUNTER, FlexMetricType.TIMER}) {
+                monitor.register(type.name(), type);
+                monitor.report(type.name(), tags, 3.0);
+                monitor.report(type.name(), other, 5.0);
+                monitor.remove(type.name(), tags);
+                monitor.remove(type.name(), tags);
+                assertEquals(1, registry.find("flexlb." + type.name()).meters().size());
+                monitor.report(type.name(), tags, 7.0);
+                assertEquals(2, registry.find("flexlb." + type.name()).meters().size());
+            }
+            assertEquals(7.0, registry.get("flexlb.GAUGE").tag("compatibility_group", "retired").gauge().value());
+            assertEquals(7.0, registry.get("flexlb.COUNTER").tag("compatibility_group", "retired").counter().count());
+            assertEquals(1L, registry.get("flexlb.TIMER").tag("compatibility_group", "retired").timer().count());
+            assertEquals(5.0, registry.get("flexlb.GAUGE").tag("compatibility_group", "current").gauge().value());
+        } finally { registry.close(); }
+    }
+
+    @Test
     void prepareTimerRegistersWithoutRecordingAndReportReusesIt() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         MicrometerFlexMonitor monitor = new MicrometerFlexMonitor(registry);

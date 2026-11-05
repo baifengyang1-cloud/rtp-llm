@@ -4,6 +4,7 @@ import org.flexlb.balance.endpoint.WorkerEndpoint;
 import org.flexlb.dao.BalanceContext;
 import org.flexlb.dao.loadbalance.ServerStatus;
 import org.flexlb.dao.master.WorkerStatus;
+import org.flexlb.dao.master.RoleCompatibility;
 import org.flexlb.dao.route.RoleType;
 import org.flexlb.sync.status.WorkerDirectory;
 import org.flexlb.util.CommonUtils;
@@ -16,6 +17,7 @@ import java.util.Objects;
 import org.flexlb.service.VitCacheDirectory;
 import org.springframework.beans.factory.annotation.Autowired;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.LongPredicate;
 
 /** Random selection for the stateless VIT role. */
 @Component
@@ -36,12 +38,32 @@ public final class RandomStrategy {
         return select(context, role, group, true);
     }
 
+    public SelectedRole select(BalanceContext context, RoleType role, String group, LongPredicate eligible) {
+        return select(context, role, group, true, eligible);
+    }
+
     /** Select a live replacement without mutating the frontend's original hint. */
     public SelectedRole reselect(BalanceContext context, String group) {
         return select(context, RoleType.VIT, group, false);
     }
 
+    public SelectedRole reselect(BalanceContext context, String group, LongPredicate eligible) {
+        return select(context, RoleType.VIT, group, false, eligible);
+    }
+
+    public SelectedRole reselectCompatible(BalanceContext context, String group, RoleCompatibility expected) {
+        var generations = workerDirectory.routingStatusSnapshot(RoleType.VIT, group).stream()
+                .filter(worker -> Objects.equals(expected, worker.compatibility()))
+                .map(WorkerStatus::getGenerationId).collect(java.util.stream.Collectors.toSet());
+        return reselect(context, group, generations::contains);
+    }
+
     private SelectedRole select(BalanceContext context, RoleType role, String group, boolean honorSelected) {
+        return select(context, role, group, honorSelected, ignored -> true);
+    }
+
+    private SelectedRole select(BalanceContext context, RoleType role, String group,
+                                boolean honorSelected, LongPredicate eligible) {
         if (role != RoleType.VIT) {
             throw new IllegalArgumentException(
                     "RANDOM endpoint selection is supported only for VIT");
@@ -49,9 +71,9 @@ public final class RandomStrategy {
         boolean pinned = honorSelected && context.getRequest().getSelectedVit() != null;
         if (vitCacheDirectory != null && (pinned
                 || (context.getRequest().getMediaKeys() != null && !context.getRequest().getMediaKeys().isEmpty()))) {
-            ServerStatus route = pinned ? vitCacheDirectory.validate(context, group)
-                    : honorSelected ? vitCacheDirectory.select(context, group)
-                    : vitCacheDirectory.selectReplacement(context, group);
+            ServerStatus route = pinned ? vitCacheDirectory.validate(context, group, eligible)
+                    : honorSelected ? vitCacheDirectory.select(context, group, eligible)
+                    : vitCacheDirectory.selectReplacement(context, group, eligible);
             if (!route.isSuccess()) {
                 return null;
             }
@@ -61,7 +83,8 @@ public final class RandomStrategy {
                 return null;
             }
             WorkerStatus status = pin.endpoint().getStatus();
-            if ((group != null || !honorSelected) && !Objects.equals(group, status.topologySnapshot().group())) {
+            if (!eligible.test(status.getGenerationId())
+                    || (group != null || !honorSelected) && !Objects.equals(group, status.topologySnapshot().group())) {
                 pin.close();
                 return null;
             }
@@ -85,6 +108,7 @@ public final class RandomStrategy {
                 WorkerStatus status = pin.endpoint().getStatus();
                 WorkerStatus.TopologySnapshot topology =
                         status.topologySnapshot();
+                if (!eligible.test(status.getGenerationId())) { continue; }
                 if ((group != null || !honorSelected) && !Objects.equals(group, topology.group())) {
                     continue;
                 }

@@ -537,6 +537,18 @@ class VitProxyRpcServerStatusTest(TestCase):
         self.assertTrue(response.alive)
         self.assertEqual(context.code, None)
 
+    def test_proxy_preserves_descriptor_and_owns_status_cursor(self):
+        child = WorkerStatusPB(role="VIT", alive=True, status_version=1)
+        child.compatibility.schema_version = 1
+        child.compatibility.vision.identity = "vision-v2"
+        child.compatibility.vision.embedding_contract = "tensor-v1:128:3:0"
+        server = self._make_server({"worker": self._make_status_stub(child)})
+        first = server.GetWorkerStatus(StatusVersionPB(), FakeContext())
+        second = server.GetWorkerStatus(StatusVersionPB(), FakeContext())
+        self.assertEqual(first.compatibility, child.compatibility)
+        self.assertGreater(second.status_version, first.status_version)
+        self.assertEqual(child.status_version, 1)
+
     def test_worker_status_continues_after_timeout_with_parallel_probe(self):
         timeout_stub = self._make_status_stub(error=RpcDeadlineExceeded())
         live_stub = self._make_status_stub(

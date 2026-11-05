@@ -226,6 +226,24 @@ public final class WorkerDirectory {
         return endpointRegistry.endpointAddressSnapshot(role);
     }
 
+    /** Non-owning, exact published generations for compatibility prefiltering. */
+    public List<WorkerStatus> routingStatusSnapshot(RoleType role, String group) {
+        List<WorkerStatus> result = new ArrayList<>();
+        for (String address : endpointAddressSnapshot(role)) {
+            WorkerEndpoint endpoint = endpointRegistry.get(role, address);
+            WorkerStatus status = endpoint == null ? null : endpoint.getStatus();
+            if (status != null
+                    && (group == null || group.equals(status.getGroup()))) {
+                result.add(status);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    public Map<RoleType, List<WorkerEndpoint>> routingTopologySnapshot() {
+        return endpointRegistry.routingTopologySnapshot();
+    }
+
     /**
      * Immutable, non-owning Prefill generations for one routing traversal.
      * The winning address must still be captured and identity-checked.

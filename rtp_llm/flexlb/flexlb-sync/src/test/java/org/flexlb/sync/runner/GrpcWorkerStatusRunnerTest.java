@@ -34,6 +34,96 @@ import static org.mockito.Mockito.when;
 class GrpcWorkerStatusRunnerTest {
 
     @ParameterizedTest
+    @CsvSource({"legacy,vision1", "vision1,vision2", "vision1,legacy", "vision1,invalid", "legacy,invalid"})
+    void compatibilityChangesAndInvalidMetadataRetireImmediatelyAtSameVersion(String first, String next) {
+        ConfigService config = mock(ConfigService.class);
+        when(config.loadBalanceConfig()).thenReturn(org.flexlb.balance.scheduler.SchedulingTestConfig.newConfig());
+        EndpointRegistry registry = RunnerTestSupport.endpointRegistry(config);
+        WorkerStatus status = RunnerTestSupport.discovered(RoleType.VIT, "g", "127.0.0.1", 8080, 8081, "test");
+        WorkerDirectory directory = directory(registry, status);
+        try {
+            pollVit(directory, status, CompletableFuture.completedFuture(vitStatus(first)));
+            assertNotNull(registry.get(RoleType.VIT, status.getIpPort()));
+            pollVit(directory, status, CompletableFuture.completedFuture(vitStatus(next)));
+            assertNull(registry.get(RoleType.VIT, status.getIpPort()));
+            assertTrue(directory.statusSnapshot(RoleType.VIT).isEmpty());
+            assertNull(status.tryBeginStatusPoll());
+        } finally { registry.close(); }
+    }
+
+    @Test
+    void staleDescriptorCallbackCannotReclassifyReplacementAtSameAddress() {
+        ConfigService config = mock(ConfigService.class);
+        when(config.loadBalanceConfig()).thenReturn(org.flexlb.balance.scheduler.SchedulingTestConfig.newConfig());
+        EndpointRegistry registry = RunnerTestSupport.endpointRegistry(config);
+        WorkerStatus old = RunnerTestSupport.discovered(RoleType.VIT, "g", "127.0.0.1", 8080, 8081, "test");
+        WorkerDirectory directory = directory(registry, old);
+        CacheAwareService cache = mock(CacheAwareService.class);
+        try {
+            pollVit(directory, old, CompletableFuture.completedFuture(vitStatus("vision1")));
+            var late = new CompletableFuture<EngineRpcService.WorkerStatusPB>();
+            pollVit(directory, old, late);
+            EndpointRegistry.DetachedGeneration detached;
+            old.lock.lock();
+            try { detached = directory.beginRetirement(RoleType.VIT, old.getIpPort(), old); }
+            finally { old.lock.unlock(); }
+            directory.completeRetirement(RoleType.VIT, old.getIpPort(), old, detached, cache,
+                    org.slf4j.LoggerFactory.getLogger(getClass()));
+            WorkerStatus replacement = directory.currentOrDiscover(RoleType.VIT, old.getIpPort(), () ->
+                    RunnerTestSupport.discovered(RoleType.VIT, "g", "127.0.0.1", 8080, 8081, "test"));
+            pollVit(directory, replacement, CompletableFuture.completedFuture(vitStatus("vision2")));
+            late.complete(vitStatus("vision1"));
+            assertSame(replacement, directory.statusSnapshot(RoleType.VIT).get(old.getIpPort()));
+            org.junit.jupiter.api.Assertions.assertEquals("vision2", replacement.compatibility().vision().identity());
+        } finally { registry.close(); }
+    }
+
+    private static EngineRpcService.WorkerStatusPB vitStatus(String identity) {
+        var status = EngineRpcService.WorkerStatusPB.newBuilder().setRole("VIT").setAlive(true).setStatusVersion(1);
+        if (!identity.equals("legacy")) {
+            var descriptor = EngineRpcService.RoleCompatibilityPB.newBuilder().setSchemaVersion(1);
+            if (!identity.equals("invalid")) {
+                descriptor.setVision(EngineRpcService.VisionCompatibilityPB.newBuilder()
+                        .setIdentity(identity).setEmbeddingContract("tensor-v1:128:3:0"));
+            }
+            status.setCompatibility(descriptor);
+        }
+        return status.build();
+    }
+
+    @ParameterizedTest
+    @CsvSource({"PREFILL", "DECODE", "PDFUSION"})
+    void emptyReportedContractImmediatelyExcludesComputeRole(RoleType role) {
+        ConfigService config = mock(ConfigService.class);
+        when(config.loadBalanceConfig()).thenReturn(org.flexlb.balance.scheduler.SchedulingTestConfig.newConfig());
+        EndpointRegistry registry = RunnerTestSupport.endpointRegistry(config);
+        WorkerStatus status = RunnerTestSupport.discovered(role, "g", "127.0.0.1", 8080, 8081, "test");
+        WorkerDirectory directory = directory(registry, status);
+        try {
+            RunnerTestSupport.publishEndpoint(registry, role, status.getIpPort(), status);
+            var response = EngineRpcService.WorkerStatusPB.newBuilder().setRole(role.getCode()).setAlive(true)
+                    .setStatusVersion(1).setCompatibility(EngineRpcService.RoleCompatibilityPB.newBuilder()
+                            .setSchemaVersion(1)).build();
+            EngineGrpcService grpc = mock(EngineGrpcService.class);
+            when(grpc.getWorkerStatusAsync(anyString(), anyInt(), anyLong(), anyLong(), any()))
+                    .thenReturn(CompletableFuture.completedFuture(response));
+            new GrpcWorkerStatusRunner("model", status.getIpPort(), "test", role, "g", status,
+                    status.tryBeginStatusPoll(), directory, mock(EngineHealthReporter.class), grpc, 5000,
+                    mock(CacheAwareService.class), Runnable::run).run();
+            assertNull(registry.get(role, status.getIpPort()));
+        } finally { registry.close(); }
+    }
+
+    private static void pollVit(WorkerDirectory directory, WorkerStatus status,
+                                CompletableFuture<EngineRpcService.WorkerStatusPB> response) {
+        EngineGrpcService grpc = mock(EngineGrpcService.class);
+        when(grpc.getWorkerStatusAsync(anyString(), anyInt(), anyLong(), anyLong(), any())).thenReturn(response);
+        new GrpcWorkerStatusRunner("model", status.getIpPort(), "test", RoleType.VIT, "g", status,
+                status.tryBeginStatusPoll(), directory, mock(EngineHealthReporter.class), grpc, 5000,
+                mock(CacheAwareService.class), Runnable::run).run();
+    }
+
+    @ParameterizedTest
     @CsvSource({"DECODE,false", "PREFILL,true", "PDFUSION,true"})
     void repeatedRpcFailuresRetireWorkerAndOnlyClearDetailedCacheIndexes(
             RoleType role, boolean needsCacheKeys) {

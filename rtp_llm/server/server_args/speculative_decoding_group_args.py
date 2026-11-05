@@ -7,6 +7,14 @@ def init_speculative_decoding_group_args(parser, sp_config):
     ##############################################################################################################
     speculative_decoding_group = parser.add_argument_group("投机采样")
     speculative_decoding_group.add_argument(
+        "--sp_model_identity",
+        env_name="SP_MODEL_IDENTITY",
+        bind_to=(sp_config, "model_identity"),
+        type=str,
+        default="",
+        help="Draft model compatibility identity; defaults to the original draft checkpoint path.",
+    )
+    speculative_decoding_group.add_argument(
         "--sp_model_type",
         env_name="SP_MODEL_TYPE",
         bind_to=(sp_config, "model_type"),

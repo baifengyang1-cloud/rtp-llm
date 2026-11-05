@@ -124,6 +124,8 @@ class ModelConfig(CppModelConfig):
         "quant_algo",
         "eplb_config",
         "ckpt_path",
+        "model_identity",
+        "vision_model_identity",
         "tokenizer_path",
         "position_ids_style",
         "pre_seq_len",
@@ -913,6 +915,16 @@ def build_model_config(
         quantization_config: Optional QuantizationConfig (for quantization settings)
     """
     model_config.ckpt_path = model_args.ckpt_path
+    model_config.model_identity = model_args.model_identity or model_args.ckpt_path
+    model_config.vision_model_identity = (
+        (
+            vit_config.model_identity
+            or vit_config.extra_data_path
+            or model_args.ckpt_path
+        )
+        if vit_config is not None
+        else ""
+    )
     model_config.tokenizer_path = model_args.tokenizer_path
     model_config.model_type = model_args.model_type
     if vit_config:

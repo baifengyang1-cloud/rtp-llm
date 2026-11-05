@@ -86,7 +86,7 @@ class DirectAdmissionContractTest {
             assertEquals(48L * prefillCapacity, fixture.decode.routingView().inflightExpectedKv());
             fixture.assertNoWaitingQueue();
             verify(fixture.requests, times(2)).commitRoute(any(), any());
-            verify(fixture.prefillSelector, times(2)).select(any(), eq(RoleType.PREFILL), any());
+            verify(fixture.prefillSelector, times(2)).select(any(), eq(RoleType.PREFILL), any(), any());
         }
     }
 
@@ -127,16 +127,19 @@ class DirectAdmissionContractTest {
     @Test
     void fullDecodeRejectsImmediatelyAndRollsBackTheProvisionalRoute() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            DecodeEndpoint.ReservationHandle occupant;
-            try (var pin = fixture.decode.tryPinGeneration()) {
-                assertNotNull(pin);
-                occupant = fixture.decode.reserve(pin, 999L, 32L, 48L, 50);
-            }
-            assertNotNull(occupant);
-            var acquired = fixture.decode.acquireDispatchPermit(occupant, new DecodeEndpoint.AdmissionCapacity(1L, 90L));
-            assertEquals(DecodeEndpoint.EngineDispatchPermitAcquireStatus.ACQUIRED, acquired.status());
-            assertEquals(DecodeEndpoint.EngineDispatchPermitTransferStatus.TRANSFERRED,
-                    acquired.permit().dispatch());
+            var occupied = new java.util.concurrent.atomic.AtomicReference<DecodeEndpoint.ReservationHandle>();
+            // Fill Decode after the group eligibility snapshot, exercising the admission race.
+            doAnswer(call -> {
+                try (var pin = fixture.decode.tryPinGeneration()) {
+                    assertNotNull(pin);
+                    occupied.set(fixture.decode.reserve(pin, 999L, 32L, 48L, 50));
+                }
+                var acquired = fixture.decode.acquireDispatchPermit(occupied.get(), new DecodeEndpoint.AdmissionCapacity(1L, 90L));
+                assertEquals(DecodeEndpoint.EngineDispatchPermitAcquireStatus.ACQUIRED, acquired.status());
+                assertEquals(DecodeEndpoint.EngineDispatchPermitTransferStatus.TRANSFERRED, acquired.permit().dispatch());
+                return PlacementResult.success(SelectedRole.prefill(fixture.prefill.tryPinGeneration(),
+                        Fixture.metadata(fixture.prefill, 102L), 30_000L, fixture.prefill.placementVersion()));
+            }).when(fixture.prefillSelector).select(any(), eq(RoleType.PREFILL), any(), any());
 
             Response response = assertTimeoutPreemptively(Duration.ofSeconds(2),
                     () -> fixture.scheduler.submit(fixture.context(102L)).get(2L, TimeUnit.SECONDS));
@@ -145,7 +148,8 @@ class DirectAdmissionContractTest {
             assertEquals(StrategyErrorType.RESOURCE_EXHAUSTED.getErrorCode(), response.getCode());
             fixture.assertNoPrefillOwnership();
             assertNull(fixture.decode.reservationHandle(102L));
-            assertEquals(occupant, fixture.decode.reservationHandle(999L));
+            assertNotNull(occupied.get());
+            assertEquals(occupied.get(), fixture.decode.reservationHandle(999L));
             assertEquals(1, fixture.decode.routingView().engineCapacityUsed());
             assertEquals(48L, fixture.decode.routingView().inflightExpectedKv());
             assertEquals(0, fixture.decode.resourceSnapshot().queuedCount());
@@ -233,14 +237,14 @@ class DirectAdmissionContractTest {
             observe(decode, Map.of(), Map.of());
             prefillSelector = mock(CostBasedPrefillStrategy.class);
             var decodeSelector = mock(DecodeSelector.class);
-            when(prefillSelector.select(any(), eq(RoleType.PREFILL), any())).thenAnswer(call -> {
+            when(prefillSelector.select(any(), eq(RoleType.PREFILL), any(), any())).thenAnswer(call -> {
                 var context = call.getArgument(0, BalanceContext.class);
                 var pin = prefill.tryPinGeneration();
                 assertNotNull(pin);
                 return PlacementResult.success(SelectedRole.prefill(pin,
                         metadata(prefill, context.getRequestId()), 30_000L, prefill.placementVersion()));
             });
-            when(decodeSelector.select(any(), any())).thenAnswer(call -> {
+            when(decodeSelector.select(any(), any(), any())).thenAnswer(call -> {
                 var request = call.getArgument(0, ScheduledRequest.DecodeBinding.class);
                 var pin = decode.tryPinGeneration();
                 assertNotNull(pin);
@@ -249,7 +253,21 @@ class DirectAdmissionContractTest {
             });
             var model = mock(ModelMetaConfig.class);
             when(model.requiredRoles()).thenReturn(List.of(RoleType.PREFILL, RoleType.DECODE));
-            var router = new DefaultRouter(prefillSelector, decodeSelector, mock(RandomStrategy.class), service, model);
+            var workers = mock(org.flexlb.sync.status.WorkerDirectory.class);
+            when(workers.prefillRoutingSnapshot(any())).thenReturn(java.util.List.of(
+                    new EndpointRegistry.PrefillRoutingEntry(prefill.ipPort(), prefill)));
+            when(workers.decodeRoutingSnapshot(any())).thenAnswer(call -> java.util.List.of(decode.routingView()));
+            when(workers.captureDecodeGeneration(any())).thenAnswer(call -> decode.tryPinGeneration());
+            when(prefillSelector.unavailable(any(), any(), any(), any())).thenAnswer(call ->
+                    new CostBasedPrefillStrategy(workers, mock(org.flexlb.cache.service.CacheAwareService.class),
+                            mock(org.flexlb.service.monitor.EngineHealthReporter.class))
+                            .unavailable(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3)));
+            when(decodeSelector.unavailable(any(), any(), any())).thenAnswer(call ->
+                    new DecodeSelector(workers).unavailable(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
+            when(workers.routingStatusSnapshot(any(), any())).thenAnswer(call ->
+                    java.util.List.of(prefill.getStatus(), decode.getStatus()).stream()
+                            .filter(w -> w.getRole() == call.getArgument(0)).toList());
+            var router = new DefaultRouter(prefillSelector, decodeSelector, mock(RandomStrategy.class), service, model, workers);
             scheduler = new RequestScheduler(service, router, endpoints, reporter, mock(EvictionManager.class),
                     requests, placement);
             runtime = new SchedulerRuntime(requests, endpoints, reporter, requestReporter, scheduler);

@@ -62,6 +62,11 @@ class DirectRequestLifetimeRaceTest {
             metadata.setGrpcPort(8081);
             var selection = mock(SelectedRole.class);
             when(selection.serverStatus()).thenReturn(metadata);
+            var worker = org.flexlb.dao.master.WorkerStatus.createDiscovered(
+                    RoleType.PDFUSION, null, "127.0.0.1", 8080, 8081, null);
+            when(prefill.getStatus()).thenReturn(worker);
+            when(prefill.canAcceptRequest()).thenReturn(true);
+            when(selection.endpoint()).thenReturn(prefill);
             when(selection.prefillWorkMs()).thenReturn(30_000L);
             when(selection.takeGenerationPin()).thenReturn(pin);
             var reservation = mock(PrefillState.RouteReservation.class);
@@ -73,12 +78,16 @@ class DirectRequestLifetimeRaceTest {
             when(handoff.precedingWork()).thenReturn(new WorkSnapshot(System.currentTimeMillis(), java.util.List.of(), java.util.List.of(), 0L));
             when(routeCommit.commit(any(), any())).thenReturn(handoff);
             var prefillSelector = mock(CostBasedPrefillStrategy.class);
-            when(prefillSelector.select(context, RoleType.PDFUSION, null))
+            when(prefillSelector.select(eq(context), eq(RoleType.PDFUSION), org.mockito.ArgumentMatchers.isNull(), any()))
                     .thenReturn(PlacementResult.success(selection));
             var model = mock(ModelMetaConfig.class);
             when(model.requiredRoles()).thenReturn(List.of(RoleType.PDFUSION));
+            var workers = mock(org.flexlb.sync.status.WorkerDirectory.class);
+            when(workers.prefillRoutingSnapshot(any())).thenReturn(java.util.List.of(
+                    new org.flexlb.balance.endpoint.EndpointRegistry.PrefillRoutingEntry(worker.getIpPort(), prefill)));
+            when(workers.routingStatusSnapshot(any(), any())).thenReturn(java.util.List.of(worker));
             var router = new DefaultRouter(prefillSelector, mock(DecodeSelector.class),
-                    mock(RandomStrategy.class), service, model);
+                    mock(RandomStrategy.class), service, model, workers);
 
             AtomicBoolean lateConfirmation = new AtomicBoolean();
             doAnswer(invocation -> {

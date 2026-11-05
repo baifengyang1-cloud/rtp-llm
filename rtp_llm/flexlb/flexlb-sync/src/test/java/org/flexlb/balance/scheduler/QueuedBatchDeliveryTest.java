@@ -167,7 +167,7 @@ class QueuedBatchDeliveryTest {
             selected.setServerIp(replacement.getIp());
             selected.setSuccess(true);
             ServerStatus replacementStatus = selected;
-            when(vitSelector.reselect(item.ctx(), "default")).thenAnswer(call ->
+            when(vitSelector.reselectCompatible(item.ctx(), "default", null)).thenAnswer(call ->
                     SelectedRole.stateless(replacement.tryPinGeneration(), replacementStatus));
             ScheduledRequest text = mixed ? item(2L) : null;
             int members = mixed ? 2 : 1;
@@ -208,7 +208,7 @@ class QueuedBatchDeliveryTest {
             assertEquals(replacement.getIp(), response.getServerStatus().get(1).getServerIp());
             assertEquals(StrategyErrorType.INVALID_REQUEST.getErrorCode(), registry.register(
                     RequestLifecycleTestSupport.context(config, 1L)).get(5, TimeUnit.SECONDS).getCode());
-            verify(vitSelector, times(1)).reselect(item.ctx(), "default");
+            verify(vitSelector, times(1)).reselectCompatible(item.ctx(), "default", null);
         } finally {
             oldVit.close();
             replacement.close();

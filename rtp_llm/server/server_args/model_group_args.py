@@ -7,6 +7,14 @@ def init_model_group_args(parser, model_args):
     ##############################################################################################################
     model_group = parser.add_argument_group("Model Configuration")
     model_group.add_argument(
+        "--model_identity",
+        env_name="MODEL_IDENTITY",
+        bind_to=(model_args, "model_identity"),
+        type=str,
+        default="",
+        help="Target model compatibility identity; defaults to the original checkpoint path.",
+    )
+    model_group.add_argument(
         "--tokenizer_path",
         env_name="TOKENIZER_PATH",
         bind_to=(model_args, "tokenizer_path"),

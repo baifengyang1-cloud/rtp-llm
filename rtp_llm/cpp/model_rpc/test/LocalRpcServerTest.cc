@@ -12,13 +12,252 @@
 #include <gtest/gtest.h>
 
 #include "rtp_llm/cpp/config/ConfigModules.h"
+#include "rtp_llm/cpp/cache/SingleConfigCreator.h"
+#include "rtp_llm/cpp/cache/CacheConfigCreator.h"
+#include "rtp_llm/cpp/model_rpc/test/RoleCompatibilityFixtures.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
+#include "rtp_llm/cpp/model_rpc/RoleCompatibility.h"
 #include "rtp_llm/cpp/model_rpc/PrefillRpcServer.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 
 using namespace ::testing;
 
 namespace rtp_llm {
+
+TEST(RoleCompatibilityTest, EncodesNativeEnumsWithoutDependingOnTheirOrdinals) {
+    const std::pair<SpeculativeType, SpeculativeCompatibilityPB::Mode> modes[] = {
+        {SP_TYPE_NONE, SpeculativeCompatibilityPB::MODE_NONE},
+        {SP_TYPE_VANILLA, SpeculativeCompatibilityPB::MODE_VANILLA},
+        {SP_TYPE_MTP, SpeculativeCompatibilityPB::MODE_MTP},
+        {SP_TYPE_EAGLE3, SpeculativeCompatibilityPB::MODE_EAGLE3},
+        {SP_TYPE_EAGLE, SpeculativeCompatibilityPB::MODE_EAGLE},
+        {SP_TYPE_DETERMINISTIC, SpeculativeCompatibilityPB::MODE_DETERMINISTIC},
+        {SP_TYPE_DSPARK, SpeculativeCompatibilityPB::MODE_DSPARK},
+    };
+    for (const auto& [native, wire] : modes) {
+        EngineInitParams params;
+        params.sp_config.type = native;
+        EXPECT_EQ(makeRoleCompatibility(params, nullptr).speculative().mode(), wire);
+    }
+    const std::pair<DataType, KVTransferGroupPB::DType> dtypes[] = {
+        {TYPE_FP16, KVTransferGroupPB::DTYPE_FP16},
+        {TYPE_BF16, KVTransferGroupPB::DTYPE_BF16},
+        {TYPE_FP32, KVTransferGroupPB::DTYPE_FP32},
+        {TYPE_FP64, KVTransferGroupPB::DTYPE_FP64},
+        {TYPE_INT8, KVTransferGroupPB::DTYPE_INT8},
+        {TYPE_UINT8, KVTransferGroupPB::DTYPE_UINT8},
+        {TYPE_INT16, KVTransferGroupPB::DTYPE_INT16},
+        {TYPE_UINT16, KVTransferGroupPB::DTYPE_UINT16},
+        {TYPE_INT32, KVTransferGroupPB::DTYPE_INT32},
+        {TYPE_UINT32, KVTransferGroupPB::DTYPE_UINT32},
+        {TYPE_INT64, KVTransferGroupPB::DTYPE_INT64},
+        {TYPE_UINT64, KVTransferGroupPB::DTYPE_UINT64},
+        {TYPE_FP8_E4M3, KVTransferGroupPB::DTYPE_FP8_E4M3},
+        {TYPE_FP8_E8M0, KVTransferGroupPB::DTYPE_FP8_E8M0},
+    };
+    for (const auto& [native, wire] : dtypes) {
+        EXPECT_EQ(compatibilityDType(native), wire);
+    }
+    EXPECT_EQ(compatibilityDType(TYPE_INVALID), KVTransferGroupPB::DTYPE_UNSPECIFIED);
+    EXPECT_EQ(compatibilityDType(TYPE_BOOL), KVTransferGroupPB::DTYPE_UNSPECIFIED);
+    const std::pair<KVCacheSpecType, KVTransferGroupPB::CacheKind> kinds[] = {
+        {MultiHeadAttention, KVTransferGroupPB::CACHE_KIND_MULTI_HEAD_ATTENTION},
+        {MultiHeadLatentAttention, KVTransferGroupPB::CACHE_KIND_MULTI_HEAD_LATENT_ATTENTION},
+        {LinearAttention, KVTransferGroupPB::CACHE_KIND_LINEAR_ATTENTION},
+        {OpaqueKV, KVTransferGroupPB::CACHE_KIND_OPAQUE_KV},
+        {OpaqueState, KVTransferGroupPB::CACHE_KIND_OPAQUE_STATE},
+    };
+    for (const auto& [native, wire] : kinds) {
+        EXPECT_EQ(compatibilityCacheKind(native), wire);
+    }
+}
+
+TEST(RoleCompatibilityTest, ReportsIndependentIdentitiesAndSpeculation) {
+    EngineInitParams params;
+    params.model_config_.model_identity                = "target-v2";
+    params.model_config_.vision_model_identity         = "vision-v1";
+    params.model_config_.mm_model_config.is_multimodal = true;
+    params.model_config_.hidden_size                   = 128;
+    params.sp_config.type                              = SP_TYPE_MTP;
+    params.sp_config.model_identity                    = "draft-v3";
+    params.sp_config.gen_num_per_cycle                 = 4;
+    const auto descriptor                              = makeRoleCompatibility(params, nullptr);
+    EXPECT_EQ(descriptor.schema_version(), 1);
+    EXPECT_EQ(descriptor.target_identity(), "target-v2");
+    EXPECT_EQ(descriptor.vision().identity(), "vision-v1");
+    EXPECT_EQ(descriptor.speculative().mode(), SpeculativeCompatibilityPB::MODE_MTP);
+    EXPECT_EQ(descriptor.speculative().draft_identity(), "draft-v3");
+    EXPECT_EQ(descriptor.speculative().proposal_width(), 4);
+    EXPECT_FALSE(descriptor.has_kv_transfer());
+    SpeculativeExecutionConfig effective;
+    const auto                 ordinary = makeRoleCompatibility(params, nullptr, nullptr, &effective);
+    EXPECT_EQ(ordinary.speculative().mode(), SpeculativeCompatibilityPB::MODE_NONE);
+    EXPECT_EQ(ordinary.speculative().proposal_width(), 1);
+    EXPECT_TRUE(ordinary.speculative().draft_identity().empty());
+}
+
+TEST(RoleCompatibilityTest, ReportsNativeAsymmetricTpAndCpContracts) {
+    EngineInitParams params;
+    params.model_id                                   = 0;
+    params.model_config_.model_identity               = "target";
+    params.model_config_.num_layers                   = 2;
+    params.model_config_.data_type                    = DataType::TYPE_BF16;
+    params.model_config_.attn_config.kv_head_num      = 12;
+    params.model_config_.attn_config.size_per_head    = 64;
+    params.model_config_.attn_config.tokens_per_block = 64;
+    KVCacheSpecDesc desc;
+    desc.tag                                 = "default";
+    desc.cache_type                          = KVCacheSpecType::MultiHeadAttention;
+    desc.dtype                               = DataType::TYPE_BF16;
+    params.model_config_.kv_cache_spec_descs = {{desc}, {desc}};
+    params.pd_sep_config.role_type           = RoleType::PREFILL;
+    params.parallelism_config.tp_size        = 4;
+    auto       config = SingleConfigCreator::createSingleConfig(params.model_config_, params.parallelism_config);
+    const auto p      = makeRoleCompatibility(params, &config);
+    ASSERT_EQ(p.kv_transfer().groups_size(), 1);
+    EXPECT_EQ(p.kv_transfer().groups(0).local_kv_heads(), 3);
+    EXPECT_EQ(p.kv_transfer().groups(0).wire_bytes(0), 3 * 64 * 64 * 2);
+    EXPECT_EQ(p.kv_transfer().groups(0).framing(), KVTransferGroupPB::FRAMING_SPLIT);
+
+    params.pd_sep_config.role_type    = RoleType::DECODE;
+    params.parallelism_config.tp_size = 2;
+    config       = SingleConfigCreator::createSingleConfig(params.model_config_, params.parallelism_config);
+    const auto d = makeRoleCompatibility(params, &config);
+    EXPECT_EQ(d.kv_transfer().groups(0).local_kv_heads(), 6);
+    EXPECT_EQ(d.kv_transfer().groups(0).wire_bytes(0), 2 * p.kv_transfer().groups(0).wire_bytes(0));
+    config.use_mla                 = true;
+    params.pd_sep_config.role_type = RoleType::PREFILL;
+    EXPECT_EQ(makeRoleCompatibility(params, &config).kv_transfer().groups(0).framing(),
+              KVTransferGroupPB::FRAMING_SPLIT);
+    params.pd_sep_config.role_type = RoleType::DECODE;
+    EXPECT_EQ(makeRoleCompatibility(params, &config).kv_transfer().groups(0).framing(), KVTransferGroupPB::FRAMING_KV);
+
+    params.pd_sep_config.role_type                               = RoleType::PREFILL;
+    params.parallelism_config.tp_size                            = 4;
+    params.parallelism_config.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+    params.parallelism_config.prefill_cp_config.kv_cache_sharded = true;
+    config          = SingleConfigCreator::createSingleConfig(params.model_config_, params.parallelism_config);
+    const auto cp_p = makeRoleCompatibility(params, &config);
+    params.pd_sep_config.role_type                              = RoleType::DECODE;
+    params.parallelism_config.tp_size                           = 1;
+    params.parallelism_config.prefill_cp_config.method          = CPRotateMethod::PREFILL_CP;
+    params.parallelism_config.prefill_cp_config.prefill_cp_size = 4;
+    config          = SingleConfigCreator::createSingleConfig(params.model_config_, params.parallelism_config);
+    const auto cp_d = makeRoleCompatibility(params, &config);
+    EXPECT_EQ(cp_p.kv_transfer().producer_cp_size(), 4);
+    EXPECT_EQ(cp_d.kv_transfer().producer_cp_size(), 4);
+    EXPECT_EQ(cp_p.kv_transfer().tp_size(), 1);
+    EXPECT_EQ(cp_d.kv_transfer().tp_size(), 1);
+    EXPECT_EQ(cp_p.kv_transfer().groups(0).SerializeAsString(), cp_d.kv_transfer().groups(0).SerializeAsString());
+}
+
+TEST(RoleCompatibilityTest, HybridMtpOmitsPlaceholderGroupsAndKeepsComponentLayers) {
+    EngineInitParams params;
+    auto&            model                                = params.model_config_;
+    model.model_identity                                  = "target";
+    model.num_layers                                      = 4;
+    model.data_type                                       = DataType::TYPE_BF16;
+    model.attn_config.head_num                            = 12;
+    model.attn_config.kv_head_num                         = 12;
+    model.attn_config.size_per_head                       = 64;
+    model.attn_config.tokens_per_block                    = 64;
+    model.hybrid_attention_config.enable_hybrid_attention = true;
+    model.hybrid_attention_config.hybrid_attention_types  = {
+        HybridAttentionType::LINEAR, HybridAttentionType::LINEAR, HybridAttentionType::NONE, HybridAttentionType::NONE};
+    model.linear_attention_config.linear_conv_kernel_dim = 2;
+    model.linear_attention_config.linear_key_head_dim    = 8;
+    model.linear_attention_config.linear_value_head_dim  = 8;
+    model.linear_attention_config.linear_num_key_heads   = 2;
+    model.linear_attention_config.linear_num_value_heads = 2;
+    model.kv_cache_spec_descs                            = {{{"linear", KVCacheSpecType::LinearAttention}},
+                                                            {{"linear", KVCacheSpecType::LinearAttention}},
+                                                            {{"full", KVCacheSpecType::MultiHeadAttention}},
+                                                            {{"full", KVCacheSpecType::MultiHeadAttention}}};
+    EngineInitParams draft;
+    draft.model_id                                                      = 1;
+    draft.model_config_                                                 = model;
+    draft.model_config_.num_layers                                      = 1;
+    draft.model_config_.model_identity                                  = "draft";
+    draft.model_config_.hybrid_attention_config.enable_hybrid_attention = false;
+    draft.model_config_.hybrid_attention_config.hybrid_attention_types.clear();
+    draft.model_config_.kv_cache_spec_descs = {{{"full", KVCacheSpecType::MultiHeadAttention}}};
+    params.sp_config.type                   = SP_TYPE_MTP;
+    params.sp_config.model_identity         = "draft";
+    params.sp_config.gen_num_per_cycle      = 2;
+    params.parallelism_config.tp_size       = 1;
+    params.kv_cache_config.test_block_num   = 8;
+    auto config                             = CacheConfigCreator::createSpConfig(model,
+                                                     draft.model_config_,
+                                                     params.parallelism_config,
+                                                     params.runtime_config,
+                                                     params.kv_cache_config,
+                                                     params.sp_config,
+                                                     std::nullopt,
+                                                     true,
+                                                     false);
+    ASSERT_EQ(config.groupNums(), 2);
+    ASSERT_EQ(config.mtp_sub_configs.size(), 2);
+    ASSERT_EQ(config.mtp_sub_configs.front()->groupNums(), 2);
+    for (auto role : {RoleType::PREFILL, RoleType::DECODE}) {
+        params.pd_sep_config.role_type = role;
+        const auto descriptor          = makeRoleCompatibility(params, &config, &draft);
+        ASSERT_EQ(descriptor.kv_transfer().groups_size(), 3);
+        for (const auto& group : descriptor.kv_transfer().groups()) {
+            ASSERT_GT(group.layers_size(), 0);
+            if (group.tag() == "target/linear") {
+                EXPECT_EQ(std::vector<int>(group.layers().begin(), group.layers().end()), (std::vector<int>{0, 1}));
+            } else if (group.tag() == "target/full") {
+                EXPECT_EQ(std::vector<int>(group.layers().begin(), group.layers().end()), (std::vector<int>{2, 3}));
+            } else {
+                EXPECT_EQ(group.tag(), "draft/0/full");
+                EXPECT_EQ(std::vector<int>(group.layers().begin(), group.layers().end()), (std::vector<int>{0}));
+            }
+        }
+        expectCompatibilityFixture(role == RoleType::PREFILL ? "hybrid_mtp_prefill.pbtxt" : "hybrid_mtp_decode.pbtxt",
+                                   descriptor);
+    }
+}
+
+TEST(RoleCompatibilityTest, ConsumerDescribesExpectedOpaqueCpPeerSlice) {
+    auto describe = [](bool consumer) {
+        EngineInitParams params;
+        params.model_id                             = 0;
+        params.model_config_.model_identity         = "target";
+        params.pd_sep_config.role_type              = consumer ? RoleType::DECODE : RoleType::PREFILL;
+        auto& parallel                              = params.parallelism_config;
+        parallel.role_type                          = params.pd_sep_config.role_type;
+        parallel.tp_size                            = consumer ? 1 : 4;
+        parallel.prefill_cp_config.kv_cache_sharded = true;
+        parallel.prefill_cp_config.prefill_cp_size  = 4;
+        parallel.prefill_cp_config.method = consumer ? CPRotateMethod::PREFILL_CP : CPRotateMethod::ALL_GATHER;
+        KVCacheSpecDesc desc;
+        desc.tag                  = "state";
+        desc.cache_type           = KVCacheSpecType::OpaqueState;
+        desc.entry_dtype          = DataType::TYPE_UINT8;
+        desc.entry_elems          = 8;
+        desc.explicit_entry_count = 16;
+        desc.cp.emplace();
+        desc.cp->scale_seq_size                  = true;
+        desc.cp->slice                           = CpBlockSliceMode::PAYLOAD_BYTES;
+        desc.cp->prefill_slice_layout            = CpPrefillSliceLayout::PAYLOAD;
+        params.model_config_.kv_cache_spec_descs = {{desc}};
+        SpecBuildContext ctx;
+        ctx.seq_size_per_block = 64;
+        ctx.parallelism_config = &parallel;
+        auto        spec       = SpecBuilder::build(desc, ctx);
+        CacheConfig config;
+        config.layer_num                 = 1;
+        config.seq_size_per_block        = 64;
+        config.use_opaque_kv_cache_store = true;
+        config.fromGroupedSpecs({spec}, {{0}}, {CacheGroupType::SWA}, {"state"}, {SpecBuilder::groupPolicy(desc)});
+        return makeRoleCompatibility(params, &config);
+    };
+    const auto p = describe(false);
+    const auto d = describe(true);
+    EXPECT_EQ(p.kv_transfer().groups(0).wire_bytes(0), 32);
+    EXPECT_EQ(d.kv_transfer().groups(0).wire_bytes(0), 32);
+    EXPECT_EQ(p.kv_transfer().groups(0).SerializeAsString(), d.kv_transfer().groups(0).SerializeAsString());
+}
 
 class MockGenerateStream: public GenerateStream {
 public:

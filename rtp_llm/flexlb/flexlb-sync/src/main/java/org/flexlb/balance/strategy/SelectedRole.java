@@ -141,6 +141,8 @@ public final class SelectedRole implements AutoCloseable {
         return serverStatus;
     }
 
+    public WorkerEndpoint endpoint() { return requireOwnedPin().endpoint(); }
+
     public long prefillWorkMs() {
         if (prefillWorkMs < 0L) {
             throw new IllegalStateException(

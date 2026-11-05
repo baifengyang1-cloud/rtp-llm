@@ -164,6 +164,19 @@ public class GrpcWorkerStatusRunner implements Runnable {
                             workerStatus.getGenerationId(), ipPort);
                     return;
                 }
+                try {
+                    if (observation.compatibility() != null) {
+                        observation.compatibility().validate(observation.role());
+                    }
+                    if (workerStatus.appliedStatusCursor().statusVersion() >= 0L
+                            && !Objects.equals(workerStatus.compatibility(), observation.compatibility())) {
+                        throw new IllegalArgumentException("Worker compatibility identity changed");
+                    }
+                } catch (IllegalArgumentException invalidCompatibility) {
+                    endpointToRetire = workerDirectory.beginRetirement(roleType, ipPort, workerStatus);
+                    generationRetiring = true;
+                    throw invalidCompatibility;
+                }
                 Long responseVersion = observation.statusVersion();
                 if (responseVersion == null || responseVersion <= 0L) {
                     endpointToRetire = workerDirectory.beginRetirement(

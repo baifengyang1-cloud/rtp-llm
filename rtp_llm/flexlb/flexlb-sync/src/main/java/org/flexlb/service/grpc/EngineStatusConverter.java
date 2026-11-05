@@ -1,6 +1,7 @@
 package org.flexlb.service.grpc;
 
 import org.flexlb.dao.master.CacheStatus;
+import org.flexlb.dao.master.RoleCompatibility;
 import org.flexlb.dao.master.WorkerStatus;
 import org.flexlb.dao.master.WorkerStatus.EngineObservation;
 import org.flexlb.dao.master.WorkerStatus.StatusObservation;
@@ -49,7 +50,107 @@ public class EngineStatusConverter {
                 workerStatusPB.getAlive(),
                 workerStatusPB.getStatusVersion(),
                 workerStatusPB.getLatestFinishedVersion(),
-                finishedTasks);
+                finishedTasks,
+                workerStatusPB.hasCompatibility() ? convertCompatibility(workerStatusPB.getCompatibility()) : null);
+    }
+
+    private static RoleCompatibility convertCompatibility(EngineRpcService.RoleCompatibilityPB value) {
+        RoleCompatibility.Vision vision = value.hasVision() ? new RoleCompatibility.Vision(
+                value.getVision().getIdentity(), value.getVision().getEmbeddingContract()) : null;
+        RoleCompatibility.Speculative speculative = value.hasSpeculative() ? new RoleCompatibility.Speculative(
+                convertMode(value.getSpeculative().getMode()), value.getSpeculative().getDraftIdentity(),
+                value.getSpeculative().getProposalWidth()) : null;
+        RoleCompatibility.Transfer transfer = null;
+        if (value.hasKvTransfer()) {
+            var kv = value.getKvTransfer();
+            transfer = new RoleCompatibility.Transfer(convertBackend(kv.getBackend()), convertKeyFormat(kv.getKeyFormat()),
+                    kv.getModelId(),
+                    kv.getTpSize(), kv.getProducerCpSize(), kv.getBaseBlockTokens(), kv.getGroupsList().stream()
+                    .map(g -> new RoleCompatibility.Group(g.getTag(), g.getLayersList(), convertCacheKind(g.getCacheKind()),
+                            convertDType(g.getDtype()), convertFraming(g.getFraming()),
+                            g.getBlockTokens(), g.getKernelBlockTokens(),
+                            g.getLocalKvHeads(), g.getWireBytesList(), g.getProjection(), g.getRepresentation())).toList(),
+                    kv.getWorkerTpSize(), convertProducerLayout(kv.getProducerLayout()));
+        }
+        return new RoleCompatibility(value.getSchemaVersion(), value.getTargetIdentity(), vision, transfer, speculative);
+    }
+
+    // Keep the domain independent of generated protobuf classes. Known enums map
+    // to interned literals; unspecified/future values remain invalid in validate().
+    private static String convertMode(EngineRpcService.SpeculativeCompatibilityPB.Mode value) {
+        return switch (value) {
+            case MODE_NONE -> "none";
+            case MODE_VANILLA -> "vanilla";
+            case MODE_MTP -> "mtp";
+            case MODE_EAGLE3 -> "eagle3";
+            case MODE_EAGLE -> "eagle";
+            case MODE_DETERMINISTIC -> "deterministic";
+            case MODE_DSPARK -> "dspark";
+            default -> "";
+        };
+    }
+
+    private static String convertBackend(EngineRpcService.KVTransferCompatibilityPB.Backend value) {
+        return switch (value) {
+            case BACKEND_CACHE_STORE_RDMA_V1 -> "cache-store-rdma-v1";
+            case BACKEND_CACHE_STORE_TCP_V1 -> "cache-store-tcp-v1";
+            default -> "";
+        };
+    }
+
+    private static String convertKeyFormat(EngineRpcService.KVTransferCompatibilityPB.KeyFormat value) {
+        return switch (value) {
+            case KEY_FORMAT_MODEL_TOKEN_LAYER_TAG_V1 -> "model-token-layer-tag-v1";
+            default -> "";
+        };
+    }
+
+    private static String convertProducerLayout(EngineRpcService.KVTransferCompatibilityPB.ProducerLayout value) {
+        return switch (value) {
+            case PRODUCER_LAYOUT_TP -> "tp";
+            case PRODUCER_LAYOUT_CP_REPLICATED -> "cp-replicated";
+            case PRODUCER_LAYOUT_CP_SHARDED -> "cp-sharded";
+            default -> "";
+        };
+    }
+
+    private static String convertCacheKind(EngineRpcService.KVTransferGroupPB.CacheKind value) {
+        return switch (value) {
+            case CACHE_KIND_MULTI_HEAD_ATTENTION -> "MultiHeadAttention";
+            case CACHE_KIND_MULTI_HEAD_LATENT_ATTENTION -> "MultiHeadLatentAttention";
+            case CACHE_KIND_LINEAR_ATTENTION -> "LinearAttention";
+            case CACHE_KIND_OPAQUE_KV -> "OpaqueKV";
+            case CACHE_KIND_OPAQUE_STATE -> "OpaqueState";
+            default -> "";
+        };
+    }
+
+    private static String convertDType(EngineRpcService.KVTransferGroupPB.DType value) {
+        return switch (value) {
+            case DTYPE_FP16 -> "fp16";
+            case DTYPE_BF16 -> "bf16";
+            case DTYPE_FP32 -> "fp32";
+            case DTYPE_FP64 -> "fp64";
+            case DTYPE_INT8 -> "int8";
+            case DTYPE_UINT8 -> "uint8";
+            case DTYPE_INT16 -> "int16";
+            case DTYPE_UINT16 -> "uint16";
+            case DTYPE_INT32 -> "int32";
+            case DTYPE_UINT32 -> "uint32";
+            case DTYPE_INT64 -> "int64";
+            case DTYPE_UINT64 -> "uint64";
+            case DTYPE_FP8_E4M3 -> "fp8_e4m3";
+            case DTYPE_FP8_E8M0 -> "fp8_e8m0";
+            default -> "";
+        };
+    }
+
+    private static String convertFraming(EngineRpcService.KVTransferGroupPB.Framing value) {
+        return switch (value) {
+            case FRAMING_KV -> "kv";
+            case FRAMING_SPLIT -> "split";
+            default -> "";
+        };
     }
 
     /**

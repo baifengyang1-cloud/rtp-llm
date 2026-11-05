@@ -32,6 +32,45 @@ def _jit_env(**values):
 
 
 class ServerConfigPortLayoutTest(TestCase):
+    @patch(
+        "rtp_llm.config.server_config_setup.fetch_remote_file_to_local",
+        side_effect=lambda path: "/local" + path,
+    )
+    def test_component_identities_survive_localization_independently(self, fetch):
+        from rtp_llm.config.server_config_setup import fetch_model_files_to_local
+
+        configs = PyEnvConfigs()
+        configs.model_args.ckpt_path = "/target"
+        configs.vit_config.extra_data_path = "/vision"
+        configs.sp_config.checkpoint_path = "/draft"
+        fetch_model_files_to_local(configs)
+        self.assertEqual(configs.model_args.model_identity, "/target")
+        self.assertEqual(configs.vit_config.model_identity, "/vision")
+        self.assertEqual(configs.sp_config.model_identity, "/draft")
+        self.assertEqual(configs.model_args.ckpt_path, "/local/target")
+        self.assertEqual(configs.sp_config.checkpoint_path, "/local/draft")
+        fetch_model_files_to_local(configs)
+        self.assertEqual(configs.model_args.model_identity, "/target")
+        self.assertEqual(configs.vit_config.model_identity, "/vision")
+        self.assertEqual(configs.sp_config.model_identity, "/draft")
+
+    @patch(
+        "rtp_llm.config.server_config_setup.fetch_remote_file_to_local",
+        side_effect=lambda path: "/local" + path,
+    )
+    def test_explicit_component_identities_and_shared_checkpoint(self, fetch):
+        from rtp_llm.config.server_config_setup import fetch_model_files_to_local
+
+        configs = PyEnvConfigs()
+        configs.model_args.ckpt_path = "/combined"
+        configs.model_args.model_identity = "target-v2"
+        configs.sp_config.model_identity = "draft-v1"
+        configs.sp_config.checkpoint_path = "/draft"
+        fetch_model_files_to_local(configs)
+        self.assertEqual(configs.model_args.model_identity, "target-v2")
+        self.assertEqual(configs.vit_config.model_identity, "/combined")
+        self.assertEqual(configs.sp_config.model_identity, "draft-v1")
+
     def test_dash_sc_rejects_legacy_stride_eight(self):
         config = ServerConfig()
         config.worker_info_port_num = 8

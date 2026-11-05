@@ -465,7 +465,7 @@ final class AutoTpmE2EHarness implements AutoCloseable {
                 new DecodeSelector(workers),
                 new RandomStrategy(workers),
                 configService,
-                modelMeta);
+                modelMeta, workers);
     }
 
     private static ServerStatus server(

@@ -32,6 +32,7 @@ import java.util.BitSet;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.LongPredicate;
 
 @Component
 public class CostBasedPrefillStrategy {
@@ -56,11 +57,16 @@ public class CostBasedPrefillStrategy {
             BalanceContext balanceContext,
             RoleType roleType,
             String group) {
+        return select(balanceContext, roleType, group, ignored -> true);
+    }
+
+    public PlacementResult<SelectedRole, RoleType> select(
+            BalanceContext balanceContext, RoleType roleType, String group, LongPredicate eligible) {
         long requestId = balanceContext.getRequestId();
         long seqLen = balanceContext.getRequest().getSeqLen();
         FlexlbConfig config = balanceContext.getConfig();
 
-        EndpointDiscovery discovery = discoverAvailableEndpoints(balanceContext, roleType, group);
+        EndpointDiscovery discovery = discoverAvailableEndpoints(balanceContext, roleType, group, eligible);
         if (discovery.candidates().isEmpty()) {
             Logger.debug("Prefill select failed: no admission capacity, request_id={}",
                     requestId);
@@ -180,6 +186,19 @@ public class CostBasedPrefillStrategy {
             case UNSPECIFIED -> Response.error(StrategyErrorType.ADMISSION_UNAVAILABLE);
         };
         return blockedWithDiagnostics(failure, role, workerCount, Map.of("observedRequests", observedRequestCount));
+    }
+
+    /** Read the existing placement gate without scoring, rotating or pinning a worker. */
+    public static boolean eligible(BalanceContext context, PrefillEndpoint endpoint) {
+        return endpoint.canAcceptRequest() || context.getConfig().allowsPreemption(VictimStage.PREFILL_QUEUED)
+                && endpoint.canPreemptQueuedRequest(context.getPriority());
+    }
+
+    public PlacementResult<SelectedRole, RoleType> unavailable(
+            BalanceContext context, RoleType role, String group, LongPredicate scope) {
+        return classifyAdmissionFailure(workerDirectory.prefillRoutingSnapshot(role).stream()
+                .filter(entry -> scope.test(entry.endpoint().getStatus().getGenerationId())).toList(),
+                context.getPriority(), role, group);
     }
 
     private static PlacementResult<SelectedRole, RoleType> blockedWithDiagnostics(
@@ -450,20 +469,19 @@ public class CostBasedPrefillStrategy {
     private EndpointDiscovery discoverAvailableEndpoints(
             BalanceContext context,
             RoleType roleType,
-            String group) {
+            String group, LongPredicate eligible) {
         List<EndpointRegistry.PrefillRoutingEntry> directory =
-                workerDirectory.prefillRoutingSnapshot(roleType);
+                workerDirectory.prefillRoutingSnapshot(roleType).stream()
+                        .filter(entry -> eligible.test(entry.endpoint().getStatus().getGenerationId())).toList();
         List<EndpointRegistry.PrefillRoutingEntry> matching = new ArrayList<>();
         int registered = 0;
-        boolean preemptQueued = context.getConfig().allowsPreemption(VictimStage.PREFILL_QUEUED);
         for (EndpointRegistry.PrefillRoutingEntry entry : directory) {
             PrefillEndpoint endpoint = entry.endpoint();
             if (group != null && !group.equals(endpoint.getStatus().topologySnapshot().group())) {
                 continue;
             }
             registered++;
-            if (endpoint.canAcceptRequest()
-                    || preemptQueued && endpoint.canPreemptQueuedRequest(context.getPriority())) {
+            if (eligible(context, endpoint)) {
                 matching.add(entry);
             }
         }
@@ -505,8 +523,18 @@ public class CostBasedPrefillStrategy {
         long blockSize = request.getCacheKeyBlockSize();
         WorkerStatus status = ep.getStatus();
         CacheStatus cacheStatus = status == null ? null : status.getCacheStatus();
-        if (blockSize <= 0L && cacheStatus != null) {
-            blockSize = cacheStatus.getBlockSize();
+        long workerBlockSize = cacheStatus == null ? 0L : cacheStatus.getBlockSize();
+        if (workerBlockSize <= 0L && status != null && status.compatibility() != null
+                && status.compatibility().transfer() != null) {
+            var transfer = status.compatibility().transfer();
+            if (transfer.producerCpSize() > 1) { return CacheTokenMatch.NONE; }
+            workerBlockSize = transfer.baseBlockTokens();
+        }
+        if (blockSize > 0L && workerBlockSize > 0L && blockSize != workerBlockSize) {
+            return CacheTokenMatch.NONE;
+        }
+        if (blockSize <= 0L) {
+            blockSize = workerBlockSize;
         }
         if (blockSize <= 0L) {
             return CacheTokenMatch.NONE;

@@ -64,6 +64,11 @@ public interface FlexMonitor extends AutoCloseable {
         // No-op by default.
     }
 
+    /** Retire one tagged series and release any backend registration/cache it owns. */
+    default void remove(String metricName, FlexMetricTags metricsTags) {
+        // Sampling backends need no persistent series registration.
+    }
+
     @Override
     default void close() {
         // No-op by default.

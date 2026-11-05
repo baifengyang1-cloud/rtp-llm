@@ -209,7 +209,7 @@ class SchedulingErrorCodeMatrixTest {
             assertFailure(fixture.route(missing), 8406, UNSPECIFIED, "missing serialized generate_input");
             BalanceContext malformed = fixture.context();
             malformed.setGenerateInputPb(ByteString.copyFrom(new byte[]{(byte) 0xff}));
-            assertFailure(fixture.route(malformed), 8510, UNSPECIFIED, "build");
+            assertFailure(fixture.route(malformed), 8510, UNSPECIFIED, "protocol message");
             assertTrue(fixture.harness.engineArrivalOrder.isEmpty());
         }
     }

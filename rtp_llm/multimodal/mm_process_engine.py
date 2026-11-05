@@ -654,6 +654,11 @@ class MMProcessEngine:
         self.server_id = server_id
         self.vit_config = vit_config
         self.is_proxy_mode = is_proxy_mode
+        self.compatibility_vision_identity = model_config.vision_model_identity
+        self.compatibility_embedding_contract = (
+            f"tensor-v1:{model_config.hidden_size}:{model_config.data_type.name.removeprefix('TYPE_').lower()}:"
+            f"{model_config.mm_model_config.mm_position_ids_style}"
+        )
         # The CUDA device this engine's weights live on; handed to the scheduler
         # so its background thread pins the right device before every forward.
         self.device = device

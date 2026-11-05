@@ -1,0 +1,66 @@
+schema_version: 1
+target_identity: "target"
+kv_transfer {
+  backend: BACKEND_CACHE_STORE_RDMA_V1
+  key_format: KEY_FORMAT_MODEL_TOKEN_LAYER_TAG_V1
+  tp_size: 1
+  producer_cp_size: 1
+  base_block_tokens: 64
+  groups {
+    tag: "target/full"
+    layers: 2
+    layers: 3
+    cache_kind: CACHE_KIND_MULTI_HEAD_ATTENTION
+    dtype: DTYPE_BF16
+    framing: FRAMING_KV
+    block_tokens: 64
+    kernel_block_tokens: 64
+    local_kv_heads: 12
+    wire_bytes: 196608
+    wire_bytes: 0
+    wire_bytes: 0
+    wire_bytes: 0
+    projection: "model=0;base=64;group=1;tail=0;validate_tail=1;mapping=0;slice=0;hybrid=1"
+    representation: "kv-v1;head_dim=64"
+  }
+  groups {
+    tag: "target/linear"
+    layers: 0
+    layers: 1
+    cache_kind: CACHE_KIND_LINEAR_ATTENTION
+    dtype: DTYPE_BF16
+    framing: FRAMING_KV
+    block_tokens: 64
+    kernel_block_tokens: 64
+    local_kv_heads: 2
+    wire_bytes: 352
+    wire_bytes: 0
+    wire_bytes: 0
+    wire_bytes: 0
+    projection: "model=0;base=64;group=0;tail=1;validate_tail=1;mapping=0;slice=0;hybrid=1"
+    representation: "kv-v1;key_head_dim=8;value_head_dim=8;key_heads=2;value_heads=2;conv=2;ssm_dtype=14;conv_dtype=14"
+  }
+  groups {
+    tag: "draft/0/full"
+    layers: 0
+    cache_kind: CACHE_KIND_MULTI_HEAD_ATTENTION
+    dtype: DTYPE_BF16
+    framing: FRAMING_KV
+    block_tokens: 64
+    kernel_block_tokens: 64
+    local_kv_heads: 12
+    wire_bytes: 196608
+    wire_bytes: 0
+    wire_bytes: 0
+    wire_bytes: 0
+    projection: "model=1;base=64;group=1;tail=0;validate_tail=1;mapping=0;slice=0;hybrid=1"
+    representation: "kv-v1;head_dim=64"
+  }
+  worker_tp_size: 1
+  producer_layout: PRODUCER_LAYOUT_TP
+}
+speculative {
+  mode: MODE_MTP
+  draft_identity: "draft"
+  proposal_width: 2
+}

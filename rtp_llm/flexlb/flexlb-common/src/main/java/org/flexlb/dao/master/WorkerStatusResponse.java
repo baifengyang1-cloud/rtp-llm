@@ -15,6 +15,8 @@ import java.util.Map;
 @JsonIgnoreProperties(ignoreUnknown = true)
 @Data
 public class WorkerStatusResponse {
+    @JsonProperty("compatibility")
+    private RoleCompatibility compatibility;
 
     @JsonProperty("role")
     private RoleType role;

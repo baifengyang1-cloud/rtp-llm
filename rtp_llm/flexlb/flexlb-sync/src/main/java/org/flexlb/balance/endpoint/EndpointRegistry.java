@@ -124,6 +124,10 @@ public class EndpointRegistry {
      */
     private volatile List<Map.Entry<String, DecodeEndpoint>> decodeDirectory =
             List.of();
+    private volatile Map<RoleType, List<WorkerEndpoint>> routingTopology = Map.of();
+
+    /** Stable, non-owning generation lists; identity changes on endpoint publication/withdrawal. */
+    public Map<RoleType, List<WorkerEndpoint>> routingTopologySnapshot() { return routingTopology; }
     private final ConfigService configService;
     private final EndpointEventProjector endpointEvents;
     private final BatchSchedulerReporter reporter;
@@ -480,9 +484,6 @@ public class EndpointRegistry {
             BiFunction<String, WorkerEndpoint, WorkerEndpoint> mutation) {
         boolean updatesPrefillDirectory = role != null && role.supportsPrefill();
         boolean updatesDecodeDirectory = role == RoleType.DECODE;
-        if (!updatesPrefillDirectory && !updatesDecodeDirectory) {
-            return endpoints.compute(address, mutation);
-        }
         synchronized (lifecycleGate) {
             WorkerEndpoint exactCurrent = endpoints.get(address);
             WorkerEndpoint next = mutation.apply(address, exactCurrent);
@@ -515,9 +516,18 @@ public class EndpointRegistry {
             });
             if (updatesPrefillDirectory) {
                 publishPrefillDirectory(role, nextPrefillDirectory);
-            } else {
+            } else if (updatesDecodeDirectory) {
                 this.decodeDirectory = nextDecodeDirectory;
             }
+            var topology = new EnumMap<RoleType, List<WorkerEndpoint>>(RoleType.class);
+            topology.putAll(routingTopology);
+            List<WorkerEndpoint> generationList = new ArrayList<>();
+            for (WorkerEndpoint endpoint : routingTopology.getOrDefault(role, List.of())) {
+                if (endpoint != exactCurrent) { generationList.add(endpoint); }
+            }
+            if (next != null && registryPhase == RegistryPhase.OPEN) { generationList.add(next); }
+            topology.put(role, List.copyOf(generationList));
+            routingTopology = Map.copyOf(topology);
             return published;
         }
     }
@@ -794,6 +804,7 @@ public class EndpointRegistry {
                 prefillDirectory = List.of();
                 pdFusionDirectory = List.of();
                 decodeDirectory = List.of();
+                routingTopology = Map.of();
                 closeOwner = true;
             }
             while (registryPhase == RegistryPhase.CLOSING

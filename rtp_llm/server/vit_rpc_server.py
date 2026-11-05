@@ -114,6 +114,8 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
         local_device_id: int = 0,
     ):
         self.engine = mm_process_engine
+        self._status_lock = threading.Lock()
+        self._status_version = 0
         self._transport = create_mm_output_transport(transport_config, local_device_id)
 
     def _register_queue_cancellation(self, request_id: int, context):
@@ -342,8 +344,17 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
     def GetWorkerStatus(self, request: StatusVersionPB, context):
         worker_status = WorkerStatusPB()
         worker_status.role = "VIT"
-        worker_status.status_version = 1
+        with self._status_lock:
+            self._status_version = max(self._status_version + 1, time.time_ns() // 1000)
+            worker_status.status_version = self._status_version
         worker_status.alive = True
+        worker_status.compatibility.schema_version = 1
+        worker_status.compatibility.vision.identity = (
+            self.engine.compatibility_vision_identity
+        )
+        worker_status.compatibility.vision.embedding_contract = (
+            self.engine.compatibility_embedding_contract
+        )
         return worker_status
 
     def GetCacheStatus(self, request: CacheVersionPB, context):

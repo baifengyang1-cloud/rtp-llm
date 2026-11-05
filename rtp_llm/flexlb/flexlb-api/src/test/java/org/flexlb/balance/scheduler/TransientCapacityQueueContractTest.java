@@ -1014,7 +1014,7 @@ class TransientCapacityQueueContractTest {
                             decodeSelector,
                             new RandomStrategy(workers),
                             configService,
-                            modelMeta(prefillFirst)),
+                            modelMeta(prefillFirst), workers),
                     metrics));
         }
 
@@ -1170,7 +1170,7 @@ class TransientCapacityQueueContractTest {
                     mock(DecodeSelector.class),
                     mock(RandomStrategy.class),
                     mock(ConfigService.class),
-                    modelMeta(false));
+                    modelMeta(false), mock(WorkerDirectory.class));
             this.delegate = delegate;
             this.metrics = metrics;
         }

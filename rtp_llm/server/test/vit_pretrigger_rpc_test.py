@@ -7,7 +7,10 @@ import torch
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.py_config_modules import ProfilingDebugLoggingConfig, VitConfig
-from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import MultimodalInputsPB
+from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
+    MultimodalInputsPB,
+    StatusVersionPB,
+)
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import (
     MultimodalRpcServiceStub,
     add_MultimodalRpcServiceServicer_to_server,
@@ -68,6 +71,21 @@ class RejectProvider(GreenNetProvider):
 
 
 class VitPretriggerRpcTest(TestCase):
+    def test_worker_status_has_role_specific_identity_and_advancing_version(self):
+        engine, _ = self._engine()
+        engine.compatibility_vision_identity = "vision-v2"
+        server = MultimodalRpcServer(engine)
+        first = server.GetWorkerStatus(StatusVersionPB(), None)
+        second = server.GetWorkerStatus(StatusVersionPB(), None)
+        self.assertGreaterEqual(second.status_version, first.status_version)
+        self.assertEqual(first.compatibility.vision.identity, "vision-v2")
+        self.assertTrue(
+            first.compatibility.vision.embedding_contract.startswith("tensor-v1:")
+        )
+        self.assertFalse(first.compatibility.HasField("kv_transfer"))
+        self.assertFalse(first.compatibility.HasField("speculative"))
+        self.assertEqual(first.compatibility.target_identity, "")
+
     def setUp(self):
         self.engines = []
         self.servers = []

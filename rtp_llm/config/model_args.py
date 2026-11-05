@@ -17,6 +17,7 @@ class ModelArgs:
 
     __slots__ = [
         "ckpt_path",
+        "model_identity",
         "tokenizer_path",
         "ptuning_path",
         "extra_data_path",
@@ -36,6 +37,7 @@ class ModelArgs:
         """Initialize ModelArgs with default values."""
         # Paths
         self.ckpt_path: str = ""
+        self.model_identity: str = ""
         self.tokenizer_path: str = ""
         self.ptuning_path: str = ""
 

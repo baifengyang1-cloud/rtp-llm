@@ -283,9 +283,12 @@ class PrefillEndpointTest {
     void repackNormalizesInvalidFeatures(long seqLen, long hitCache, long expectedMs) {
         ScheduledRequest survivor = org.mockito.Mockito.spy(createScheduledRequest(1L, 500L, 200L));
         ScheduledRequest finished = createScheduledRequest(2L, 300L, 100L);
+        var features = new AtomicReference<>(List.of(500L, 200L));
+        // Stub before publication, then change features without concurrent Mockito mutation.
+        org.mockito.Mockito.doAnswer(call -> features.get().get(0)).when(survivor).seqLen();
+        org.mockito.Mockito.doAnswer(call -> features.get().get(1)).when(survivor).hitCache();
         registerBatch(endpoint, 1L, 100L, List.of(survivor, finished));
-        org.mockito.Mockito.doReturn(seqLen).when(survivor).seqLen();
-        org.mockito.Mockito.doReturn(hitCache).when(survivor).hitCache();
+        features.set(List.of(seqLen, hitCache));
 
         assertDoesNotThrow(() -> reportRejectedBatchMember(endpoint, 1L, 2L));
         assertEquals(expectedMs, endpoint.captureRouteProjectionInputs().work().totalRemainingWorkMs().orElseThrow());

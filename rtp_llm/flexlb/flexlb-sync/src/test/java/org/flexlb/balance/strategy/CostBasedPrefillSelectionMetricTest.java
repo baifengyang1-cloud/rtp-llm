@@ -328,6 +328,23 @@ class CostBasedPrefillSelectionMetricTest {
         return result.value();
     }
 
+    @ParameterizedTest
+    @CsvSource({"64,128", "128,64"})
+    void heterogeneousBlockHintsDoNotInflateAffinity(long hintBlock, long workerBlock) {
+        var worker = registry.get(RoleType.PREFILL, "10.0.0.1:8080").getStatus();
+        var cacheStatus = new org.flexlb.dao.master.CacheStatus();
+        cacheStatus.setBlockSize(workerBlock);
+        worker.lock.lock();
+        try { worker.publishCacheStatus(cacheStatus); }
+        finally { worker.lock.unlock(); }
+        context.getRequest().setCacheKeyBlockSize(hintBlock);
+        context.getRequest().setBlockCacheKeys(List.of(1L, 2L));
+        when(cache.findMatchingEngines(any(), any(), any())).thenReturn(Map.of(worker.getIpPort(), 2));
+        try (SelectedRole selected = select()) {
+            assertEquals(0L, selected.serverStatus().getDebugInfo().getHitCacheLen());
+        }
+    }
+
     private void configureFocusedAffinity() {
         RoutingConfig.CacheAffinityConfig affinity =
                 new RoutingConfig.CacheAffinityConfig();

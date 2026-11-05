@@ -137,7 +137,11 @@ public class WorkerStatus {
     /** The single public value for one successfully committed status round. */
     public record CommittedWorkerStatus(
             EngineObservation fields,
-            AppliedStatusCursor cursor) {
+            AppliedStatusCursor cursor,
+            RoleCompatibility compatibility) {
+        public CommittedWorkerStatus(EngineObservation fields, AppliedStatusCursor cursor) {
+            this(fields, cursor, null);
+        }
     }
 
     /**
@@ -174,6 +178,7 @@ public class WorkerStatus {
         private final Long statusVersion;
         private final Long latestFinishedVersion;
         private final Map<String, TaskObservation> finishedTasks;
+        private final RoleCompatibility compatibility;
 
         private StatusObservation(
                 WorkerStatus owner,
@@ -181,14 +186,18 @@ public class WorkerStatus {
                 boolean reportedAlive,
                 Long statusVersion,
                 Long latestFinishedVersion,
-                Map<String, TaskObservation> finishedTasks) {
+                Map<String, TaskObservation> finishedTasks,
+                RoleCompatibility compatibility) {
             this.owner = owner;
             this.engine = engine;
             this.reportedAlive = reportedAlive;
             this.statusVersion = statusVersion;
             this.latestFinishedVersion = latestFinishedVersion;
             this.finishedTasks = finishedTasks;
+            this.compatibility = compatibility;
         }
+
+        public RoleCompatibility compatibility() { return compatibility; }
 
         /** Exact service-discovery generation which issued this observation. */
         public WorkerStatus owner() {
@@ -367,6 +376,10 @@ public class WorkerStatus {
         return committedStatus.get().cursor();
     }
 
+    public RoleCompatibility compatibility() {
+        return committedStatus.get().compatibility();
+    }
+
     /**
      * Deep-freeze one RPC response. Finished tasks remain response-local and
      * are never copied into the committed Engine observation.
@@ -399,7 +412,8 @@ public class WorkerStatus {
                 response.isAlive(),
                 response.getStatusVersion(),
                 response.getLatestFinishedVersion(),
-                finishedTasks);
+                finishedTasks,
+                response.getCompatibility());
     }
 
     /** Bind an already immutable protocol conversion to this exact generation. */
@@ -409,6 +423,12 @@ public class WorkerStatus {
             Long statusVersion,
             Long latestFinishedVersion,
             Map<String, TaskObservation> finishedTasks) {
+        return bindStatusObservation(engine, reportedAlive, statusVersion, latestFinishedVersion, finishedTasks, null);
+    }
+
+    public StatusObservation bindStatusObservation(
+            EngineObservation engine, boolean reportedAlive, Long statusVersion, Long latestFinishedVersion,
+            Map<String, TaskObservation> finishedTasks, RoleCompatibility compatibility) {
         return new StatusObservation(
                 this,
                 Objects.requireNonNull(engine, "engine"),
@@ -416,7 +436,7 @@ public class WorkerStatus {
                 statusVersion,
                 latestFinishedVersion,
                 finishedTasks == null || finishedTasks.isEmpty()
-                        ? Map.of() : Map.copyOf(finishedTasks));
+                        ? Map.of() : Map.copyOf(finishedTasks), compatibility);
     }
 
     /** Bind a strictly newer frozen observation to the current commit holder. */
@@ -428,6 +448,11 @@ public class WorkerStatus {
                     "status observation belongs to another worker generation");
         }
         CommittedWorkerStatus current = committedStatus.get();
+        if (observation.compatibility() != null) { observation.compatibility().validate(observation.role()); }
+        if (current.cursor().statusVersion() >= 0L
+                && !Objects.equals(current.compatibility(), observation.compatibility())) {
+            throw new IllegalArgumentException("compatibility identity changed within a worker generation");
+        }
         Long responseVersion = observation.statusVersion();
         if (responseVersion == null || responseVersion <= 0L
                 || responseVersion <= current.cursor().statusVersion()) {
@@ -443,7 +468,7 @@ public class WorkerStatus {
         return new PreparedStatus(
                 current,
                 observation,
-                new CommittedWorkerStatus(observation.engine(), cursor));
+                new CommittedWorkerStatus(observation.engine(), cursor, observation.compatibility()));
     }
 
     /**
@@ -557,8 +582,8 @@ public class WorkerStatus {
     public void updateDiscoveryLabels(String site, String group) {
         requireGenerationLock();
         requireActiveGeneration();
-        topology.updateAndGet(current -> new TopologySnapshot(
-                group, current.ip(), current.port(), current.grpcPort(), site));
+        topology.updateAndGet(current -> Objects.equals(group, current.group()) && Objects.equals(site, current.site())
+                ? current : new TopologySnapshot(group, current.ip(), current.port(), current.grpcPort(), site));
     }
 
     public RoleType getRole() {

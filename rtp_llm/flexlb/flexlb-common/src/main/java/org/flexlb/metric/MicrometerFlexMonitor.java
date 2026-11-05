@@ -157,6 +157,18 @@ public class MicrometerFlexMonitor implements FlexMonitor {
         }
     }
 
+    @Override
+    public void remove(String metricName, FlexMetricTags metricsTags) {
+        MetricKey key = new MetricKey(METRIC_PREFIX + metricName, metricsTags);
+        GaugeEntry gauge = gaugeCache.remove(key);
+        if (gauge != null) { meterRegistry.remove(gauge.gauge()); }
+        Counter counter = counterCache.remove(key);
+        if (counter != null) { meterRegistry.remove(counter); }
+        Timer timer = timerCache.remove(key);
+        if (timer != null) { meterRegistry.remove(timer); }
+        if (metricsTags != null) { tagsCache.remove(metricsTags); }
+    }
+
     private Tags resolveTags(FlexMetricTags metricsTags) {
         return (metricsTags == null || metricsTags.isEmpty())
                 ? Tags.empty()

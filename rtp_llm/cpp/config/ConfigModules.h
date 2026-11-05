@@ -363,6 +363,7 @@ struct SpeculativeExecutionConfig {
     bool            force_score_context_attention = true;
     std::string     quantization                  = "";
     std::string     checkpoint_path               = "";
+    std::string     model_identity                = "";
     // DSpARK noise/mask token used to build each fixed-width draft block.
     // Filled from the draft checkpoint by ModelFactory.
     int64_t sp_dspark_mask_token_id = -1;

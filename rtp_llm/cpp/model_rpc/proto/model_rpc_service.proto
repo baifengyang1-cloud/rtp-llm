@@ -592,6 +592,116 @@ message UpdateWeightsRequestPB {
     string method = 3;
 }
 
+// A descriptor describes the effective producer/consumer contract, not a release
+// or a local allocation fingerprint. Absence is reserved for legacy workers.
+// These new, unreleased descriptors use enums for closed vocabularies. Replacing
+// their earlier string fields changes wire types: deploy Engine, ViT and FlexLB
+// from the same schema. Unspecified and unknown enum values are invalid metadata.
+message RoleCompatibilityPB {
+    uint32 schema_version = 1;
+    string target_identity = 2;
+    VisionCompatibilityPB vision = 3;
+    KVTransferCompatibilityPB kv_transfer = 4;
+    SpeculativeCompatibilityPB speculative = 5;
+}
+
+message VisionCompatibilityPB {
+    string identity = 1;
+    // Embedding tensor and position-id ABI shared by ViT and its consumers.
+    string embedding_contract = 2;
+}
+
+message SpeculativeCompatibilityPB {
+    enum Mode {
+        MODE_UNSPECIFIED = 0;
+        MODE_NONE = 1;
+        MODE_VANILLA = 2;
+        MODE_MTP = 3;
+        MODE_EAGLE3 = 4;
+        MODE_EAGLE = 5;
+        MODE_DETERMINISTIC = 6;
+        MODE_DSPARK = 7;
+    }
+    Mode mode = 1;
+    string draft_identity = 2;
+    uint32 proposal_width = 3;
+}
+
+message KVTransferCompatibilityPB {
+    enum Backend {
+        BACKEND_UNSPECIFIED = 0;
+        BACKEND_CACHE_STORE_RDMA_V1 = 1;
+        BACKEND_CACHE_STORE_TCP_V1 = 2;
+    }
+    enum KeyFormat {
+        KEY_FORMAT_UNSPECIFIED = 0;
+        KEY_FORMAT_MODEL_TOKEN_LAYER_TAG_V1 = 1;
+    }
+    enum ProducerLayout {
+        PRODUCER_LAYOUT_UNSPECIFIED = 0;
+        PRODUCER_LAYOUT_TP = 1;
+        PRODUCER_LAYOUT_CP_REPLICATED = 2;
+        PRODUCER_LAYOUT_CP_SHARDED = 3;
+    }
+    Backend backend = 1;
+    KeyFormat key_format = 2;
+    uint64 model_id = 3;
+    uint32 tp_size = 4;
+    // Actual producer CP size on P; expected producer CP size on D.
+    uint32 producer_cp_size = 5;
+    uint32 base_block_tokens = 6;
+    repeated KVTransferGroupPB groups = 7;
+    uint32 worker_tp_size = 8;
+    // P's effective layout, or D's expected P layout: tp/cp-replicated/cp-sharded.
+    ProducerLayout producer_layout = 9;
+}
+
+message KVTransferGroupPB {
+    enum CacheKind {
+        CACHE_KIND_UNSPECIFIED = 0;
+        CACHE_KIND_MULTI_HEAD_ATTENTION = 1;
+        CACHE_KIND_MULTI_HEAD_LATENT_ATTENTION = 2;
+        CACHE_KIND_LINEAR_ATTENTION = 3;
+        CACHE_KIND_OPAQUE_KV = 4;
+        CACHE_KIND_OPAQUE_STATE = 5;
+    }
+    enum DType {
+        DTYPE_UNSPECIFIED = 0;
+        DTYPE_FP16 = 1;
+        DTYPE_BF16 = 2;
+        DTYPE_FP32 = 3;
+        DTYPE_FP64 = 4;
+        DTYPE_INT8 = 5;
+        DTYPE_UINT8 = 6;
+        DTYPE_INT16 = 7;
+        DTYPE_UINT16 = 8;
+        DTYPE_INT32 = 9;
+        DTYPE_UINT32 = 10;
+        DTYPE_INT64 = 11;
+        DTYPE_UINT64 = 12;
+        DTYPE_FP8_E4M3 = 13;
+        DTYPE_FP8_E8M0 = 14;
+    }
+    enum Framing {
+        FRAMING_UNSPECIFIED = 0;
+        FRAMING_KV = 1;
+        FRAMING_SPLIT = 2;
+    }
+    string tag = 1;
+    repeated uint32 layers = 2;
+    CacheKind cache_kind = 3;
+    DType dtype = 4;
+    Framing framing = 5;
+    uint32 block_tokens = 6;
+    uint32 kernel_block_tokens = 7;
+    uint32 local_kv_heads = 8;
+    // Wire bytes per layer: K/V and K/V scales, or whole KV/0 and scale/0.
+    // D reports the size of each expected peer slice, before TP partitioning.
+    repeated uint64 wire_bytes = 9;
+    string projection = 10;
+    string representation = 11;
+}
+
 message WorkerStatusPB {
     string role = 1;              // 字符串角色名，如 "PREFILL"，向后兼容
     // LocalRpcServer::GetWorkerStatus currently does not populate this field, so
@@ -620,6 +730,7 @@ message WorkerStatusPB {
     // avoid constructing a group that the Engine can never admit.
     int64 max_seq_len = 21;
     int64 max_batch_tokens_size = 22;
+    RoleCompatibilityPB compatibility = 23;
 }
 
 message EmbeddingInputPB {

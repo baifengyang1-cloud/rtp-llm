@@ -338,6 +338,7 @@ class VitConfig:
     DEFAULT_MM_VIDEO_MAX_FILE_SIZE_KB: int = 2 * 1024 * 1024
 
     def __init__(self):
+        self.model_identity: str = ""
         self.vit_separation: VitSeparation = VitSeparation.VIT_SEPARATION_LOCAL
         self.vit_trt: int = 0
         self.trt_cache_enabled: int = 0

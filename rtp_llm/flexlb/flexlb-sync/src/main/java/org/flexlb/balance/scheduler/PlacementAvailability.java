@@ -112,6 +112,9 @@ public final class PlacementAvailability {
     }
 
     long lastChangedSequence(PlacementKey key) {
+        if (!key.alternatives().isEmpty()) {
+            return key.alternatives().stream().mapToLong(this::lastChangedSequence).max().orElse(0L);
+        }
         return lastChanged.getOrDefault(key, 0L);
     }
 

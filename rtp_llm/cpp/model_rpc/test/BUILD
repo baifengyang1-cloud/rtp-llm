@@ -37,6 +37,7 @@ py_test (
 )
 
 test_deps = [
+    "//rtp_llm/cpp/cache:cache_core",
     "//rtp_llm/cpp/testing:device_test_utils",
     "//rtp_llm/cpp/models:models",
     "//rtp_llm/cpp/config:config_modules",
@@ -46,6 +47,7 @@ test_deps = [
     "//rtp_llm/cpp/testing:test_log_capture",
     "@com_google_googletest//:gtest",
     "@com_google_googletest//:gtest_main",
+    "@com_google_protobuf//:protobuf",
     "@havenask//aios/autil:base64",
     "@havenask//aios/autil:zlib",
 ] + torch_deps() + device_impl_target() + cuda13_torch_link_deps
@@ -68,7 +70,8 @@ test_deps = [
 
 cc_test(
     name = "local_rpc_server_test",
-    srcs = ["LocalRpcServerTest.cc"],
+    srcs = ["LocalRpcServerTest.cc", "RoleCompatibilityFixtures.h"],
+    data = glob(["testdata/compatibility/*.pbtxt"]),
     copts = test_copts,
     deps = test_deps,
     env = {},
@@ -131,7 +134,8 @@ cc_test(
 
 cc_test(
     name = "decode_rpc_server_test",
-    srcs = ["DecodeRpcServerTest.cc"],
+    srcs = ["DecodeRpcServerTest.cc", "RoleCompatibilityFixtures.h"],
+    data = glob(["testdata/compatibility/*.pbtxt"]),
     copts = test_copts,
     deps = test_deps,
     env = {},

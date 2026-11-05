@@ -237,14 +237,22 @@ public class VitCacheDirectory {
     }
 
     public synchronized ServerStatus select(BalanceContext ctx, String group) {
-        return select(ctx, group, false);
+        return select(ctx, group, ignored -> true);
+    }
+
+    public synchronized ServerStatus select(BalanceContext ctx, String group, java.util.function.LongPredicate eligible) {
+        return select(ctx, group, false, eligible);
     }
 
     public synchronized ServerStatus selectReplacement(BalanceContext ctx, String group) {
-        return select(ctx, group, true);
+        return selectReplacement(ctx, group, ignored -> true);
     }
 
-    private ServerStatus select(BalanceContext ctx, String group, boolean exactGroup) {
+    public synchronized ServerStatus selectReplacement(BalanceContext ctx, String group, java.util.function.LongPredicate eligible) {
+        return select(ctx, group, true, eligible);
+    }
+
+    private ServerStatus select(BalanceContext ctx, String group, boolean exactGroup, java.util.function.LongPredicate eligible) {
         var keys = ctx.getRequest().getMediaKeys();
         if (keys == null || keys.isEmpty() || keys.size() > 256
                 || keys.stream().anyMatch(k -> k == null || k.isEmpty() || k.length() > 4096)) {
@@ -256,7 +264,8 @@ public class VitCacheDirectory {
         List<WorkerStatus> best = new ArrayList<>();
         MatchScore bestScore = null;
         for (WorkerStatus worker : liveWorkers(RoleType.VIT, group).values()) {
-            if (!available(ctx, worker) || (exactGroup && !Objects.equals(group, worker.getGroup()))) {
+            if (!available(ctx, worker) || !eligible.test(worker.getGenerationId())
+                    || (exactGroup && !Objects.equals(group, worker.getGroup()))) {
                 continue;
             }
             int hashHits = 0;
@@ -308,10 +317,15 @@ public class VitCacheDirectory {
     }
 
     public synchronized ServerStatus validate(BalanceContext ctx, String group) {
+        return validate(ctx, group, ignored -> true);
+    }
+
+    public synchronized ServerStatus validate(BalanceContext ctx, String group, java.util.function.LongPredicate eligible) {
         ServerStatus selected = ctx.getRequest().getSelectedVit();
         WorkerStatus worker = liveWorkers(RoleType.VIT, group)
                 .get(selected.getServerIp() + ":" + selected.getHttpPort());
         if (selected.getRole() != RoleType.VIT || !available(ctx, worker)
+                || !eligible.test(worker.getGenerationId())
                 || selected.getGrpcPort() != CommonUtils.toGrpcPort(worker.getPort())
                 || !Objects.equals(selected.getGroup(), worker.getGroup())) {
             return errorStatus(StrategyErrorType.NO_VIT_WORKER);

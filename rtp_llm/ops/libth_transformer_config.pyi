@@ -1056,6 +1056,8 @@ class ModelConfig:
     add_bias_linear: bool
     attn_config: AttentionConfigs
     ckpt_path: str
+    model_identity: str
+    vision_model_identity: str
     deepseek_mscale_all_dim: float
     deepseek_rope_mscale: float
     embedding_size: int
@@ -1672,6 +1674,7 @@ class SpecialTokens:
         ...
 class SpeculativeExecutionConfig:
     checkpoint_path: str
+    model_identity: str
     force_score_context_attention: bool
     force_stream_sample: bool
     gen_num_per_cycle: int

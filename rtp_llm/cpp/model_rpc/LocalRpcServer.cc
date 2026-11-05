@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
 #include "rtp_llm/cpp/multimodal_processor/MMProcessorConfig.h"
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
+#include "rtp_llm/cpp/model_rpc/RoleCompatibility.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include "rtp_llm/cpp/config/EplbConfig.h"
 #include "rtp_llm/cpp/config/RoleTypes.h"
@@ -156,6 +157,18 @@ grpc::Status LocalRpcServer::init(const EngineInitParams&                       
                                 "running engine init with gil held may cause program hang, please check");
         engine_.reset(new NormalEngine(maga_init_params, std::move(propose_params)));
     }
+    auto        cache_manager        = engine_->getCacheManager();
+    const auto* draft                = propose_maga_init_params_ && propose_maga_init_params_->draftModel() ?
+                                           &propose_maga_init_params_->getEngineInitParams() :
+                                           nullptr;
+    auto        effective_spec       = maga_init_params_.sp_config;
+    effective_spec.type              = propose_maga_init_params_ ? propose_maga_init_params_->sp_type : SP_TYPE_NONE;
+    effective_spec.gen_num_per_cycle = propose_maga_init_params_ ? propose_maga_init_params_->genNumPerCircle() : 1;
+    if (draft != nullptr) {
+        effective_spec.model_identity = draft->model_config_.model_identity;
+    }
+    compatibility_ = makeRoleCompatibility(
+        maga_init_params_, cache_manager ? &cache_manager->cacheConfig() : nullptr, draft, &effective_spec);
     if (mm_kind == MMProcessorKind::LOCAL) {
         mm_processor_.reset(new LocalMultimodalProcessor(mm_process_engine,
                                                          maga_init_params.model_config_.mm_model_config,
@@ -579,6 +592,7 @@ grpc::Status LocalRpcServer::GetWorkerStatus(grpc::ServerContext*   context,
     auto kv_info = engine_->getCacheStatusInfo(-1, false);
     response->set_available_kv_cache(kv_info.available_kv_cache);
     response->set_total_kv_cache(kv_info.total_kv_cache);
+    *response->mutable_compatibility() = compatibility_;
     reportWorkerStatusTime(request_begin_time_us, request_after_ws_time_us);
     return grpc::Status::OK;
 }

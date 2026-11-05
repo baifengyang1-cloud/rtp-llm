@@ -1,0 +1,32 @@
+schema_version: 1
+target_identity: "target"
+kv_transfer {
+  backend: BACKEND_CACHE_STORE_RDMA_V1
+  key_format: KEY_FORMAT_MODEL_TOKEN_LAYER_TAG_V1
+  tp_size: 2
+  producer_cp_size: 4
+  base_block_tokens: 64
+  groups {
+    tag: "target/default"
+    layers: 0
+    layers: 1
+    cache_kind: CACHE_KIND_MULTI_HEAD_ATTENTION
+    dtype: DTYPE_BF16
+    framing: FRAMING_SPLIT
+    block_tokens: 64
+    kernel_block_tokens: 64
+    local_kv_heads: 6
+    wire_bytes: 49152
+    wire_bytes: 49152
+    wire_bytes: 0
+    wire_bytes: 0
+    projection: "model=0;base=64;group=1;tail=0;validate_tail=1;mapping=1;slice=0;hybrid=0"
+    representation: "kv-v1;head_dim=64"
+  }
+  worker_tp_size: 2
+  producer_layout: PRODUCER_LAYOUT_CP_SHARDED
+}
+speculative {
+  mode: MODE_NONE
+  proposal_width: 1
+}

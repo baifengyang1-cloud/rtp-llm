@@ -8,6 +8,8 @@ import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.TreeSet;
 import java.util.function.Consumer;
+import java.util.Set;
+import java.util.HashSet;
 
 /**
  * Capacity-event waiting for the model queue. All methods run under the coordinator lock.
@@ -22,9 +24,10 @@ final class PlacementWaitQueue {
     private final PlacementAvailability availability;
     private final Comparator<GlobalQueueEntry> order;
     private final Map<PlacementKey, Domain> domains = new HashMap<>();
-    private final Map<GlobalQueueEntry, Domain> waiting = new IdentityHashMap<>();
+    private final Map<GlobalQueueEntry, Set<Domain>> waiting = new IdentityHashMap<>();
     private final Map<GlobalQueueEntry, Domain> retrying = new IdentityHashMap<>();
     private final NavigableSet<Domain> ready;
+    private long nextDomainSequence;
 
     PlacementWaitQueue(boolean priorityOrdering, PlacementAvailability availability) {
         this.availability = Objects.requireNonNull(availability, "availability");
@@ -32,7 +35,8 @@ final class PlacementWaitQueue {
         order = priorityOrdering
                 ? Comparator.<GlobalQueueEntry>comparingInt(entry -> entry.priority).reversed().thenComparing(fifo)
                 : fifo;
-        ready = new TreeSet<>((left, right) -> order.compare(left.entries.first(), right.entries.first()));
+        ready = new TreeSet<>(Comparator.<Domain, GlobalQueueEntry>comparing(domain -> domain.entries.first(), order)
+                .thenComparingLong(domain -> domain.sequence));
     }
 
     boolean isWaiting(GlobalQueueEntry entry) {
@@ -42,17 +46,22 @@ final class PlacementWaitQueue {
     /** The only park boundary: do not sleep through an edge published during planning. */
     boolean park(GlobalQueueEntry entry, PlacementKey blocker, long observedSequence) {
         Objects.requireNonNull(blocker, "blocker");
-        if (availability.lastChangedSequence(waitKey(blocker)) > observedSequence) {
+        if (blocker.dependencies().stream().anyMatch(key ->
+                availability.lastChangedSequence(waitKey(key)) > observedSequence)) {
             return false;
         }
         finishRetry(entry, false);
         removeWaiting(entry);
-        PlacementKey key = waitKey(blocker);
-        Domain domain = domains.computeIfAbsent(key, Domain::new);
-        unindex(domain);
-        domain.entries.add(entry);
-        waiting.put(entry, domain);
-        index(domain);
+        Set<Domain> dependencies = new HashSet<>();
+        for (PlacementKey dependency : blocker.dependencies()) {
+            PlacementKey key = waitKey(dependency);
+            Domain domain = domains.computeIfAbsent(key, Domain::new);
+            unindex(domain);
+            domain.entries.add(entry);
+            dependencies.add(domain);
+            index(domain);
+        }
+        waiting.put(entry, dependencies);
         return true;
     }
 
@@ -74,10 +83,10 @@ final class PlacementWaitQueue {
     void resumeReady(int limit, Consumer<GlobalQueueEntry> resume) {
         for (int count = 0; count < limit && !ready.isEmpty(); count++) {
             Domain domain = ready.pollFirst();
-            GlobalQueueEntry entry = domain.entries.pollFirst();
+            GlobalQueueEntry entry = domain.entries.first();
             domain.active = true;
             domain.available = false;
-            waiting.remove(entry);
+            removeWaiting(entry);
             retrying.put(entry, domain);
             // Even completed entries need an owner-side cleanup opportunity.
             resume.accept(entry);
@@ -109,11 +118,13 @@ final class PlacementWaitQueue {
     }
 
     private void removeWaiting(GlobalQueueEntry entry) {
-        Domain domain = waiting.remove(entry);
-        if (domain != null) {
-            unindex(domain);
-            domain.entries.remove(entry);
-            index(domain);
+        Set<Domain> dependencies = waiting.remove(entry);
+        if (dependencies != null) {
+            for (Domain domain : dependencies) {
+                unindex(domain);
+                domain.entries.remove(entry);
+                index(domain);
+            }
         }
     }
 
@@ -148,6 +159,7 @@ final class PlacementWaitQueue {
 
     private final class Domain {
         private final PlacementKey key;
+        private final long sequence = nextDomainSequence++;
         private final NavigableSet<GlobalQueueEntry> entries = new TreeSet<>(order);
         private boolean available;
         private boolean active;

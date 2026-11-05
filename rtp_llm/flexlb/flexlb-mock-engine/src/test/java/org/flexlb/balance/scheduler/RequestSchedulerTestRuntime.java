@@ -220,7 +220,7 @@ public final class RequestSchedulerTestRuntime implements AutoCloseable {
                     new DecodeSelector(workers),
                     new RandomStrategy(workers),
                     configs,
-                    emptyModelMeta());
+                    emptyModelMeta(), workers);
         }
 
         private synchronized void bind(DefaultRouter exactRouter) {
