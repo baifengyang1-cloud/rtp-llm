@@ -715,6 +715,8 @@ class Pipeline(object):
                 mm_inputs=[],
                 generate_config=copy.copy(generate_config),
                 tokenizer=self.tokenizer,
+                batch_group_id=base_request_id,
+                batch_group_size=len(prompts),
             )
             inputs.append(gen_input)
 

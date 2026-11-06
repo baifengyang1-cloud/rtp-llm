@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 from typing import List
+from unittest.mock import AsyncMock, patch
 
 import torch
 from rtp_llm.config.generate_config import GenerateConfig
@@ -61,6 +63,45 @@ class MockTokenizer(BaseTokenizer):
 
 
 class PipelineDecodeTest(unittest.TestCase):
+
+    def test_batch_infer_sets_group_metadata(self):
+        prompts = ["first", "second", "third"]
+        base_request_id = 100
+        outputs = [
+            GenerateOutputs(
+                [GenerateOutput(output_ids=torch.tensor([[1]]), finished=True)]
+            )
+            for _ in prompts
+        ]
+        with (
+            patch.object(MockTokenizer, "__len__", return_value=1000),
+            patch.object(self.tokenizer, "encode", return_value=[1, 2]),
+            patch.object(
+                self.pipeline,
+                "create_generate_config",
+                return_value=GenerateConfig(force_batch=True),
+            ),
+            patch.object(
+                self.pipeline.backend_rpc_server_visitor,
+                "batch_enqueue",
+                new_callable=AsyncMock,
+                return_value=outputs,
+            ) as batch_enqueue,
+        ):
+            responses = asyncio.run(
+                self.pipeline.batch_infer(
+                    prompts, base_request_id, {"force_batch": True}
+                )
+            )
+
+        batch_enqueue.assert_awaited_once()
+        inputs = batch_enqueue.call_args.args[0]
+        self.assertEqual(len(inputs), len(prompts))
+        self.assertEqual(len(responses), len(prompts))
+        for i, inp in enumerate(inputs):
+            self.assertEqual(inp.batch_group_id, base_request_id)
+            self.assertEqual(inp.batch_group_size, len(prompts))
+            self.assertEqual(inp.request_id, base_request_id + i)
 
     def test_batched_terminal_matches_legacy_without_materializing_rows(self):
         from unittest.mock import patch
