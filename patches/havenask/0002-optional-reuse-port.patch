@@ -1,0 +1,40 @@
+diff --git aios/network/anet/transport.cpp aios/network/anet/transport.cpp
+index 1378a95d..fcfdf776 100644
+--- aios/network/anet/transport.cpp
++++ aios/network/anet/transport.cpp
+@@ -250,7 +250,8 @@ IOComponent *Transport::listen(const char *spec,
+                                IServerAdapter *serverAdapter,
+                                int postPacketTimeout,
+                                int maxIdleTime,
+-                               int backlog) {
++                               int backlog,
++                               bool reusePort) {
+     MutexGuard guard(&_stopMutex);
+     if (_stop) {
+         ANET_LOG(SPAM, "Transport(%p) Stoped!", this);
+@@ -266,6 +267,11 @@ IOComponent *Transport::listen(const char *spec,
+     DBGASSERT(socket);
+     socket->setAddrSpec(spec);
+     if (socket->getProtocolType() == (int)SOCK_STREAM) {
++        if (reusePort && !socket->setIntOption(SO_REUSEPORT, 1)) {
++            ANET_LOG(ERROR, "Failed to enable SO_REUSEPORT for %s", spec);
++            delete socket;
++            return NULL;
++        }
+         // TCPAcceptor
+         TCPAcceptor *acceptor =
+             new TCPAcceptor(this, socket, streamer, serverAdapter, postPacketTimeout, maxIdleTime, backlog);
+diff --git aios/network/anet/transport.h aios/network/anet/transport.h
+index 09b3636f..a7c379b6 100644
+--- aios/network/anet/transport.h
++++ aios/network/anet/transport.h
+@@ -179,7 +179,8 @@ public:
+                         IServerAdapter *serverAdapter,
+                         int postPacketTimeout = DEFAULT_POSTPACKET_TIMEOUT,
+                         int maxIdleTime = MAX_IDLE_TIME_IN_MILLSECONDS,
+-                        int backlog = LISTEN_BACKLOG);
++                        int backlog = LISTEN_BACKLOG,
++                        bool reusePort = false);
+
+     /**
+      * connect to server at address spec
