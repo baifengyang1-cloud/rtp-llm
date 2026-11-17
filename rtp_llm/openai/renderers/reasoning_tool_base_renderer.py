@@ -498,9 +498,9 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                     collected_deltas.append(token_delta)
             return collected_deltas, normalizer_yielded
 
-        # Non-streaming: accumulate all text first, then process once
-        all_text = "".join(
-            normalizer.normalize_tokens(status.prev_token_id, new_token_ids)
+        # Non-streaming outputs do not need token-by-token detector input.
+        all_text = normalizer.normalize_non_streaming_tokens(
+            status.prev_token_id, new_token_ids
         )
         if not all_text:
             return [], False

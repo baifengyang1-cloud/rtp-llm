@@ -84,6 +84,22 @@ class TokenNormalizer:
         """
         self.tokenizer = tokenizer
 
+    def normalize_non_streaming_tokens(
+        self, prev_token_ids: List[int], new_token_ids: List[int]
+    ) -> str:
+        """Decode a complete output once, retaining legacy handling at boundaries."""
+        if not new_token_ids:
+            return ""
+
+        if not prev_token_ids:
+            decoded = self.tokenizer.decode(new_token_ids)
+            if "\ufffd" not in decoded:
+                return decoded
+
+        # Context and replacement characters need the existing UTF-8 recovery
+        # semantics. Complete non-streaming outputs normally have neither.
+        return "".join(self.normalize_tokens(prev_token_ids, new_token_ids))
+
     def normalize_tokens(
         self, prev_token_ids: List[int], new_token_ids: List[int]
     ) -> Generator[str, None, None]:

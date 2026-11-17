@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Optional
 from unittest import IsolatedAsyncioTestCase, main
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -24,7 +25,67 @@ from rtp_llm.openai.renderers.sglang_helpers.reasoning_parser import (
     Qwen3Detector,
     ReasoningParser,
 )
+from rtp_llm.openai.renderers.sglang_helpers.token_normalizer import TokenNormalizer
 from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput
+
+
+class ProcessNormalizedTokensTest(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.renderer = Mock()
+        self.renderer._process_single_token_delta = AsyncMock(return_value="delta")
+        self.tokenizer = Mock()
+        self.tokenizer.decode.side_effect = lambda ids: "".join(chr(t) for t in ids)
+        self.normalizer = TokenNormalizer(self.tokenizer)
+        self.status = SimpleNamespace(prev_token_id=[])
+
+    async def test_non_streaming_long_response_is_decoded_once(self):
+        text = (
+            '<think>分析</think>{"intent":"可乐 薯片 😀","text":"'
+            + "正文 " * 1000
+            + '"}'
+        )
+        token_ids = [ord(c) for c in text]
+
+        result = await ReasoningToolBaseRenderer._process_normalized_tokens(
+            self.renderer, self.normalizer, self.status, token_ids, None, [], [], False
+        )
+
+        self.assertEqual(result, (["delta"], True))
+        self.tokenizer.decode.assert_called_once_with(token_ids)
+        self.renderer._process_single_token_delta.assert_awaited_once_with(
+            self.status, text, None, [], [], is_streaming=False
+        )
+
+    async def test_non_streaming_empty_response_does_not_emit_delta(self):
+        result = await ReasoningToolBaseRenderer._process_normalized_tokens(
+            self.renderer, self.normalizer, self.status, [], None, [], [], False
+        )
+
+        self.assertEqual(result, ([], False))
+        self.tokenizer.decode.assert_not_called()
+        self.renderer._process_single_token_delta.assert_not_awaited()
+
+    async def test_streaming_still_emits_individual_token_deltas(self):
+        text = "ABC"
+        result = await ReasoningToolBaseRenderer._process_normalized_tokens(
+            self.renderer,
+            self.normalizer,
+            self.status,
+            [ord(c) for c in text],
+            None,
+            [],
+            [],
+            True,
+        )
+
+        self.assertEqual(result, (["delta"] * 3, True))
+        self.assertEqual(
+            [
+                args.args[1]
+                for args in self.renderer._process_single_token_delta.await_args_list
+            ],
+            list(text),
+        )
 
 
 class ProcessReasoningAndToolCallsTest(IsolatedAsyncioTestCase):
