@@ -222,6 +222,64 @@ class TestSimpleTokenizer(unittest.TestCase):
         self.assertEqual(deltas[1], "D")
 
 
+class TestNonStreamingTokenNormalizer(unittest.TestCase):
+    def test_complete_long_output_is_decoded_once(self):
+        tokenizer = Mock()
+        tokenizer.decode.side_effect = lambda ids: "".join(chr(t) for t in ids)
+        text = '{"intent":"可乐 薯片 😀","content":"' + "正文 " * 1000 + '"}'
+        token_ids = [ord(c) for c in text]
+
+        result = TokenNormalizer(tokenizer).normalize_non_streaming_tokens(
+            [], token_ids
+        )
+
+        self.assertEqual(result, text)
+        tokenizer.decode.assert_called_once_with(token_ids)
+
+    def test_complete_multibyte_tokens_are_decoded_together(self):
+        tokenizer = Mock(wraps=MockTokenizer())
+        token_ids = [1, 2, 3, 4, 5, 6, 7]
+
+        result = TokenNormalizer(tokenizer).normalize_non_streaming_tokens(
+            [], token_ids
+        )
+
+        self.assertEqual(result, "Hello 你好")
+        tokenizer.decode.assert_called_once_with(token_ids)
+
+    def test_empty_output_does_not_decode(self):
+        tokenizer = Mock()
+
+        result = TokenNormalizer(tokenizer).normalize_non_streaming_tokens([1], [])
+
+        self.assertEqual(result, "")
+        tokenizer.decode.assert_not_called()
+
+    def test_incomplete_tail_keeps_legacy_recovery(self):
+        normalizer = TokenNormalizer(MockTokenizer())
+        token_ids = [1, 2, 3]
+
+        result = normalizer.normalize_non_streaming_tokens([], token_ids)
+
+        self.assertEqual(result, "Hello ")
+        self.assertEqual(result, "".join(normalizer.normalize_tokens([], token_ids)))
+
+    def test_existing_context_keeps_legacy_offsets(self):
+        cases = [
+            ([1], [2, 3, 4, 5, 6, 7]),
+            ([2], [3, 4]),
+            ([4, 1], [1, 1]),
+            ([4, 1, 2], [3, 4]),
+        ]
+        normalizer = TokenNormalizer(MockTokenizer())
+        for prev_tokens, new_tokens in cases:
+            with self.subTest(prev_tokens=prev_tokens, new_tokens=new_tokens):
+                self.assertEqual(
+                    normalizer.normalize_non_streaming_tokens(prev_tokens, new_tokens),
+                    "".join(normalizer.normalize_tokens(prev_tokens, new_tokens)),
+                )
+
+
 def _get_qwen_tokenizer():
     """
     Get Qwen tokenizer with fallback chain for CI compatibility.
@@ -287,6 +345,25 @@ class TestTokenNormalizerWithQwen(unittest.TestCase):
         """Load Qwen tokenizer with fallbacks."""
         self.tokenizer = _get_qwen_tokenizer()
         self.tokenizer_available = self.tokenizer is not None
+
+    def test_non_streaming_matches_complete_decode(self):
+        if not self.tokenizer_available:
+            self.skipTest("Qwen tokenizer not available")
+
+        texts = [
+            '{"intent":"可乐 薯片 饼干","emoji":"😀"}',
+            "<think>分析</think>  正文。\n",
+            "正文 " * 1000,
+        ]
+        for text in texts:
+            with self.subTest(text_length=len(text)):
+                token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+                tokenizer = Mock(wraps=self.tokenizer)
+                result = TokenNormalizer(tokenizer).normalize_non_streaming_tokens(
+                    [], token_ids
+                )
+                self.assertEqual(result, self.tokenizer.decode(token_ids))
+                tokenizer.decode.assert_called_once_with(token_ids)
 
     def test_single_token_streaming_preserves_spaces(self):
         """
