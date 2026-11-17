@@ -576,8 +576,29 @@ py_library(
 )
 
 py_library(
+    name = "frontend_model_config",
+    # HTTP and DashSc workers resolve model classes to construct ModelConfig.
+    # Package their Python definitions without the GPU execution dependencies
+    # of :models; GPU model construction stays deferred until backend startup.
+    srcs = glob([
+        "models/*.py",
+        "models/**/*.py",
+    ], exclude = ["models/test/*.py"]) + [
+        "async_decoder_engine/embedding/interface.py",
+    ],
+    deps = [
+        ":config",
+        ":ops",
+        ":tokenizer",
+        ":utils",
+        "//rtp_llm/model_loader:loader",
+    ],
+)
+
+py_library(
     name = "rtp_llm_frontend_lib",
     deps = [
+        ":frontend_model_config",
         ":utils",
         ":eplb",
         ":ops",
