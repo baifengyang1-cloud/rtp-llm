@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import gc
+import itertools
 import logging
 import multiprocessing.pool
 import os
@@ -507,6 +508,16 @@ class MMEmbeddingRes:
 
     def __str__(self) -> str:
         return f"MMEmbeddingRes(length={len(self.embeddings)}, embeddings_shape={[e.shape for e in self.embeddings]}, position_ids_shape={[p.shape for p in self.position_ids] if self.position_ids is not None else []}, extra_input_shape={[d.shape for d in self.extra_input] if self.extra_input is not None else []})"
+
+
+_anonymous_request_ids = itertools.count(-1, -1)
+
+
+def vit_request_owner(engine, request_id: int) -> int:
+    """Give each anonymous call its own cancellable work."""
+    if request_id == 0 and getattr(engine, "_image_downloads", None) is not None:
+        return next(_anonymous_request_ids)
+    return request_id
 
 
 class _AsyncComputeTask:
@@ -1406,6 +1417,7 @@ class MMProcessEngine:
         Returns the list of cache keys. Inputs already in-progress or complete
         are not recomputed.
         """
+        request_id = vit_request_owner(self, request_id)
         try:
             self.mm_part.validate_inputs(mm_inputs)
             claims = self._claim_and_submit_async(
@@ -1434,6 +1446,7 @@ class MMProcessEngine:
         """
         wait_started = time.monotonic()
         current_entry: Optional[MMEmbeddingCacheEntry] = None
+        request_id = vit_request_owner(self, request_id)
         try:
             self.mm_part.validate_inputs(mm_inputs)
             _report_image_count(mm_inputs)

@@ -26,7 +26,7 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import (
 from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
 from rtp_llm.multimodal.mm_error_messages import format_mm_rpc_error
-from rtp_llm.multimodal.mm_process_engine import MMEmbeddingRes, MMProcessEngine
+from rtp_llm.multimodal.mm_process_engine import MMEmbeddingRes, MMProcessEngine, vit_request_owner
 from rtp_llm.multimodal.mm_scheduler import (
     MMSchedulerOverloadError,
     MMSchedulerRequestTooLargeError,
@@ -257,9 +257,8 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 len(multimodal_inputs.multimodal_inputs),
                 tags,
             )
-            cancellation_event = self._register_queue_cancellation(
-                multimodal_inputs.request_id, context
-            )
+            owner = vit_request_owner(self.engine, multimodal_inputs.request_id)
+            cancellation_event = self._register_queue_cancellation(owner, context)
             limits = {}
             if getattr(self.engine, "_image_downloads", None) is not None:
                 remaining = context.time_remaining()
@@ -267,7 +266,7 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                     limits["timeout_ms"] = max(1, int(min(120, remaining) * 1000))
             results = self.engine.get_embedding_result(
                 trans_mm_input(multimodal_inputs),
-                request_id=multimodal_inputs.request_id,
+                request_id=owner,
                 cancellation_event=cancellation_event,
                 **limits,
             )

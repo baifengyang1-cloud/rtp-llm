@@ -1,5 +1,4 @@
 import asyncio
-import itertools
 import time
 import logging
 import socket
@@ -29,7 +28,7 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import (
 from rtp_llm.distribute.worker_info import WorkerInfo
 from rtp_llm.metrics import kmonitor
 from rtp_llm.model_factory import ModelFactory
-from rtp_llm.multimodal.mm_process_engine import MMProcessEngine
+from rtp_llm.multimodal.mm_process_engine import MMProcessEngine, vit_request_owner
 from rtp_llm.multimodal.multimodal_util import trans_mm_input
 from rtp_llm.ops import RoleType
 from rtp_llm.server.vit_rpc_server import MultimodalRpcServer, create_rpc_server
@@ -82,8 +81,6 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
             "cpu_embedding_keys": [key for key, tier in tiers.items() if tier == "cpu"],
         }
 
-    anonymous_ids = itertools.count(-1, -1)
-
     @app.post("/mm_cache/metadata")
     async def cache_metadata(request: MMCacheMetadataRequest, raw_request: RawRequest):
         started = time.monotonic()
@@ -119,9 +116,7 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
         missing_keys = [key for key in dict.fromkeys(request.keys) if key in missing]
         try:
             isolated = getattr(engine, "_image_downloads", None) is not None
-            request_id = request.request_id
-            if isolated and not request_id:
-                request_id = next(anonymous_ids)
+            request_id = vit_request_owner(engine, request.request_id)
             cancelled = threading.Event()
 
             def compute():
