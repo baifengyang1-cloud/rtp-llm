@@ -1547,11 +1547,16 @@ class MMProcessEngine:
 
             self._raise_if_async_request_cancelled(request_id, cancellation_event)
 
-            self._dispatch_image_batch(
-                pending,
-                request_id=request_id,
-                queue_timeout_ms=queue_timeout_ms,
-            )
+            try:
+                self._dispatch_image_batch(
+                    pending,
+                    request_id=request_id,
+                    queue_timeout_ms=queue_timeout_ms,
+                )
+            except Exception:
+                if getattr(self, "_image_downloads", None) is not None:
+                    self.cancel_queued_request(request_id)
+                raise
             self._raise_if_async_request_cancelled(request_id, cancellation_event)
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -1607,10 +1612,9 @@ class MMProcessEngine:
                 self._async_request_tasks.pop(request_id, None)
 
     def cancel_queued_request(self, request_id: int) -> int:
-        """Cancel work that is still queued and exclusively owned by a request.
+        """Detach a request. The last owner cancels its network I/O and queued compute.
 
-        Running futures are deliberately left alone. A deduplicated task remains
-        queued while any other request still owns it.
+        Compute already executing checks the deadline before GPU admission.
         """
         cancelled = 0
         with self._async_task_lock:
@@ -1815,13 +1819,14 @@ class MMProcessEngine:
         stage = getattr(self, "_image_downloads", None)
         if stage is None:
             return self._submit_async_compute_batch(
-                pending, request_id, queue_timeout_ms
+                pending, request_id=request_id, queue_timeout_ms=queue_timeout_ms
             )
 
         from internal_source.rtp_llm.utils.image_downloads import DownloadBusy
         from rtp_llm.multimodal.mm_error_messages import MMErr
 
         ready = []
+        admission_error = None
         for item, key, entry in pending:
             if item.mm_type not in (
                 MMUrlType.IMAGE,
@@ -1871,8 +1876,11 @@ class MMProcessEngine:
                 )
                 self._forget_async_task_locked(entry)
                 self._fail_async_compute(key, entry, error)
+                admission_error = error
+        if admission_error is not None:
+            raise admission_error
         if ready:
-            self._submit_async_compute_batch(ready, request_id, queue_timeout_ms)
+            self._submit_async_compute_batch(ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms)
 
     def _image_download_done(self, pending, future, start, owner_deadline):
         from internal_source.rtp_llm.utils.image_downloads import (
@@ -1904,7 +1912,7 @@ class MMProcessEngine:
                 )
                 url_data_cache_.insert_cache(item.url, BytesIO(body))
                 self._submit_async_compute_batch(
-                    [pending], next(iter(task.request_ids)), left_ms
+                    [pending], request_id=next(iter(task.request_ids)), queue_timeout_ms=left_ms
                 )
                 return
             except FtRuntimeException as e:

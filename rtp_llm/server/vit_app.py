@@ -118,18 +118,21 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
         del inputs_pb
         missing_keys = [key for key in dict.fromkeys(request.keys) if key in missing]
         try:
-            request_id = request.request_id or next(anonymous_ids)
+            isolated = getattr(engine, "_image_downloads", None) is not None
+            request_id = request.request_id
+            if isolated and not request_id:
+                request_id = next(anonymous_ids)
             cancelled = threading.Event()
 
             def compute():
-                remaining = request.timeout_ms - int(
-                    (time.monotonic() - started) * 1000
-                )
+                remaining = request.timeout_ms
+                if isolated:
+                    remaining -= int((time.monotonic() - started) * 1000)
                 if remaining <= 0:
                     raise TimeoutError("ViT metadata deadline expired")
                 kwargs = (
                     {"cancellation_event": cancelled}
-                    if getattr(engine, "_image_downloads", None)
+                    if isolated
                     else {}
                 )
                 return engine.get_embedding_result(
@@ -143,7 +146,7 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
             work = asyncio.create_task(asyncio.to_thread(compute))
             try:
                 while not work.done():
-                    if await raw_request.is_disconnected():
+                    if isolated and await raw_request.is_disconnected():
                         raise HTTPException(
                             status_code=499, detail="ViT caller disconnected"
                         )
