@@ -7,6 +7,7 @@ import os
 import signal
 import threading
 import time
+from io import BytesIO
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -41,6 +42,9 @@ from rtp_llm.multimodal.multimodal_mixins.multimodal_common import (
 )
 from rtp_llm.multimodal.multimodal_util import (
     collect_download_timing,
+    check_prepared_image_deadline,
+    use_prepared_image,
+    _get_http_heads,
     maybe_tensor_to_list,
     trans_mm_input,
     url_data_cache_,
@@ -69,7 +73,12 @@ def _run_preprocess_task(
     with collect_vit_preprocess_metrics() as samples, collect_download_timing() as download_timing:
         with Timer() as route_timer:
             result = preprocess_func(mm_inputs, vit_config, **preprocess_params)
-    return result, route_timer.cost_ms(), download_timing.elapsed_ms, samples.samples
+    return (
+        result,
+        route_timer.cost_ms() + download_timing.prefetched_ms,
+        download_timing.elapsed_ms,
+        samples.samples,
+    )
 
 
 def _embedding_token_length(embeddings: List[Any]) -> int:
@@ -505,6 +514,9 @@ class _AsyncComputeTask:
         self.cache_key = cache_key
         self.entry = entry
         self.request_ids: Set[int] = set()
+        self.deadlines: Dict[int, float] = {}
+        self.download = None
+        self.source = None
         self.future: Optional[concurrent.futures.Future] = None
 
 
@@ -793,6 +805,28 @@ class MMProcessEngine:
         self._greennet_timeout_s = (
             float(getattr(self.vit_config, "mm_timeout_ms", 120000) or 120000) / 1000.0
         )
+
+        self._image_downloads = None
+        io_limit = int(os.environ.get("VIT_IMAGE_DOWNLOAD_CONCURRENCY", "0"))
+        if (
+            io_limit
+            and vit_config.use_local_preprocess
+            and not self._greennet_enabled()
+        ):
+            from internal_source.rtp_llm.utils.image_downloads import ImageDownloads
+
+            self._download_budget = (
+                int(os.getenv("VIT_IMAGE_DOWNLOAD_TIMEOUT_MS", "650")) / 1000
+            )
+            self._compute_reserve = (
+                int(os.getenv("VIT_IMAGE_COMPUTE_RESERVE_MS", "50")) / 1000
+            )
+            if self._download_budget <= 0 or self._compute_reserve < 0:
+                raise ValueError("Invalid ViT download budget or compute reserve")
+            per_host = int(
+                os.getenv("VIT_IMAGE_DOWNLOAD_PER_HOST", str(min(16, io_limit)))
+            )
+            self._image_downloads = ImageDownloads(io_limit, per_host)
 
     def inc_query_num(self) -> None:
         """Increment the query counter."""
@@ -1326,6 +1360,7 @@ class MMProcessEngine:
         pending_items = [wi for wi in work_items if wi.embedding_result is None]
 
         if pending_items:
+            check_prepared_image_deadline()
             self._scheduler.submit_and_wait(pending_items)
 
         emb_res, pos_res, tensor_res = [], [], []
@@ -1408,7 +1443,7 @@ class MMProcessEngine:
                 queue_timeout_ms=timeout_ms,
                 cancellation_event=cancellation_event,
             )
-            deadline = time.monotonic() + timeout_ms / 1000.0
+            deadline = wait_started + timeout_ms / 1000.0
             results = []
             for cache_key, entry in claims:
                 current_entry = entry
@@ -1446,7 +1481,7 @@ class MMProcessEngine:
             )
             return results
         except Exception as error:
-            if hashes_only:
+            if hashes_only or getattr(self, "_image_downloads", None) is not None:
                 self.cancel_queued_request(request_id)
             self.report_vit_error(error, current_entry)
             raise
@@ -1472,6 +1507,10 @@ class MMProcessEngine:
         keyed_inputs = [(item, item.cache_key()) for item in mm_inputs]
         if any(not item.url for item, _ in keyed_inputs):
             raise ValueError("async embedding requires non-empty url for each input")
+        owner_deadline = None
+        if getattr(self, "_image_downloads", None) is not None:
+            owner_timeout = self._image_timeout_ms(mm_inputs, queue_timeout_ms)
+            owner_deadline = time.monotonic() + owner_timeout / 1000
         # Claim, capacity reservation and executor handoff are one transaction
         # with respect to joiners and cancellation. submit() only enqueues;
         # no media I/O or embedding wait is performed while holding this lock.
@@ -1498,13 +1537,17 @@ class MMProcessEngine:
                     if task is not None:
                         merged |= bool(task.request_ids - {request_id})
                         task.request_ids.add(request_id)
+                        if owner_deadline is not None:
+                            task.deadlines[request_id] = max(
+                                task.deadlines.get(request_id, 0), owner_deadline
+                            )
                         self._async_request_tasks.setdefault(request_id, set()).add(
                             entry
                         )
 
             self._raise_if_async_request_cancelled(request_id, cancellation_event)
 
-            self._submit_async_compute_batch(
+            self._dispatch_image_batch(
                 pending,
                 request_id=request_id,
                 queue_timeout_ms=queue_timeout_ms,
@@ -1554,6 +1597,7 @@ class MMProcessEngine:
         task = self._async_tasks.pop(entry, None)
         if task is None:
             return
+        task.source = None
         for request_id in task.request_ids:
             request_tasks = self._async_request_tasks.get(request_id)
             if request_tasks is None:
@@ -1576,7 +1620,15 @@ class MMProcessEngine:
                 if task is None:
                     continue
                 task.request_ids.discard(request_id)
+                task.deadlines.pop(request_id, None)
                 if task.request_ids:
+                    continue
+
+                if task.download is not None:
+                    # Cancellation invokes its callback synchronously; that
+                    # callback owns cleanup and only releases download capacity.
+                    task.download.cancel()
+                    cancelled += 1
                     continue
 
                 if task.future is None:
@@ -1654,11 +1706,16 @@ class MMProcessEngine:
         pending: List[Tuple[MultimodalInput, str, MMEmbeddingCacheEntry]],
         queue_timeout_ms: Optional[int],
     ) -> int:
+        return self._image_timeout_ms(
+            [item for item, _, _ in pending], queue_timeout_ms
+        )
+
+    def _image_timeout_ms(self, items, queue_timeout_ms):
         if queue_timeout_ms is not None and queue_timeout_ms > 0:
             return queue_timeout_ms
         per_input_timeouts = [
             item.mm_preprocess_config.mm_timeout_ms
-            for item, _, _ in pending
+            for item in items
             if item.mm_preprocess_config.mm_timeout_ms > 0
         ]
         return max(per_input_timeouts, default=self.vit_config.mm_timeout_ms)
@@ -1734,6 +1791,11 @@ class MMProcessEngine:
         request_id: int,
         deadline: float,
     ) -> None:
+        with self._async_task_lock:
+            task = self._async_tasks.get(entry)
+            source = task.source if task else None
+            if source is not None:
+                deadline = source[3]()
         if time.monotonic() >= deadline:
             error = FtRuntimeException(
                 ExceptionType.GENERATE_TIMEOUT,
@@ -1746,7 +1808,126 @@ class MMProcessEngine:
             )
             self._fail_async_compute(cache_key, entry, error)
             return
-        self._async_compute(mm_inputs, cache_key, entry, request_id)
+        with use_prepared_image(source):
+            self._async_compute(mm_inputs, cache_key, entry, request_id)
+
+    def _dispatch_image_batch(self, pending, request_id, queue_timeout_ms):
+        stage = getattr(self, "_image_downloads", None)
+        if stage is None:
+            return self._submit_async_compute_batch(
+                pending, request_id, queue_timeout_ms
+            )
+
+        from internal_source.rtp_llm.utils.image_downloads import DownloadBusy
+        from rtp_llm.multimodal.mm_error_messages import MMErr
+
+        ready = []
+        for item, key, entry in pending:
+            if item.mm_type not in (
+                MMUrlType.IMAGE,
+                MMUrlType.DEFAULT,
+            ) or not item.url.startswith(("http://", "https://")):
+                ready.append((item, key, entry))
+                continue
+            task = self._async_tasks[entry]
+
+            def owner_deadline(task=task):
+                with self._async_task_lock:
+                    return max(task.deadlines.values(), default=0)
+
+            try:
+                cached = url_data_cache_.check_cache(item.url)
+                if cached is not None:
+                    task.source = (item.url, cached.getvalue(), 0.0, owner_deadline)
+                    ready.append((item, key, entry))
+                    continue
+                start = time.monotonic()
+                hard_limit = start + self._download_budget
+
+                def download_deadline(end=hard_limit, budget=owner_deadline):
+                    return min(end, budget() - self._compute_reserve)
+
+                fut = stage.submit(
+                    item.url,
+                    _get_http_heads(self.vit_config.download_headers),
+                    self.vit_config.mm_image_max_file_size_kb,
+                    download_deadline,
+                )
+                task.download = fut
+                fut.add_done_callback(
+                    lambda f, x=(
+                        item,
+                        key,
+                        entry,
+                    ), t=start, d=owner_deadline: self._image_download_done(x, f, t, d)
+                )
+            except Exception as exc:
+                error = (
+                    FtRuntimeException(ExceptionType.CONCURRENCY_LIMIT_ERROR, str(exc))
+                    if isinstance(exc, DownloadBusy)
+                    else FtRuntimeException(
+                        ExceptionType.MM_DOWNLOAD_FAILED, MMErr.DL_FAILED
+                    )
+                )
+                self._forget_async_task_locked(entry)
+                self._fail_async_compute(key, entry, error)
+        if ready:
+            self._submit_async_compute_batch(ready, request_id, queue_timeout_ms)
+
+    def _image_download_done(self, pending, future, start, owner_deadline):
+        from internal_source.rtp_llm.utils.image_downloads import (
+            DownloadBusy,
+            ImageTooLarge,
+        )
+        from rtp_llm.multimodal.mm_error_messages import MMErr
+
+        item, key, entry = pending
+        with self._async_task_lock:
+            task = self._async_tasks.get(entry)
+            if task is None or task.download is not future:
+                return
+            task.download = None
+            try:
+                if self._stopped or not task.request_ids or future.cancelled():
+                    raise FtRuntimeException(
+                        ExceptionType.CANCELLED_ERROR, "Image download cancelled"
+                    )
+                body = future.result()
+                left_ms = int(1000 * (owner_deadline() - time.monotonic()))
+                if left_ms <= 0:
+                    raise TimeoutError()
+                task.source = (
+                    item.url,
+                    body,
+                    (time.monotonic() - start) * 1000,
+                    owner_deadline,
+                )
+                url_data_cache_.insert_cache(item.url, BytesIO(body))
+                self._submit_async_compute_batch(
+                    [pending], next(iter(task.request_ids)), left_ms
+                )
+                return
+            except FtRuntimeException as e:
+                error = e
+            except (TimeoutError, asyncio.TimeoutError):
+                error = FtRuntimeException(
+                    ExceptionType.MM_DOWNLOAD_FAILED, MMErr.DL_TIMEOUT
+                )
+            except ImageTooLarge:
+                error = FtRuntimeException(
+                    ExceptionType.MM_WRONG_FORMAT_ERROR, MMErr.FILE_TOO_LARGE
+                )
+            except DownloadBusy as e:
+                error = FtRuntimeException(
+                    ExceptionType.CONCURRENCY_LIMIT_ERROR, str(e)
+                )
+            except Exception:
+                error = FtRuntimeException(
+                    ExceptionType.MM_DOWNLOAD_FAILED, MMErr.DL_FAILED
+                )
+            if entry in self._async_tasks:
+                self._forget_async_task_locked(entry)
+                self._fail_async_compute(key, entry, error)
 
     def _submit_async_compute_batch(
         self,
@@ -1870,6 +2051,8 @@ class MMProcessEngine:
         if self._stopped:
             return
         self._stopped = True
+        if getattr(self, "_image_downloads", None) is not None:
+            self._image_downloads.close()
         self._async_compute_executor.shutdown(wait=False, cancel_futures=True)
         self.preprocess_executor.shutdown()
         self._scheduler.close()

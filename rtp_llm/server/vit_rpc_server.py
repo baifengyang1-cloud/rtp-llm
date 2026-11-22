@@ -260,10 +260,16 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
             cancellation_event = self._register_queue_cancellation(
                 multimodal_inputs.request_id, context
             )
+            limits = {}
+            if getattr(self.engine, "_image_downloads", None) is not None:
+                remaining = context.time_remaining()
+                if remaining is not None:
+                    limits["timeout_ms"] = max(1, int(min(120, remaining) * 1000))
             results = self.engine.get_embedding_result(
                 trans_mm_input(multimodal_inputs),
                 request_id=multimodal_inputs.request_id,
                 cancellation_event=cancellation_event,
+                **limits,
             )
             res = merge_embedding_results(results)
             output_pb = self._transport.transfer(multimodal_inputs, res)

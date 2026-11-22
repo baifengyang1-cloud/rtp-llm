@@ -38,10 +38,11 @@ logger = logging.getLogger(__name__)
 class _DownloadTiming:
     """Mutable timing carrier used while one preprocess call is running."""
 
-    __slots__ = ("elapsed_ms",)
+    __slots__ = ("elapsed_ms", "prefetched_ms")
 
     def __init__(self):
         self.elapsed_ms = 0.0
+        self.prefetched_ms = 0.0
 
 
 _download_timing: contextvars.ContextVar[Optional[_DownloadTiming]] = (
@@ -327,6 +328,26 @@ def _download_http_content(
             response.close()
 
 
+# Keep the actual bytes alive across admission and preprocessing, including
+# when the URL LRU is disabled or another request evicts the entry.
+_prepared_image = contextvars.ContextVar("prepared_vit_image", default=None)
+
+
+@contextmanager
+def use_prepared_image(source):
+    token = _prepared_image.set(source)
+    try:
+        yield
+    finally:
+        _prepared_image.reset(token)
+
+
+def check_prepared_image_deadline():
+    source = _prepared_image.get()
+    if source is not None and time.monotonic() >= source[3]():
+        raise TimeoutError("ViT image request expired before GPU admission")
+
+
 def get_bytes_io_from_url(
     url: str,
     download_headers: str = "",
@@ -340,6 +361,17 @@ def get_bytes_io_from_url(
         max_file_size_kb: Maximum file size in KB. Content-Length is checked when
             available, and the limit is also enforced while streaming the body.
     """
+
+    source = _prepared_image.get()
+    if source is not None and source[0] == url:
+        check_prepared_image_deadline()
+        _, body, elapsed_ms, _ = source
+        _validate_file_size(len(body), max_file_size_kb)
+        timer = _download_timing.get()
+        if timer is not None and not timer.prefetched_ms:
+            timer.elapsed_ms += elapsed_ms
+            timer.prefetched_ms = elapsed_ms
+        return BytesIO(body)
 
     cached_res = url_data_cache_.check_cache(url)
     if cached_res is None:

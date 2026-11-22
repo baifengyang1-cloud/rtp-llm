@@ -1,4 +1,6 @@
 import asyncio
+import itertools
+import time
 import logging
 import socket
 import threading
@@ -80,8 +82,11 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
             "cpu_embedding_keys": [key for key, tier in tiers.items() if tier == "cpu"],
         }
 
+    anonymous_ids = itertools.count(-1, -1)
+
     @app.post("/mm_cache/metadata")
-    def cache_metadata(request: MMCacheMetadataRequest):
+    async def cache_metadata(request: MMCacheMetadataRequest, raw_request: RawRequest):
+        started = time.monotonic()
         if engine is None or engine.is_proxy_mode:
             raise HTTPException(status_code=501, detail="worker-local cache required")
         if any(not key or len(key) > 4096 for key in request.keys):
@@ -113,12 +118,47 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
         del inputs_pb
         missing_keys = [key for key in dict.fromkeys(request.keys) if key in missing]
         try:
-            results = engine.get_embedding_result(
-                [inputs[key] for key in missing_keys],
-                request_id=request.request_id,
-                timeout_ms=request.timeout_ms,
-                hashes_only=True,
-            )
+            request_id = request.request_id or next(anonymous_ids)
+            cancelled = threading.Event()
+
+            def compute():
+                remaining = request.timeout_ms - int(
+                    (time.monotonic() - started) * 1000
+                )
+                if remaining <= 0:
+                    raise TimeoutError("ViT metadata deadline expired")
+                kwargs = (
+                    {"cancellation_event": cancelled}
+                    if getattr(engine, "_image_downloads", None)
+                    else {}
+                )
+                return engine.get_embedding_result(
+                    [inputs[key] for key in missing_keys],
+                    request_id=request_id,
+                    timeout_ms=remaining,
+                    hashes_only=True,
+                    **kwargs,
+                )
+
+            work = asyncio.create_task(asyncio.to_thread(compute))
+            try:
+                while not work.done():
+                    if await raw_request.is_disconnected():
+                        raise HTTPException(
+                            status_code=499, detail="ViT caller disconnected"
+                        )
+                    await asyncio.wait({work}, timeout=0.025)
+                results = work.result()
+            finally:
+                if not work.done():
+                    cancelled.set()
+                    if hasattr(engine, "cancel_queued_request"):
+                        engine.cancel_queued_request(request_id)
+                    # asyncio cannot interrupt a synchronous waiter. Consume its
+                    # eventual exception after the shared entry settles.
+                    work.add_done_callback(
+                        lambda f: None if f.cancelled() else f.exception()
+                    )
         except TimeoutError as error:
             raise HTTPException(
                 status_code=504, detail="ViT hash computation timed out"
