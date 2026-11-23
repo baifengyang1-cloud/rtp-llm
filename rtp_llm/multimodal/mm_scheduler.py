@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 import torch.profiler
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.py_config_modules import VitConfig
 from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
@@ -92,9 +93,37 @@ def _run_embedding(
     data_list = [wi.preprocess_result for wi in items]
     type_list = [wi.mm_type for wi in items]
 
+    traced = set()
+    if diag.SAMPLE_EVERY:
+        traced = {getattr(item, "trace_request_id", 0) for item in items}
+        traced = {rid for rid in traced if diag.selected(rid)}
+    batch_id = time.monotonic_ns() if traced else None
+    for rid in traced:
+        diag.event(
+            rid, "vit.gpu_forward", phase="begin", batch_id=batch_id, items=len(items)
+        )
     with Timer() as route_timer:
         with torch.profiler.record_function("batched_embedding"):
-            batch_outputs = mm_part.batched_embedding(data_list, type_list)
+            try:
+                batch_outputs = mm_part.batched_embedding(data_list, type_list)
+            except BaseException as error:
+                for rid in traced:
+                    diag.event(
+                        rid,
+                        "vit.gpu_forward",
+                        phase="end",
+                        batch_id=batch_id,
+                        error=type(error).__name__,
+                    )
+                raise
+    for rid in traced:
+        diag.event(
+            rid,
+            "vit.gpu_forward",
+            phase="end",
+            batch_id=batch_id,
+            elapsed_ms=route_timer.cost_ms(),
+        )
     # Forward latency is per batch; VIT_EMBEDDING_RT_METRIC in submit_and_wait
     # includes the per-request queue and batch-collection wait as well.
     kmonitor.report(GaugeMetrics.VIT_EMBEDDING_FORWARD_RT_METRIC, route_timer.cost_ms())
@@ -281,6 +310,14 @@ class MMScheduler:
         """Put a chunk into the waiting queue and stamp its queue-entry time."""
         chunk.enqueued_at = time.monotonic()
         chunk.queue_wait_reported = False
+        if diag.SAMPLE_EVERY:
+            rid = getattr(chunk.work_items[0], "trace_request_id", 0)
+            diag.event(
+                rid,
+                "vit.gpu_enqueue",
+                queue_depth=self._queue_depth(),
+                items=len(chunk.work_items),
+            )
         self._waiting.put(chunk)
         self._report_queue_depth()
 

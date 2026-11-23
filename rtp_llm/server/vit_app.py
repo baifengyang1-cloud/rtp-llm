@@ -17,6 +17,7 @@ from typing_extensions import override
 from uvicorn import Config, Server
 from uvicorn.loops.auto import auto_loop_setup
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.engine_config import EngineConfig
 from rtp_llm.config.exceptions import FtRuntimeException
 from rtp_llm.config.py_config_modules import PyEnvConfigs
@@ -83,6 +84,20 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
 
     @app.post("/mm_cache/metadata")
     async def cache_metadata(request: MMCacheMetadataRequest, raw_request: RawRequest):
+        kind = "probe" if request.inputs is None else "fill"
+        trace_id = request.request_id or raw_request.scope.get("state", {}).get(
+            "vit_metadata_trace_id"
+        )
+        with diag.span(
+            trace_id,
+            "vit.metadata_handler",
+            kind=kind,
+            keys=len(request.keys),
+            budget_ms=request.timeout_ms,
+        ):
+            return await resolve_metadata(request, raw_request, trace_id)
+
+    async def resolve_metadata(request, raw_request, trace_id):
         started = time.monotonic()
         if engine is None or engine.is_proxy_mode:
             raise HTTPException(status_code=501, detail="worker-local cache required")
@@ -96,6 +111,12 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
         except ValueError as error:
             raise HTTPException(status_code=413, detail=str(error)) from error
         missing = {e["key"] for e in metadata["entries"] if not e["hash_hit"]}
+        diag.event(
+            trace_id,
+            "vit.hash_lookup",
+            missing=len(missing),
+            keys=len(request.keys),
+        )
         if not missing or request.inputs is None:
             return metadata
         try:
@@ -120,6 +141,11 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
             cancelled = threading.Event()
 
             def compute():
+                diag.event(
+                    request_id,
+                    "vit.executor_start",
+                    queued_ms=round((time.monotonic() - submitted) * 1000, 3),
+                )
                 remaining = request.timeout_ms
                 if isolated:
                     remaining -= int((time.monotonic() - started) * 1000)
@@ -138,6 +164,8 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
                     **kwargs,
                 )
 
+            submitted = time.monotonic()
+            diag.event(request_id, "vit.executor_submit")
             work = asyncio.create_task(asyncio.to_thread(compute))
             try:
                 while not work.done():
@@ -147,8 +175,10 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
                         )
                     await asyncio.wait({work}, timeout=0.025)
                 results = work.result()
+                diag.event(request_id, "vit.executor_result")
             finally:
                 if not work.done():
+                    diag.event(request_id, "vit.metadata_cancel")
                     cancelled.set()
                     if hasattr(engine, "cancel_queued_request"):
                         engine.cancel_queued_request(request_id)
@@ -312,6 +342,8 @@ class VitEndpointApp:
             )
         ]
         app = FastAPI(middleware=middleware)
+        if diag.SAMPLE_EVERY:
+            app.add_middleware(diag.MetadataTraceMiddleware)
         register_mm_cache_routes(app, self.vit_endpoint_server.mm_process_engine)
 
         @app.get("/health")

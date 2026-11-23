@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.access_logger.access_logger import AccessLogger
 from rtp_llm.config.log_config import get_log_path
 from rtp_llm.config.model_config import (
@@ -140,6 +141,31 @@ def _record_http_status(trace_state, status_code: int) -> None:
     # wins, and the HTTP-error counter only reads the legacy http.status_code.
     trace_state.set_attribute(trace_attrs.HTTP_RESPONSE_STATUS_CODE, status_code)
     trace_state.set_attribute(trace_attrs.HTTP_STATUS_CODE, status_code)
+
+
+def _chat_admission_event(raw_request, request_id, worker, controller):
+    from rtp_llm.server.request_headers import (
+        extract_correlation_request_id,
+        extract_trace_id,
+    )
+
+    scope = getattr(raw_request, "scope", {})
+    state = scope.setdefault("state", {})
+    key = request_id or state.get("vit_trace_id") or -time.time_ns()
+    state["vit_trace_id"] = key
+    if diag.selected(key):
+        diag.event(
+            key,
+            "frontend.admitted" if request_id else "frontend.rejected",
+            worker=worker,
+            capacity=controller.max_concurrency,
+            available=controller.get_available_concurrency(),
+            attempt_id=-state["vit_arrival_ns"] if "vit_arrival_ns" in state else None,
+            arrival_wall_ns=state.get("vit_arrival_ns"),
+            arrival_mono_ns=state.get("vit_arrival_mono_ns"),
+            upstream_id=extract_correlation_request_id(raw_request.headers)[:128],
+            upstream_trace=extract_trace_id(raw_request.headers)[:128],
+        )
 
 
 class FrontendServer(object):
@@ -310,7 +336,13 @@ class FrontendServer(object):
         is_openai_response = request.get("stream", False)
         response_data_prefix = "data: " if is_openai_response else "data:"
         try:
+            first = True
             async for res in response:
+                if first:
+                    diag.event(
+                        request.get(request_id_field_name), "frontend.first_result"
+                    )
+                    first = False
                 data_str = res.model_dump_json(exclude_none=True)
                 yield response_data_prefix + data_str + "\r\n\r\n"
                 await asyncio.sleep(0)
@@ -373,6 +405,11 @@ class FrontendServer(object):
                 # safety net for exits not covered above; idempotent
                 trace_state.finish()
             self._global_controller.decrement()
+            diag.event(
+                request.get(request_id_field_name),
+                "frontend.slot_released",
+                streaming=True,
+            )
 
     async def inference(self, req: Union[str, Dict[Any, Any]], raw_request: RawRequest):
         request_headers: Dict[str, str] = {}
@@ -425,6 +462,9 @@ class FrontendServer(object):
         try:
             rep = await self._infer_impl(req, raw_request, generate_call)
         except BaseException as e:
+            diag.event(
+                req.get(request_id_field_name), "frontend.error", error=type(e).__name__
+            )
             rep = self._handle_exception(req, e)
             # Finish the span here while the real exception is still in hand:
             # the caller only sees the swallowed ORJSONResponse and would
@@ -479,6 +519,10 @@ class FrontendServer(object):
         try:
             sequence = self._global_controller.increment() % 4096
         except ConcurrencyException as error:
+            if diag.SAMPLE_EVERY:
+                _chat_admission_event(
+                    raw_request, None, self.server_id, self._global_controller
+                )
             return self._handle_exception(body, error, status_code=429)
         request_id = generate_request_id(
             self.py_env_configs.server_config.ip,
@@ -486,6 +530,10 @@ class FrontendServer(object):
             self.server_id,
             sequence,
         )
+        if diag.SAMPLE_EVERY:
+            _chat_admission_event(
+                raw_request, request_id, self.server_id, self._global_controller
+            )
         body = dict(body)
         body[request_id_field_name] = request_id
         started = time.monotonic()
@@ -550,6 +598,7 @@ class FrontendServer(object):
                     )
                     trace_state.finish()
                 self._global_controller.decrement()
+                diag.event(request_id, "frontend.slot_released", outcome=outcome)
             try:
                 kmonitor.report(
                     AccMetrics.PRETRIGGER_OUTCOME_QPS_METRIC, 1, {"outcome": outcome}
@@ -586,7 +635,14 @@ class FrontendServer(object):
                     dict(item, loc=("body", *item["loc"])) for item in error.errors()
                 ]
                 raise RequestValidationError(errors, body=body) from error
-        sequence = self._global_controller.increment() % 4096  # 12 bits
+        try:
+            sequence = self._global_controller.increment() % 4096
+        except ConcurrencyException:
+            if diag.SAMPLE_EVERY:
+                _chat_admission_event(
+                    raw_request, None, self.server_id, self._global_controller
+                )
+            raise
         request_id = generate_request_id(
             self.py_env_configs.server_config.ip,
             self.py_env_configs.server_config.server_port,
@@ -594,6 +650,10 @@ class FrontendServer(object):
             sequence,
         )
 
+        if diag.SAMPLE_EVERY:
+            _chat_admission_event(
+                raw_request, request_id, self.server_id, self._global_controller
+            )
         trace_state = self._start_chat_trace(request.model, raw_request, request_id)
 
         def generate_call():
@@ -622,6 +682,7 @@ class FrontendServer(object):
                 _record_http_status(trace_state, 500)
                 trace_state.finish(error=e)
             self._global_controller.decrement()
+            diag.event(request_id, "frontend.slot_released", error=type(e).__name__)
             raise e
 
         if not isinstance(rep, StreamingResponse):
@@ -634,6 +695,11 @@ class FrontendServer(object):
                 _record_http_status(trace_state, getattr(rep, "status_code", 200))
                 trace_state.finish()
             self._global_controller.decrement()
+            diag.event(
+                request_id,
+                "frontend.slot_released",
+                status=getattr(rep, "status_code", 200),
+            )
 
         return rep
 
@@ -882,13 +948,22 @@ class FrontendServer(object):
         is_streaming = self._frontend_worker.is_streaming(req)
         if await raw_request.is_disconnected():
             raise asyncio.CancelledError("client disconnects")
+        diag.event(
+            req.get(request_id_field_name),
+            "frontend.generate_start",
+            streaming=is_streaming,
+        )
         res = await self._call_generate_with_report(generate_call, is_streaming)
 
         if is_streaming:
             return StreamingResponse(
                 self.stream_response(req, res), media_type="text/event-stream"
             )
+        first = True
         async for x in res:
+            if first:
+                diag.event(req.get(request_id_field_name), "frontend.first_result")
+                first = False
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
                 await res.aclose()

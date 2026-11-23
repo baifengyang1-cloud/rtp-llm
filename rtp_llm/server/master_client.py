@@ -11,6 +11,7 @@ import grpc
 import grpc.aio
 import orjson
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.exceptions import (
     AdmissionRejectReason,
     ExceptionType,
@@ -363,8 +364,12 @@ class MasterClient:
         """Probe hashes, then submit only missing media when routing requires them."""
         started = time.monotonic()
         unique_keys = list(dict.fromkeys(keys))
+        request_id = getattr(input, "request_id", None)
         metadata = await self._post_vit_metadata(
-            address, {"keys": unique_keys}, DEFAULT_REQUEST_TIMEOUT_SEC
+            address,
+            {"keys": unique_keys},
+            DEFAULT_REQUEST_TIMEOUT_SEC,
+            trace_id=request_id,
         )
         if input is None:
             return metadata
@@ -382,6 +387,12 @@ class MasterClient:
                 "hash_hit", entries.get(key, {}).get("hit", False)
             )
         }
+        diag.event(
+            request_id,
+            "frontend.hash_lookup",
+            keys=len(unique_keys),
+            missing=len(missing),
+        )
         if not missing:
             return metadata
 
@@ -457,24 +468,51 @@ class MasterClient:
         filled["entries"] = [entries[key] for key in unique_keys]
         return filled
 
-    async def _post_vit_metadata(self, address, payload, timeout_sec, required=False):
+    async def _post_vit_metadata(
+        self, address, payload, timeout_sec, required=False, trace_id=None
+    ):
         import aiohttp
 
         started = time.monotonic()
+        request_id = trace_id or payload.get("request_id")
+        phase = "fill" if required else "probe"
+        headers = {"Content-Type": "application/json"}
+        if diag.selected(request_id):
+            headers["x-rtp-vit-trace-id"] = str(request_id)
+        status = error_type = None
+        diag.event(
+            request_id,
+            "frontend.metadata_send",
+            kind=phase,
+            budget_ms=int(timeout_sec * 1000),
+        )
         try:
             session = await self._get_session()
             async with session.post(
                 f"http://{address.ip}:{address.http_port}/mm_cache/metadata",
                 data=orjson.dumps(payload),
-                headers={"Content-Type": "application/json"},
+                headers=headers,
+                trace_request_ctx=(
+                    (request_id, phase) if diag.selected(request_id) else None
+                ),
                 timeout=aiohttp.ClientTimeout(total=timeout_sec),
             ) as response:
+                status = response.status
+                diag.event(
+                    request_id, "frontend.metadata_headers", kind=phase, status=status
+                )
                 # One bounded buffer avoids retaining chunks plus a joined copy.
                 body = bytearray()
                 async for chunk in response.content.iter_chunked(65536):
                     if len(body) + len(chunk) > 16 * 1024 * 1024:
                         raise ValueError("ViT metadata response exceeds byte limit")
                     body.extend(chunk)
+                diag.event(
+                    request_id,
+                    "frontend.metadata_body_read",
+                    kind=phase,
+                    bytes=len(body),
+                )
                 data = orjson.loads(body)
                 if response.status != SUCCESS_CODE:
                     if not required:
@@ -499,6 +537,7 @@ class MasterClient:
             OSError,
             ValueError,
         ) as error:
+            error_type = type(error).__name__
             if required:
                 code = (
                     ExceptionType.GENERATE_TIMEOUT
@@ -512,7 +551,18 @@ class MasterClient:
                 "ViT metadata unavailable, address=%s:%s", address.ip, address.http_port
             )
             return None
+        except BaseException as error:
+            error_type = type(error).__name__
+            raise
         finally:
+            diag.event(
+                request_id,
+                "frontend.metadata_exit",
+                kind=phase,
+                status=status,
+                error=error_type,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+            )
             route_logger.debug(
                 "ViT metadata query elapsed_ms=%.3f",
                 (time.monotonic() - started) * 1000,
@@ -521,7 +571,8 @@ class MasterClient:
     async def _get_session(self):
         session = getattr(self, "_metadata_session", None)
         if session is None or session.closed:
-            self._metadata_session = aiohttp.ClientSession()
+            traces = [diag.metadata_http_trace()] if diag.SAMPLE_EVERY else []
+            self._metadata_session = aiohttp.ClientSession(trace_configs=traces)
         return self._metadata_session
 
     async def get_backend_role_addrs(
@@ -588,23 +639,32 @@ class MasterClient:
         if input_pb is not None and not vit_only:
             request_pb.generate_input = input_pb.SerializeToString()
 
-        response = await self._send_schedule_request(
-            master_addr, request_pb, timeout_s, request_id
-        )
-
-        if response is None and slave_addr:
-            route_logger.info(
-                "Master connection failed, retrying slave, slave=%s, request_id=%s",
-                slave_addr,
-                request_id,
-            )
+        with diag.span(
+            request_id, "frontend.schedule", role="vit" if vit_only else "pd"
+        ):
             response = await self._send_schedule_request(
-                slave_addr, request_pb, timeout_s, request_id
+                master_addr, request_pb, timeout_s, request_id
             )
 
+            if response is None and slave_addr:
+                route_logger.info(
+                    "Master connection failed, retrying slave, slave=%s, request_id=%s",
+                    slave_addr,
+                    request_id,
+                )
+                response = await self._send_schedule_request(
+                    slave_addr, request_pb, timeout_s, request_id
+                )
         if response is None:
             return FlexlbResponse.connection_failed_response()
 
+        diag.event(
+            request_id,
+            "frontend.schedule_result",
+            role="vit" if vit_only else "pd",
+            code=response.code,
+            queue_length=response.queue_length,
+        )
         self.latest_queue_length = response.queue_length
 
         if selected_vit is not None and response.code == VIT_ROUTE_STALE_CODE:

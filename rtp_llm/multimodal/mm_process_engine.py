@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import torch
 import torch.profiler
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.access_logger.access_logger import MMAccessLogger
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.log_config import get_log_path
@@ -135,6 +136,7 @@ def _worker_initializer(
 
 def _worker_process_task(
     mm_inputs: List[MultimodalInput],
+    request_id: int = 0,
 ) -> Tuple[Any, float, float, List[VitMetricSample]]:
     """
     只接收变化的 `mm_inputs` 参数。
@@ -142,12 +144,13 @@ def _worker_process_task(
     if _worker_preprocess_func is None:
         raise RuntimeError("Worker process has not been initialized correctly.")
 
-    return _run_preprocess_task(
-        _worker_preprocess_func,
-        mm_inputs,
-        _worker_vit_config,
-        _worker_preprocess_params,
-    )
+    with diag.span(request_id, "vit.preprocess_worker", mode="pool"):
+        return _run_preprocess_task(
+            _worker_preprocess_func,
+            mm_inputs,
+            _worker_vit_config,
+            _worker_preprocess_params,
+        )
 
 
 def _unpack_preprocess_result(payload: Any) -> Tuple[Any, float, float]:
@@ -245,12 +248,17 @@ class LocalPreprocessExecutor(PreprocessExecutor):
             return
 
         try:
-            payload = _run_preprocess_task(
-                self.preprocess_func,
-                work_item.mm_inputs,
-                self.vit_config,
-                self.preprocess_params,
-            )
+            with diag.span(
+                getattr(work_item, "trace_request_id", 0),
+                "vit.preprocess_worker",
+                mode="local",
+            ):
+                payload = _run_preprocess_task(
+                    self.preprocess_func,
+                    work_item.mm_inputs,
+                    self.vit_config,
+                    self.preprocess_params,
+                )
             result, preprocess_time, download_time = _unpack_preprocess_result(payload)
             work_item.preprocess_result = result
             # 使用简单的对象模拟 future 行为
@@ -354,7 +362,7 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
     def _apply_async(self, work_item: "MMWorkItem", task_id: int) -> Any:
         return self.pool.apply_async(
             _worker_process_task,
-            args=(work_item.mm_inputs,),
+            args=(work_item.mm_inputs, getattr(work_item, "trace_request_id", 0)),
             callback=lambda _result: self._finish_preprocess_task(task_id),
             error_callback=lambda _error: self._finish_preprocess_task(task_id),
         )
@@ -1112,6 +1120,7 @@ class MMProcessEngine:
                 if raw_result is None:
                     raise RuntimeError("sync embedding did not produce a cache value")
                 work_items[0].complete_cache(raw_result, force=True)
+                diag.event(request_id, "vit.cache_ready", entry=id(entry))
             elif self._greennet_enabled():
                 verdict = entry.wait_greennet(timeout=self._greennet_timeout_s)
                 if verdict is None:
@@ -1260,8 +1269,10 @@ class MMProcessEngine:
                             mm_inputs,
                             cache_claim=cache_claim,
                             defer_cache_complete=defer_cache_complete,
+                            request_id=request_id,
                         )
                         self._wait_for_preprocessing(work_items)
+                        diag.event(request_id, "vit.preprocess_ready")
 
                     with torch.profiler.record_function("compute_embeddings"):
                         emb_res, pos_res, extra_input_res = self._compute_embeddings(
@@ -1311,6 +1322,7 @@ class MMProcessEngine:
         mm_inputs: List[MultimodalInput],
         cache_claim: Optional[Tuple[str, MMEmbeddingCacheEntry, str]] = None,
         defer_cache_complete: bool = False,
+        request_id: int = 0,
     ) -> List[MMWorkItem]:
         """Create work items and submit preprocessing tasks."""
         if cache_claim is not None and len(mm_inputs) != 1:
@@ -1332,7 +1344,14 @@ class MMProcessEngine:
                 cache_claim=cache_claim if index == 0 else None,
                 defer_cache_complete=defer_cache_complete,
             )
+            work_item.trace_request_id = request_id
             work_items.append(work_item)
+            diag.event(
+                request_id,
+                "vit.preprocess_submit",
+                images=len(batch),
+                cache_wait=work_item.waiting_for_cache,
+            )
             self.preprocess_executor.submit(work_item)
 
         return work_items
@@ -1373,7 +1392,12 @@ class MMProcessEngine:
 
         if pending_items:
             check_prepared_image_deadline()
-            self._scheduler.submit_and_wait(pending_items)
+            with diag.span(
+                getattr(pending_items[0], "trace_request_id", 0),
+                "vit.scheduler_wait",
+                items=len(pending_items),
+            ):
+                self._scheduler.submit_and_wait(pending_items)
 
         emb_res, pos_res, tensor_res = [], [], []
         for wi in work_items:
@@ -1462,7 +1486,8 @@ class MMProcessEngine:
             for cache_key, entry in claims:
                 current_entry = entry
                 remaining = max(0.0, deadline - time.monotonic())
-                entry.wait_ready(timeout=remaining)
+                with diag.span(request_id, "vit.cache_wait", hashes_only=hashes_only):
+                    entry.wait_ready(timeout=remaining)
                 feature_hashes = self._hash_key_cache.get(cache_key, entry.generation)
                 raw_result = None
                 if not hashes_only or feature_hashes is None:
@@ -1536,6 +1561,10 @@ class MMProcessEngine:
                 state, entry = self._async_cache.try_acquire(cache_key)
                 claims.append((cache_key, entry))
                 claim_logs.append((cache_key, state))
+                if diag.selected(request_id):
+                    diag.event(
+                        request_id, "vit.cache_claim", state=state, entry=id(entry)
+                    )
                 if (
                     state == "complete"
                     and self._embedding_cache.peek(cache_key) is entry
@@ -1681,6 +1710,9 @@ class MMProcessEngine:
                         )
                         cancelled += 1
 
+        diag.event(
+            request_id, "vit.cancel_queued", detached=len(entries), cancelled=cancelled
+        )
         if cancelled:
             logging.info(
                 "Cancelled %d queued ViT task(s) for request %d",
@@ -1771,6 +1803,7 @@ class MMProcessEngine:
         cache_key: str,
         entry: MMEmbeddingCacheEntry,
         future: concurrent.futures.Future,
+        request_id: int = 0,
     ) -> None:
         with self._async_task_lock:
             try:
@@ -1797,6 +1830,7 @@ class MMProcessEngine:
                     logging.exception("Failed to remove completed ViT async task")
                 try:
                     self._release_async_slots()
+                    diag.event(request_id, "vit.compute_slot_released", entry=id(entry))
                 except Exception as cleanup_error:
                     self.report_vit_error(cleanup_error, entry)
                     logging.exception("Failed to release ViT async admission slot")
@@ -1812,6 +1846,7 @@ class MMProcessEngine:
         with self._async_task_lock:
             task = self._async_tasks.get(entry)
             source = task.source if task else None
+            diag.event(request_id, "vit.compute_worker_start", entry=id(entry))
             if source is not None:
                 deadline = source[3]()
         if time.monotonic() >= deadline:
@@ -1857,6 +1892,7 @@ class MMProcessEngine:
             try:
                 cached = url_data_cache_.check_cache(item.url)
                 if cached is not None:
+                    diag.event(request_id, "vit.image_bytes_cache_hit", entry=id(entry))
                     task.source = (item.url, cached.getvalue(), 0.0, owner_deadline)
                     ready.append((item, key, entry))
                     continue
@@ -1866,6 +1902,7 @@ class MMProcessEngine:
                 def download_deadline(end=hard_limit, budget=owner_deadline):
                     return min(end, budget() - self._compute_reserve)
 
+                diag.event(request_id, "vit.download_submit", entry=id(entry))
                 fut = stage.submit(
                     item.url,
                     _get_http_heads(self.vit_config.download_headers),
@@ -1980,6 +2017,14 @@ class MMProcessEngine:
                 return
 
             accepted, admitted = self._try_reserve_async_slots(len(active_pending))
+            diag.event(
+                request_id,
+                "vit.compute_admission",
+                accepted=accepted,
+                admitted=admitted,
+                capacity=self._async_admission_capacity,
+                requested=len(active_pending),
+            )
             if not accepted:
                 error = FtRuntimeException(
                     ExceptionType.CONCURRENCY_LIMIT_ERROR,
@@ -2000,6 +2045,12 @@ class MMProcessEngine:
             submitted = 0
             try:
                 for mm_input, cache_key, entry in active_pending:
+                    diag.event(
+                        request_id,
+                        "vit.compute_submit",
+                        entry=id(entry),
+                        budget_ms=timeout_ms,
+                    )
                     future = self._async_compute_executor.submit(
                         self._run_async_compute,
                         [mm_input],
@@ -2014,7 +2065,7 @@ class MMProcessEngine:
                     )
                     future.add_done_callback(
                         lambda completed, key=cache_key, cache_entry=entry: self._on_async_compute_done(
-                            key, cache_entry, completed
+                            key, cache_entry, completed, request_id
                         )
                     )
                     submitted += 1
@@ -2065,6 +2116,7 @@ class MMProcessEngine:
             if raw_result is None:
                 raise RuntimeError("async embedding did not produce a cache value")
             work_items[0].complete_cache(raw_result, force=True)
+            diag.event(request_id, "vit.cache_ready", entry=id(entry))
         except Exception as e:
             logging.exception(
                 "ViT background computation failed request_id=%s", request_id

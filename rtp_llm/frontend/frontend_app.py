@@ -27,6 +27,7 @@ from typing_extensions import override
 from uvicorn import Config, Server
 from uvicorn.loops.auto import auto_loop_setup
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.engine_config import EngineConfig
 from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.config.uvicorn_config import get_uvicorn_logging_config
@@ -549,6 +550,8 @@ class FrontendApp(object):
             )
         ]
         app = FastAPI(middleware=middleware)
+        if diag.SAMPLE_EVERY:
+            app.add_middleware(diag.ChatTraceMiddleware)
         allocator_dump_enabled = bool(
             getattr(self.server_config, "enable_torch_allocator_dump", False)
         )

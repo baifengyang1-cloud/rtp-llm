@@ -6,6 +6,7 @@ from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import Request
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.generate_config import (
     GenerateConfig,
@@ -641,7 +642,8 @@ class OpenaiEndpoint(object):
         renderer = (
             self.template_renderer if chat_request.user_template else self.chat_renderer
         )
-        rendered_input = self.render_chat(chat_request)
+        with diag.span(request_id, "frontend.render_chat"):
+            rendered_input = self.render_chat(chat_request)
         generate_config = self._extract_generation_config(
             chat_request, rendered_input.input_ids, renderer
         )
@@ -683,6 +685,12 @@ class OpenaiEndpoint(object):
             except (TypeError, ValueError):
                 pass
 
+        diag.event(
+            request_id,
+            "frontend.input_ready",
+            tokens=len(rendered_input.input_ids),
+            media=len(mm_inputs) if mm_inputs else 0,
+        )
         choice_generator = renderer.generate_choice(
             request_id,
             rendered_input.input_ids,

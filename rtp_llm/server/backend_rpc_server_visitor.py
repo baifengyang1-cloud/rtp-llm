@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, AsyncGenerator, Callable, List, Optional, Set
 
 import torch
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.generate_config import RoleAddr, RoleType
 from rtp_llm.config.model_config import ModelConfig as PyModelConfig
@@ -416,6 +417,7 @@ class BackendRPCServerVisitor:
         # Keep hash generation at the physical KV block granularity. Page-RR
         # routing samples canonical keys from this full logical-block key list;
         # it must not recompute request hashes with the virtual block size.
+        diag.event(input.request_id, "frontend.pd_keys_begin")
         full_block_cache_keys = get_block_cache_keys(token_ids, self.seq_size_per_block)
         block_cache_keys = self._route_cache_keys(full_block_cache_keys)
         self._report_recent_cache_key_metrics(block_cache_keys)
@@ -805,20 +807,46 @@ class BackendRPCServerVisitor:
             while True:
                 yielded_output = False
                 try:
+                    diag.event(
+                        input.request_id, "frontend.backend_attempt", attempt=attempt
+                    )
                     stream = await route_and_enqueue(attempt_input)
+                    diag.event(
+                        input.request_id,
+                        "frontend.backend_stream_wait",
+                        attempt=attempt,
+                    )
                     if is_streaming:
                         async for output in stream:
+                            if not yielded_output:
+                                diag.event(
+                                    input.request_id,
+                                    "frontend.backend_first_output",
+                                    attempt=attempt,
+                                )
                             yielded_output = True
                             yield output
                     else:
                         buffered_outputs = []
                         async for output in stream:
+                            if not buffered_outputs:
+                                diag.event(
+                                    input.request_id,
+                                    "frontend.backend_first_output",
+                                    attempt=attempt,
+                                )
                             buffered_outputs.append(output)
                         yielded_output = True
                         for output in buffered_outputs:
                             yield output
                     return
                 except BaseException as e:
+                    diag.event(
+                        input.request_id,
+                        "frontend.backend_attempt_error",
+                        attempt=attempt,
+                        error=type(e).__name__,
+                    )
                     set_aux_info(e)
                     if first_exc is None:
                         first_exc = e

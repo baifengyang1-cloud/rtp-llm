@@ -5,6 +5,7 @@ from concurrent import futures
 
 import grpc
 
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.exceptions import (
     ExceptionCategory,
     ExceptionType,
@@ -136,6 +137,10 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
         return rpc_done
 
     def AsyncSubmitEmbedding(self, multimodal_inputs: MultimodalInputsPB, context):
+        with diag.span(multimodal_inputs.request_id, "vit.submit_rpc"):
+            return self._async_submit_embedding(multimodal_inputs, context)
+
+    def _async_submit_embedding(self, multimodal_inputs: MultimodalInputsPB, context):
         pretrigger = (
             dict(context.invocation_metadata() or ()).get("x-rtp-pretrigger") == "1"
         )
@@ -227,6 +232,12 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
         return EmptyPB()
 
     def RemoteMultimodalEmbedding(self, multimodal_inputs: MultimodalInputsPB, context):
+        with diag.span(multimodal_inputs.request_id, "vit.embedding_rpc"):
+            return self._remote_multimodal_embedding(multimodal_inputs, context)
+
+    def _remote_multimodal_embedding(
+        self, multimodal_inputs: MultimodalInputsPB, context
+    ):
         tags = {"source": "vit_server"}
         start_us = _now_us()
         lifecycle_reported = False
@@ -271,7 +282,8 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 **limits,
             )
             res = merge_embedding_results(results)
-            output_pb = self._transport.transfer(multimodal_inputs, res)
+            with diag.span(owner, "vit.embedding_transfer"):
+                output_pb = self._transport.transfer(multimodal_inputs, res)
             add_multimodal_feature_hashes(output_pb, res.embeddings, res.feature_hashes)
             kmonitor.report(
                 GaugeMetrics.VIT_RPC_SERVER_HANDLER_RT_US_METRIC,
@@ -280,6 +292,12 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
             )
             return output_pb
         except MMSchedulerOverloadError as e:
+            diag.event(
+                multimodal_inputs.request_id,
+                "vit.rpc_error",
+                error=type(e).__name__,
+                code=getattr(e, "exception_type", None),
+            )
             # Backpressure, not a server fault: map to a defined, ret/backoff-able
             # status instead of a generic error. abort() raises to end the call.
             # NOTE: overload is returned directly to the client here; forwarding to
@@ -297,6 +315,12 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 ),
             )
         except MMSchedulerTimeoutError as e:
+            diag.event(
+                multimodal_inputs.request_id,
+                "vit.rpc_error",
+                error=type(e).__name__,
+                code=getattr(e, "exception_type", None),
+            )
             # Scheduler wait exceeded its embedding timeout.
             kmonitor.report(
                 AccMetrics.VIT_RPC_SERVER_ERROR_QPS_METRIC,
@@ -310,6 +334,12 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 ),
             )
         except MMSchedulerRequestTooLargeError as e:
+            diag.event(
+                multimodal_inputs.request_id,
+                "vit.rpc_error",
+                error=type(e).__name__,
+                code=getattr(e, "exception_type", None),
+            )
             # Client asked for more than a single request may carry -> a caller
             # error, so INVALID_ARGUMENT rather than UNKNOWN.
             kmonitor.report(
@@ -324,6 +354,12 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 ),
             )
         except FtRuntimeException as e:
+            diag.event(
+                multimodal_inputs.request_id,
+                "vit.rpc_error",
+                error=type(e).__name__,
+                code=getattr(e, "exception_type", None),
+            )
             grpc_status = _grpc_status_for_runtime_exception(e)
             kmonitor.report(
                 AccMetrics.VIT_RPC_SERVER_ERROR_QPS_METRIC,
