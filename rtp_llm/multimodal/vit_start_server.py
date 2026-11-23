@@ -1,4 +1,6 @@
+import gc
 import logging
+import time
 
 from setproctitle import setproctitle
 
@@ -75,6 +77,17 @@ def vit_start_server(
     )
 
     app = VitEndpointApp(py_env_configs, vit_process_engine, local_rank)
+    # Freeze the initialized worker once, before it can accept image requests.
+    started = time.monotonic()
+    collected = gc.collect()
+    gc.freeze()
+    logging.info(
+        "vit_gc_freeze server_id=%s collected=%d frozen=%d elapsed_ms=%.3f",
+        server_id,
+        collected,
+        gc.get_freeze_count(),
+        (time.monotonic() - started) * 1000,
+    )
     app.start(
         grpc_port=grpc_port,
         http_port=http_port,
