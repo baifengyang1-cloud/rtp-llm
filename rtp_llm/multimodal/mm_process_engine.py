@@ -8,6 +8,7 @@ import os
 import signal
 import threading
 import time
+from functools import partial
 from io import BytesIO
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -1870,15 +1871,14 @@ class MMProcessEngine:
                     _get_http_heads(self.vit_config.download_headers),
                     self.vit_config.mm_image_max_file_size_kb,
                     download_deadline,
+                    request_id=request_id,
+                    started=start,
+                    on_done=partial(
+                        self._image_download_done, (item, key, entry),
+                        start=start, owner_deadline=owner_deadline,
+                    ),
                 )
                 task.download = fut
-                fut.add_done_callback(
-                    lambda f, x=(
-                        item,
-                        key,
-                        entry,
-                    ), t=start, d=owner_deadline: self._image_download_done(x, f, t, d)
-                )
             except Exception as exc:
                 error = (
                     FtRuntimeException(ExceptionType.CONCURRENCY_LIMIT_ERROR, str(exc))
@@ -1896,6 +1896,8 @@ class MMProcessEngine:
             self._submit_async_compute_batch(ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms)
 
     def _image_download_done(self, pending, future, start, owner_deadline):
+        timing = future.download_timing
+        timing.callback_enter = time.monotonic()
         from internal_source.rtp_llm.utils.image_downloads import (
             DownloadBusy,
             ImageTooLarge,
@@ -1903,20 +1905,26 @@ class MMProcessEngine:
         from rtp_llm.multimodal.mm_error_messages import MMErr
 
         item, key, entry = pending
+        timing.lock_start = time.monotonic()
         with self._async_task_lock:
+            timing.callback_locked = time.monotonic()
             task = self._async_tasks.get(entry)
             if task is None or task.download is not future:
+                timing.handoff = "detached"
                 return
             task.download = None
             try:
                 if self._stopped or not task.request_ids or future.cancelled():
+                    timing.handoff = "cancelled"
                     raise FtRuntimeException(
                         ExceptionType.CANCELLED_ERROR, "Image download cancelled"
                     )
                 body = future.result()
                 left_ms = int(1000 * (owner_deadline() - time.monotonic()))
                 if left_ms <= 0:
+                    timing.handoff = "deadline_expired"
                     raise TimeoutError()
+                timing.handoff = "ready"
                 task.source = (
                     item.url,
                     body,
