@@ -205,7 +205,10 @@ class MMEmbeddingCacheEntry:
             raise self.error
 
     def complete(
-        self, result: Any, feature_hashes: Optional[List[torch.Tensor]] = None
+        self,
+        result: Any,
+        feature_hashes: Optional[List[torch.Tensor]] = None,
+        before_ready: Optional[Callable[[], None]] = None,
     ) -> bool:
         with self._state_lock:
             if self._terminal:
@@ -215,6 +218,12 @@ class MMEmbeddingCacheEntry:
         try:
             if self._on_complete is not None:
                 self._on_complete(self, result)
+            if before_ready is not None:
+                before_ready()
+        except Exception as error:
+            # A waiter must not consume a partially published completion.
+            self.error = error
+            raise
         finally:
             self._event.set()
         return True
@@ -743,8 +752,21 @@ class MMEmbeddingCache:
         entry: MMEmbeddingCacheEntry,
         result: Any,
         feature_hashes: Optional[List[torch.Tensor]] = None,
+        hash_key_cache: Optional[MMHashKeyCache] = None,
     ) -> bool:
-        return entry.complete(result, feature_hashes)
+        def publish_hashes() -> None:
+            if hash_key_cache is None or feature_hashes is None:
+                return
+            # Hashing and embedding transfers have already finished. Serialize
+            # this small sidecar insertion with removal/replacement so a late
+            # producer cannot overwrite another generation's routing hashes.
+            with self._lock:
+                if self._entries.get(cache_key) is entry:
+                    hash_key_cache.put(cache_key, feature_hashes, entry.generation)
+
+        # Publish the sidecar before waking readers. The callback is transient;
+        # retaining it on the entry would introduce a cache/entry reference cycle.
+        return entry.complete(result, feature_hashes, before_ready=publish_hashes)
 
     def fail(
         self, cache_key: str, entry: MMEmbeddingCacheEntry, error: Exception

@@ -637,15 +637,12 @@ class MMWorkItem:
         ):
             return
         self.embedding_cache.complete(
-            self.cache_key, self.cache_entry, result, self.feature_hashes
+            self.cache_key,
+            self.cache_entry,
+            result,
+            self.feature_hashes,
+            hash_key_cache=self.hash_key_cache,
         )
-        if (
-            self.hash_key_cache is not None
-            and self.embedding_cache.peek(self.cache_key) is self.cache_entry
-        ):
-            self.hash_key_cache.put(
-                self.cache_key, self.feature_hashes or [], self.cache_entry.generation
-            )
 
     def fail_cache(self, error: Exception) -> None:
         if (

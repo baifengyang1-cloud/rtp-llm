@@ -1,3 +1,13 @@
+py_test(
+    name = "feature_hash_test",
+    srcs = ["feature_hash_test.py"],
+    deps = ["//rtp_llm:testlib"],
+    exec_properties = select({
+        "@//:using_rocm": {"gpu": "MI308X-ROCM7"},
+        "//conditions:default": {"gpu": "A10"},
+    }),
+)
+
 filegroup(
     name = "testdata",
     srcs = glob([

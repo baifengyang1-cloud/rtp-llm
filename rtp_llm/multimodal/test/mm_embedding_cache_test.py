@@ -76,6 +76,88 @@ class EmbeddingTraversalLifetimeTest(unittest.TestCase):
         self.assertEqual(_embedding_result_cost(result), (6, 432))
 
 
+class EmbeddingHashPublicationTest(unittest.TestCase):
+    def setUp(self):
+        self.cache = MMEmbeddingCache(gpu_max_bytes=0, cpu_max_bytes=4096)
+        self.hashes = MMHashKeyCache(max_bytes=4096)
+        self.value = (torch.ones(2, 4), None)
+        self.tokens = [torch.tensor([-3, 4], dtype=torch.int32)]
+
+    def complete(self, entry):
+        return self.cache.complete(
+            "image", entry, self.value, self.tokens, hash_key_cache=self.hashes
+        )
+
+    def test_waiters_cannot_wake_before_hash_publication(self):
+        _, entry = self.cache.try_acquire("image")
+        inserting, release = threading.Event(), threading.Event()
+        original = self.hashes.put
+
+        def delayed_put(*args, **kwargs):
+            inserting.set()
+            if not release.wait(5):
+                raise TimeoutError("hash publication barrier was not released")
+            original(*args, **kwargs)
+
+        def consume():
+            entry.wait_ready(5)
+            return self.hashes.get("image", entry.generation)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            with patch.object(self.hashes, "put", side_effect=delayed_put):
+                consumers = [executor.submit(consume) for _ in range(2)]
+                producer = executor.submit(self.complete, entry)
+                try:
+                    self.assertTrue(inserting.wait(5))
+                    self.assertFalse(entry._event.is_set())
+                    self.assertTrue(all(not future.done() for future in consumers))
+                finally:
+                    release.set()
+                self.assertTrue(producer.result(5))
+                for consumer in consumers:
+                    self.assertTrue(torch.equal(consumer.result(5)[0], self.tokens[0]))
+
+    def test_old_producer_cannot_replace_new_generation_hashes(self):
+        _, old = self.cache.try_acquire("image")
+        self.cache.remove("image")
+        _, current = self.cache.try_acquire("image")
+        self.assertTrue(self.complete(current))
+        expected = self.hashes.get("image", current.generation)
+        self.assertTrue(self.complete(old))
+        self.assertIs(self.hashes.get("image", current.generation), expected)
+        self.assertIsNone(self.hashes.get("image", old.generation))
+
+    def test_cancelled_and_duplicate_completions_do_not_publish(self):
+        _, cancelled = self.cache.try_acquire("image")
+        cancelled.fail(ValueError("cancelled"))
+        self.assertFalse(self.complete(cancelled))
+        self.assertIsNone(self.hashes.get("image"))
+        _, current = self.cache.try_acquire("image")
+        self.assertTrue(self.complete(current))
+        self.hashes.clear()
+        self.assertFalse(self.complete(current))
+        self.assertIsNone(self.hashes.get("image"))
+
+    def test_publication_error_reaches_waiter(self):
+        _, entry = self.cache.try_acquire("image")
+        with patch.object(self.hashes, "put", side_effect=RuntimeError("publish")):
+            with self.assertRaisesRegex(RuntimeError, "publish"):
+                self.complete(entry)
+        with self.assertRaisesRegex(RuntimeError, "publish"):
+            entry.wait_ready(1)
+        self.assertEqual(self.cache.try_acquire("image")[0], "miss")
+
+    def test_disabled_or_oversized_sidecar_still_completes(self):
+        for budget in (0, 1):
+            with self.subTest(budget=budget):
+                self.cache.clear()
+                self.hashes.resize(budget)
+                _, entry = self.cache.try_acquire("image")
+                self.assertTrue(self.complete(entry))
+                entry.wait_ready(1)
+                self.assertIsNone(self.hashes.get("image"))
+
+
 class EmbeddingCapacityTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_active_tensor_survives_demotion_eviction_and_same_key_replacement(self):

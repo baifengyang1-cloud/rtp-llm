@@ -39,14 +39,22 @@ __global__ void featureHashKernel(const uint8_t* input, int64_t num_rows, int64_
 
 }  // namespace
 
-cudaError_t
-invokeFeatureHash(const void* input, int64_t num_rows, int64_t row_bytes, int32_t* output, cudaStream_t stream) {
+FeatureHashError
+invokeFeatureHash(const void* input, int64_t num_rows, int64_t row_bytes, int32_t* output, FeatureHashStream stream) {
     if (input == nullptr || output == nullptr || num_rows <= 0 || row_bytes <= 0) {
+#if USING_ROCM
+        return hipErrorInvalidValue;
+#else
         return cudaErrorInvalidValue;
+#endif
     }
     featureHashKernel<<<static_cast<unsigned int>(num_rows), kFeatureHashThreads, 0, stream>>>(
         static_cast<const uint8_t*>(input), num_rows, row_bytes, output);
+#if USING_ROCM
+    return hipPeekAtLastError();
+#else
     return cudaPeekAtLastError();
+#endif
 }
 
 }  // namespace rtp_llm

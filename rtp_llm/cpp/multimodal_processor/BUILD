@@ -1,4 +1,4 @@
-load("//:def.bzl", "copts", "cuda_copts")
+load("//:def.bzl", "copts", "any_cuda_copts")
 
 cc_library(
     name = "multimodal_input_class",
@@ -65,12 +65,18 @@ cc_library(
     name = "feature_hash_kernel",
     srcs = ["FeatureHashKernel.cu"],
     hdrs = ["FeatureHashKernel.h"],
-    copts = cuda_copts(),
-    deps = [
-        ":feature_hash_utils",
-        "@local_config_cuda//cuda:cuda_headers",
-        "@local_config_cuda//cuda:cudart",
-    ],
+    copts = any_cuda_copts(),
+    deps = [":feature_hash_utils"] + select({
+        "@//:using_cuda": [
+            "@local_config_cuda//cuda:cuda_headers",
+            "@local_config_cuda//cuda:cudart",
+        ],
+        "@//:using_rocm": [
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:hip",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -105,6 +111,7 @@ cc_library(
         "//rtp_llm/cpp/pybind:py_utils",
     ] + select({
         "@//:using_cuda": [":feature_hash_kernel"],
+        "@//:using_rocm": [":feature_hash_kernel"],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],
