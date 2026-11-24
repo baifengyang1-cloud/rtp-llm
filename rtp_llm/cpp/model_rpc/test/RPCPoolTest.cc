@@ -137,7 +137,7 @@ TEST(RPCPoolTest, ReadyPreflightBoundsUnreadyChannelAndEvictsItsGeneration) {
     auto elapsed_ms = elapsedMs(begin);
 
     EXPECT_FALSE(result.ok());
-    EXPECT_EQ(result.status().code(), absl::StatusCode::kUnavailable);
+    EXPECT_EQ(result.status().code(), absl::StatusCode::kDeadlineExceeded);
     EXPECT_GE(elapsed_ms, 75);
     EXPECT_LT(elapsed_ms, 1000);
 
@@ -193,6 +193,38 @@ TEST(RPCPoolTest, OldGenerationCannotEraseReadyReplacement) {
     auto current = pool.getReadyConnection(server.address(), 2s);
     ASSERT_TRUE(current.ok()) << current.status();
     EXPECT_EQ(current->channel, replacement->channel);
+}
+
+TEST(RPCPoolTest, ExpiredDeadlineRejectsRequestWithoutEvictingReadyChannel) {
+    TestGrpcServer server;
+    RPCPool        pool;
+    auto           ready = pool.getReadyConnection(server.address(), 2s);
+    ASSERT_TRUE(ready.ok()) << ready.status();
+    ASSERT_EQ(ready->channel->GetState(false), GRPC_CHANNEL_READY);
+
+    auto expired = pool.getReadyConnection(server.address(), std::chrono::system_clock::now() - 1ms);
+    EXPECT_FALSE(expired.ok());
+    EXPECT_EQ(expired.status().code(), absl::StatusCode::kDeadlineExceeded);
+
+    auto current = pool.getReadyConnection(server.address(), 2s);
+    ASSERT_TRUE(current.ok()) << current.status();
+    EXPECT_EQ(current->channel, ready->channel);
+}
+
+TEST(RPCPoolTest, CancelledRequestCannotReuseReadyChannel) {
+    TestGrpcServer server;
+    RPCPool        pool;
+    auto           ready = pool.getReadyConnection(server.address(), 2s);
+    ASSERT_TRUE(ready.ok()) << ready.status();
+
+    auto cancelled = pool.getReadyConnection(
+        server.address(), std::chrono::system_clock::now() + 2s, []() { return true; });
+    EXPECT_FALSE(cancelled.ok());
+    EXPECT_EQ(cancelled.status().code(), absl::StatusCode::kCancelled);
+
+    auto current = pool.getReadyConnection(server.address(), 2s);
+    ASSERT_TRUE(current.ok()) << current.status();
+    EXPECT_EQ(current->channel, ready->channel);
 }
 
 }  // namespace

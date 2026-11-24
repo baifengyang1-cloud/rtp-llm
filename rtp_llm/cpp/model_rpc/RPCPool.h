@@ -102,14 +102,18 @@ public:
                 .count();
         const auto final_state = connection.channel->GetState(false);
         RTP_LLM_LOG_WARNING(
-            "grpc channel not ready, peer [%s], channel [%p], state [%d], final state [%d], elapsed [%ld]ms",
+            "grpc channel readiness deadline exceeded, peer [%s], channel [%p], state [%d], final state [%d], "
+            "elapsed [%ld]ms",
             peer.c_str(),
             static_cast<void*>(connection.channel.get()),
             static_cast<int>(state),
             static_cast<int>(final_state),
             elapsed_ms);
-        removeConnection(peer, connection.channel);
-        return absl::UnavailableError("grpc channel for " + peer + " is not ready");
+        // A caller's expired budget does not make a READY pooled channel bad.
+        if (final_state != GRPC_CHANNEL_READY) {
+            removeConnection(peer, connection.channel);
+        }
+        return absl::DeadlineExceededError("grpc channel readiness deadline for " + peer + " was exceeded");
     }
 
     void removeConnection(const std::string& peer, const std::shared_ptr<grpc::Channel>& expected_channel) {

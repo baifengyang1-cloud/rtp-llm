@@ -403,7 +403,7 @@ TEST_F(PrefillRpcServerTest, decodeReadinessWithoutConfiguredBudgetsUsesSafetyCa
     EXPECT_LE(remaining, 15000);
 }
 
-TEST_F(PrefillRpcServerTest, decodeReadinessUsesTightestRetryAndRpcBudgets) {
+TEST_F(PrefillRpcServerTest, decodeReadinessUsesRequestAndRpcBudgetsInsteadOfRetryBudget) {
     GenerateInputPB request;
     request.set_request_id(7);
     auto context = makeContext(&request, /*timeout_ms=*/500);
@@ -415,9 +415,9 @@ TEST_F(PrefillRpcServerTest, decodeReadinessUsesTightestRetryAndRpcBudgets) {
     const auto           remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - before).count();
 
     EXPECT_GT(remaining, 0);
-    EXPECT_LE(remaining, 80);
+    EXPECT_LE(remaining, 200);
     ASSERT_TRUE(context->retry_deadline.has_value());
-    EXPECT_EQ(deadline, *context->retry_deadline);
+    EXPECT_GT(deadline, *context->retry_deadline);
 
     context->setRetryTimeoutMs(400);
     const auto rpc_before    = std::chrono::system_clock::now();
@@ -427,10 +427,10 @@ TEST_F(PrefillRpcServerTest, decodeReadinessUsesTightestRetryAndRpcBudgets) {
     EXPECT_LE(rpc_remaining, 30);
 }
 
-TEST_F(PrefillRpcServerTest, retriesReuseOneAbsoluteReadinessDeadline) {
+TEST_F(PrefillRpcServerTest, retriesReuseOriginalRequestReadinessDeadline) {
     GenerateInputPB request;
     request.set_request_id(8);
-    auto context = makeContext(&request);
+    auto context = makeContext(&request, /*timeout_ms=*/1000);
 
     TestPrefillRpcServer                               server;
     std::vector<std::chrono::system_clock::time_point> observed_deadlines;
@@ -450,9 +450,34 @@ TEST_F(PrefillRpcServerTest, retriesReuseOneAbsoluteReadinessDeadline) {
                                   /*retry_interval_ms=*/0)
                     .ok());
     ASSERT_TRUE(context->retry_deadline.has_value());
+    ASSERT_TRUE(context->request_deadline.has_value());
     ASSERT_EQ(observed_deadlines.size(), 2);
-    EXPECT_EQ(observed_deadlines[0], *context->retry_deadline);
-    EXPECT_EQ(observed_deadlines[1], *context->retry_deadline);
+    EXPECT_EQ(observed_deadlines[0], *context->request_deadline);
+    EXPECT_EQ(observed_deadlines[1], *context->request_deadline);
+}
+
+TEST_F(PrefillRpcServerTest, admittedAllocationCanUseReadyDecodeAfterRetryBudgetExpires) {
+    TestDecodeRpcServer decode_server(/*fail_first_allocate=*/false);
+    ASSERT_TRUE(decode_server.start());
+
+    GenerateInputPB request;
+    request.set_request_id(13);
+    auto context            = makeContext(&request, /*timeout_ms=*/5000);
+    context->generate_input = makeMultimodalInput();
+    context->generate_input->generate_config->role_addrs.emplace_back(
+        RoleType::DECODE, "127.0.0.1", 0, decode_server.listenPort());
+    context->retry_deadline = std::chrono::system_clock::now() - std::chrono::milliseconds(1);
+
+    TestPrefillRpcServer server;
+    server.mm_processor_ = std::make_shared<TestMultimodalProcessor>(ErrorCode::NONE_ERROR);
+    auto ready = server.resource().rpc_pool.getReadyConnection(
+        "127.0.0.1:" + std::to_string(decode_server.listenPort()), std::chrono::seconds(2));
+    ASSERT_TRUE(ready.ok()) << ready.status();
+
+    EXPECT_TRUE(server.prepareAllocateResource(*context).ok());
+    EXPECT_FALSE(context->hasError()) << context->error_info.ToString();
+    EXPECT_EQ(decode_server.allocateCount(), 1);
+    EXPECT_TRUE(context->closeGrpcStream().ok());
 }
 
 TEST_F(PrefillRpcServerTest, downstreamRetriesReuseOriginalAbsoluteDeadline) {

@@ -111,7 +111,9 @@ std::chrono::system_clock::time_point
 PrefillRpcServer::decodeChannelReadyDeadline(const PrefillGenerateContext& prefill_context,
                                              int64_t                       max_rpc_timeout_ms) {
     auto       deadline     = std::chrono::system_clock::now() + kDecodeChannelReadyTimeoutCap;
-    const auto rpc_deadline = prefill_context.effectiveDeadline(max_rpc_timeout_ms);
+    // The retry budget gates starting another allocation attempt. It must not
+    // expire an already admitted attempt while looking up a healthy channel.
+    const auto rpc_deadline = prefill_context.streamRpcDeadline(max_rpc_timeout_ms);
     if (rpc_deadline.has_value()) {
         deadline = std::min(deadline, *rpc_deadline);
     }
@@ -306,6 +308,9 @@ void PrefillRpcServer::getRpcConnection(PrefillGenerateContext& prefill_context)
             setContextError(prefill_context, ErrorInfo(ErrorCode::CANCELLED, "request is cancelled"));
         } else if (prefill_context.requestDeadlineExceeded()) {
             setContextError(prefill_context, ErrorInfo(ErrorCode::GENERATE_TIMEOUT, "request deadline exhausted"));
+        } else if (absl::IsDeadlineExceeded(connect_status.status())) {
+            setContextError(
+                prefill_context, ErrorInfo(ErrorCode::GENERATE_TIMEOUT, "decode channel readiness deadline exhausted"));
         } else {
             setContextError(prefill_context,
                             ErrorInfo(ErrorCode::GET_CONNECTION_FAILED,

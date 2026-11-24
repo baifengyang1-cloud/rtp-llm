@@ -128,8 +128,11 @@ cc_test(
     srcs = ["PrefillRpcServerTest.cc"],
     copts = test_copts,
     deps = test_deps,
-    env = {},
-    exec_properties = {'gpu':'A10'},
+    env = device_test_envs(),
+    exec_properties = select({
+        "@//:using_rocm": {"gpu": "MI308X-ROCM7"},
+        "//conditions:default": {"gpu": "A10"},
+    }),
 )
 
 cc_test(
