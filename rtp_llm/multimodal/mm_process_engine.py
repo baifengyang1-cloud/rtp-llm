@@ -56,6 +56,7 @@ from rtp_llm.multimodal.multimodal_util import (
 from rtp_llm.multimodal.vit_metrics import (
     VitMetricSample,
     collect_vit_preprocess_metrics,
+    image_log_id,
 )
 from rtp_llm.ops import MMPreprocessConfig, MultimodalInput, get_multimodal_feature_hash
 from rtp_llm.utils.base_model_datatypes import MMUrlType
@@ -71,15 +72,35 @@ def _run_preprocess_task(
     mm_inputs: List[MultimodalInput],
     vit_config: VitConfig,
     preprocess_params: dict,
+    request_id: int = 0,
 ) -> Tuple[Any, float, float, List[VitMetricSample]]:
     """Run preprocessing and return total and media-load durations in ms."""
-    with collect_vit_preprocess_metrics() as samples, collect_download_timing() as download_timing:
-        with Timer() as route_timer:
-            result = preprocess_func(mm_inputs, vit_config, **preprocess_params)
+    with (
+        collect_vit_preprocess_metrics(request_id) as samples,
+        collect_download_timing() as download_timing,
+    ):
+        outcome = "error"
+        try:
+            with Timer() as route_timer:
+                result = preprocess_func(mm_inputs, vit_config, **preprocess_params)
+            outcome = "ok"
+        finally:
+            total_ms = route_timer.cost_ms() + download_timing.prefetched_ms
+            download_ms = download_timing.elapsed_ms
+            logging.info(
+                "vit_preprocess_timing request_id=%s image_ids=%s outcome=%s "
+                "total_ms=%.3f download_ms=%.3f preprocess_ms=%.3f",
+                request_id,
+                ",".join(image_log_id(item.url) for item in mm_inputs),
+                outcome,
+                total_ms,
+                download_ms,
+                max(0.0, total_ms - download_ms),
+            )
     return (
         result,
-        route_timer.cost_ms() + download_timing.prefetched_ms,
-        download_timing.elapsed_ms,
+        total_ms,
+        download_ms,
         samples.samples,
     )
 
@@ -150,6 +171,7 @@ def _worker_process_task(
             mm_inputs,
             _worker_vit_config,
             _worker_preprocess_params,
+            request_id=request_id,
         )
 
 
@@ -258,6 +280,7 @@ class LocalPreprocessExecutor(PreprocessExecutor):
                     work_item.mm_inputs,
                     self.vit_config,
                     self.preprocess_params,
+                    request_id=getattr(work_item, "trace_request_id", 0),
                 )
             result, preprocess_time, download_time = _unpack_preprocess_result(payload)
             work_item.preprocess_result = result
@@ -1911,8 +1934,10 @@ class MMProcessEngine:
                     request_id=request_id,
                     started=start,
                     on_done=partial(
-                        self._image_download_done, (item, key, entry),
-                        start=start, owner_deadline=owner_deadline,
+                        self._image_download_done,
+                        (item, key, entry),
+                        start=start,
+                        owner_deadline=owner_deadline,
                     ),
                 )
                 task.download = fut
@@ -1930,7 +1955,9 @@ class MMProcessEngine:
         if admission_error is not None:
             raise admission_error
         if ready:
-            self._submit_async_compute_batch(ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms)
+            self._submit_async_compute_batch(
+                ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms
+            )
 
     def _image_download_done(self, pending, future, start, owner_deadline):
         timing = future.download_timing
@@ -1970,7 +1997,9 @@ class MMProcessEngine:
                 )
                 url_data_cache_.insert_cache(item.url, BytesIO(body))
                 self._submit_async_compute_batch(
-                    [pending], request_id=next(iter(task.request_ids)), queue_timeout_ms=left_ms
+                    [pending],
+                    request_id=next(iter(task.request_ids)),
+                    queue_timeout_ms=left_ms,
                 )
                 return
             except FtRuntimeException as e:

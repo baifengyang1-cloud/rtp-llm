@@ -26,7 +26,14 @@ from rtp_llm.multimodal.multimodal_mixins.qwen2_5_vl.qwen2_5_vl_mixin import (
     smart_resize,
 )
 from rtp_llm.multimodal.multimodal_util import get_bytes_io_from_url
+from rtp_llm.multimodal.qwen_image_preprocess import (
+    default_resize_size,
+    maybe_draft_jpeg,
+    prepare_device_pixels,
+    resize_qwen_image,
+)
 from rtp_llm.multimodal.vit_metrics import (
+    image_preprocess_timing,
     record_vit_preprocess_value,
     vit_preprocess_timer,
 )
@@ -78,79 +85,107 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
         vit_config: VitConfig,
         processor,
         factor: int = 32,
+        defer_pixel_processing: bool = False,
     ):
         assert len(mm_inputs) == 1
         mm_input = mm_inputs[0]
         mm_type = mm_input.mm_type
         do_resize = True
         if mm_type == MMUrlType.DEFAULT or mm_type == MMUrlType.IMAGE:
-            tags = {"model": "qwen3_vl", "mm_type": "image"}
-            with vit_preprocess_timer(GaugeMetrics.VIT_IMAGE_FETCH_RT_US_METRIC, tags):
-                image_data = get_bytes_io_from_url(
-                    mm_input.url,
-                    vit_config.download_headers,
-                    max_file_size_kb=vit_config.mm_image_max_file_size_kb,
-                )
-            with vit_preprocess_timer(GaugeMetrics.VIT_IMAGE_DECODE_RT_US_METRIC, tags):
-                image = Image.open(image_data)
-            if (
-                mm_input.mm_preprocess_config.height != -1
-                and mm_input.mm_preprocess_config.width != -1
-            ):
-                resized_height, resized_width = smart_resize(
-                    mm_input.mm_preprocess_config.height,
-                    mm_input.mm_preprocess_config.width,
-                    factor=factor,
+            with image_preprocess_timing(mm_input.url) as timing:
+                tags = {"model": "qwen3_vl", "mm_type": "image"}
+                with vit_preprocess_timer(
+                    GaugeMetrics.VIT_IMAGE_FETCH_RT_US_METRIC, tags
+                ):
+                    image_data = get_bytes_io_from_url(
+                        mm_input.url,
+                        vit_config.download_headers,
+                        max_file_size_kb=vit_config.mm_image_max_file_size_kb,
+                    )
+                timing["image_bytes"] = image_data.getbuffer().nbytes
+                with vit_preprocess_timer(
+                    GaugeMetrics.VIT_IMAGE_DECODE_RT_US_METRIC, tags
+                ):
+                    image = Image.open(image_data)
+                    timing.update(
+                        original_width=image.width,
+                        original_height=image.height,
+                        original_pixels=image.width * image.height,
+                        image_format=image.format,
+                    )
+                    config = mm_input.mm_preprocess_config
+                    target_hw = None
+                    processor_resize = False
+                    if config.height != -1 and config.width != -1:
+                        target_hw = smart_resize(
+                            config.height, config.width, factor=factor
+                        )
+                    elif config.max_pixels != -1 or config.min_pixels != -1:
+                        target_hw = smart_resize(
+                            image.height,
+                            image.width,
+                            factor=factor,
+                            min_pixels=(
+                                0 if config.min_pixels == -1 else config.min_pixels
+                            ),
+                            max_pixels=(
+                                0x7FFFFFFF
+                                if config.max_pixels == -1
+                                else config.max_pixels
+                            ),
+                        )
+                    else:
+                        target_hw = default_resize_size(
+                            image, processor.image_processor, factor
+                        )
+                        processor_resize = True
+                    timing["jpeg_draft"] = maybe_draft_jpeg(image, target_hw)
+                    timing.update(
+                        decoded_width=image.width, decoded_height=image.height
+                    )
+                    # Pillow opens lazily; count pixel decoding here instead of
+                    # charging it to resize or the image processor below.
+                    image.load()
+                if target_hw is not None:
+                    resized_height, resized_width = target_hw
+                    with vit_preprocess_timer(
+                        GaugeMetrics.VIT_IMAGE_RESIZE_RT_US_METRIC, tags
+                    ):
+                        image = resize_qwen_image(
+                            image,
+                            processor.image_processor,
+                            target_hw,
+                            processor_resize=processor_resize,
+                        )
+                    record_vit_preprocess_value(
+                        GaugeMetrics.VIT_RESIZED_PIXEL_COUNT_METRIC,
+                        resized_width * resized_height,
+                        tags,
+                    )
+                    do_resize = False
+                timing.update(
+                    processor_input_width=image.width,
+                    processor_input_height=image.height,
+                    processor_do_resize=do_resize,
                 )
                 with vit_preprocess_timer(
-                    GaugeMetrics.VIT_IMAGE_RESIZE_RT_US_METRIC, tags
+                    GaugeMetrics.VIT_IMAGE_PROCESSOR_RT_US_METRIC, tags
                 ):
-                    image = image.resize((resized_width, resized_height))
-                record_vit_preprocess_value(
-                    GaugeMetrics.VIT_RESIZED_PIXEL_COUNT_METRIC,
-                    resized_width * resized_height,
-                    tags,
-                )
-                do_resize = False
-            elif (
-                mm_input.mm_preprocess_config.max_pixels != -1
-                or mm_input.mm_preprocess_config.min_pixels != -1
-            ):
-                width, height = image.size
-                min_pixels = (
-                    0
-                    if mm_input.mm_preprocess_config.min_pixels == -1
-                    else mm_input.mm_preprocess_config.min_pixels
-                )
-                max_pixels = (
-                    0x7FFFFFFF
-                    if mm_input.mm_preprocess_config.max_pixels == -1
-                    else mm_input.mm_preprocess_config.max_pixels
-                )
-                resized_height, resized_width = smart_resize(
-                    height,
-                    width,
-                    factor=factor,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
-                )
-                with vit_preprocess_timer(
-                    GaugeMetrics.VIT_IMAGE_RESIZE_RT_US_METRIC, tags
-                ):
-                    image = image.resize((resized_width, resized_height))
-                record_vit_preprocess_value(
-                    GaugeMetrics.VIT_RESIZED_PIXEL_COUNT_METRIC,
-                    resized_width * resized_height,
-                    tags,
-                )
-                do_resize = False
-            with vit_preprocess_timer(
-                GaugeMetrics.VIT_IMAGE_PROCESSOR_RT_US_METRIC, tags
-            ):
-                res = processor.image_processor(
-                    image, return_tensors="pt", do_resize=do_resize
-                )
-            return res["pixel_values"], res["image_grid_thw"]
+                    if defer_pixel_processing and (
+                        not do_resize or not processor.image_processor.do_resize
+                    ):
+                        prepared = prepare_device_pixels(
+                            image, processor.image_processor
+                        )
+                        if prepared is not None:
+                            timing["pixel_processing_deferred"] = True
+                            timing["image_grid_thw"] = prepared[1].tolist()
+                            return prepared
+                    res = processor.image_processor(
+                        image, return_tensors="pt", do_resize=do_resize
+                    )
+                timing["image_grid_thw"] = res["image_grid_thw"].tolist()
+                return res["pixel_values"], res["image_grid_thw"]
         elif mm_type == MMUrlType.VIDEO:
             tags = {"model": "qwen3_vl", "mm_type": "video"}
             with vit_preprocess_timer(GaugeMetrics.VIT_IMAGE_FETCH_RT_US_METRIC, tags):
