@@ -95,6 +95,7 @@ public:
     bool                          force_disable_sp_run     = false;
     bool                          force_sp_accept          = false;
     ReturnAllProbsMode            return_all_probs         = ReturnAllProbsMode::NONE;
+    int32_t                       logprobs_top_k           = -1;
     bool                          return_softmax_probs     = false;
     bool                          aux_info                 = true;
     std::vector<std::vector<int>> stop_words_list;
@@ -198,6 +199,7 @@ public:
                      << ", top_p:" << top_p << ", force_disable_sp_run: " << force_disable_sp_run
                      << ", force_sp_accept: " << force_sp_accept
                      << ", return_all_probs: " << static_cast<int>(return_all_probs)
+                     << ", logprobs_top_k: " << logprobs_top_k
                      << ", json_schema: " << summarize_optional_string(json_schema)
                      << ", regex: " << summarize_optional_string(regex) << ", ebnf: " << summarize_optional_string(ebnf)
                      << ", structural_tag: " << summarize_optional_string(structural_tag)
@@ -317,6 +319,7 @@ public:
                 // field absent or other parse error — keep prior value
             }
         }
+        JSONIZE(logprobs_top_k);
         JSONIZE(sp_advice_prompt);
         JSONIZE(sp_advice_prompt_token_ids);
         JSONIZE(in_think_mode);

@@ -19,6 +19,32 @@ namespace rtp_llm {
 
 class QueryConverterTest: public DeviceTestBase {};
 
+TEST_F(QueryConverterTest, CompactLogprobsConfigIsOptInOnTheWire) {
+    GenerateConfigPB pb;
+    EXPECT_EQ(QueryConverter::transGenerateConfig(&pb)->logprobs_top_k, -1);
+    pb.mutable_logprobs_top_k()->set_value(0);
+    EXPECT_EQ(QueryConverter::transGenerateConfig(&pb)->logprobs_top_k, 0);
+    pb.mutable_logprobs_top_k()->set_value(5);
+    EXPECT_EQ(QueryConverter::transGenerateConfig(&pb)->logprobs_top_k, 5);
+}
+
+TEST_F(QueryConverterTest, CompactProbabilityResponseContainsNoDenseTensor) {
+    GenerateOutputs outputs;
+    GenerateOutput  output;
+    output.output_ids                 = torch::tensor({{2}}, torch::kInt32);
+    output.aux_info.logprob_token_ids = torch::tensor({{2, 1}}, torch::kInt32);
+    output.aux_info.logprob_values    = torch::tensor({{-1.0f, -0.5f}});
+    outputs.generate_outputs.push_back(output);
+    GenerateOutputsPB pb;
+    QueryConverter::transResponse(&pb, &outputs, true, "", 0);
+    EXPECT_FALSE(pb.flatten_output().has_all_probs());
+    ASSERT_EQ(pb.flatten_output().aux_info_size(), 1);
+    auto& aux = pb.flatten_output().aux_info(0);
+    EXPECT_EQ(QueryConverter::transTensor(aux.logprob_token_ids()).numel(), 2);
+    EXPECT_TRUE(
+        torch::equal(QueryConverter::transTensor(aux.logprob_values()), output.aux_info.logprob_values.value()));
+}
+
 TEST_F(QueryConverterTest, testTransInput) {
     ASSERT_TRUE(GenerateConfig().enable_disk_cache);
 

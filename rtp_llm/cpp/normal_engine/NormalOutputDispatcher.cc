@@ -326,7 +326,7 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
     }
 
     torch::Tensor all_probs;
-    if (return_all_probs) {
+    if (return_all_probs && stream->getReturnAllProbs() != ReturnAllProbsMode::NONE) {
         all_probs = sampler_output.all_probs.narrow(0, batch_idx_out, next_batch_size);
     };
 

@@ -649,6 +649,37 @@ class CustomChatRenderer:
             multimodal_lengths=aux_info.multimodal_lengths,
         )
 
+    def _generate_compact_log_probs(
+        self, status, compact: Dict[str, torch.Tensor], output_ids: torch.Tensor
+    ) -> ChatCompletionTokenLogprob:
+        ids = compact["token_ids"].reshape(-1).tolist()
+        values = compact["logprobs"].reshape(-1).tolist()
+        selected_id = output_ids.reshape(-1)[-1].item()
+        if not ids or len(ids) != len(values) or ids[0] != selected_id:
+            raise ValueError("compact logprobs do not match the generated token")
+        text = self.tokenizer.decode([selected_id])
+        result = ChatCompletionTokenLogprob(
+            token=text,
+            bytes=list(text.encode("utf-8", errors="replace")),
+            logprob=values[0],
+            top_logprobs=[],
+        )
+        for token_id, value in list(zip(ids[1:], values[1:]))[
+            : status.request.top_logprobs or 1
+        ]:
+            # The dense renderer excludes zero-probability candidates too.
+            if value == float("-inf"):
+                continue
+            text = self.tokenizer.decode([token_id])
+            result.top_logprobs.append(
+                TopLogprob(
+                    token=text,
+                    bytes=list(text.encode("utf-8", errors="replace")),
+                    logprob=value,
+                )
+            )
+        return result
+
     async def _generate_log_probs(
         self, status: StreamStatus, output: Optional[GenerateOutput]
     ) -> Optional[ChatCompletionTokenLogprob]:
@@ -660,6 +691,10 @@ class CustomChatRenderer:
         output_id = output.output_ids
         if output_id == None:
             return None
+        if getattr(output, "compact_logprobs", None) is not None:
+            return self._generate_compact_log_probs(
+                status, output.compact_logprobs, output_id
+            )
         selected_id = output_id[-1].item()
         if all_probs == None:
             raise Exception(
@@ -1280,6 +1315,8 @@ class CustomChatRenderer:
         output_id = output_ids
         if output_id == None:
             return None
+        if isinstance(all_probs, dict):
+            return self._generate_compact_log_probs(status, all_probs, output_id)
         selected_id = output_id[-1].item()
         if all_probs == None:
             raise Exception(

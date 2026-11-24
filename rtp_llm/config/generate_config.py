@@ -238,6 +238,8 @@ class GenerateConfig(BaseModel):
     force_sp_accept: bool = False
     return_cum_log_probs: bool = False
     return_all_probs: int = ReturnAllProbsMode.NONE
+    # -1 keeps the dense probability response; otherwise retain selected + top-k.
+    logprobs_top_k: int = Field(default=-1, ge=-1, le=1024)
     return_softmax_probs: bool = False
     aux_info: bool = True
     can_use_pd_separation: bool = True

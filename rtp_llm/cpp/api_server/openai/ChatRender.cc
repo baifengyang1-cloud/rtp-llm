@@ -18,19 +18,25 @@ void RenderContext::init(int n, std::string body, std::shared_ptr<ChatRender> ch
     complete_responses_           = std::make_shared<py::list>();
 }
 
-std::tuple<std::vector<int>, std::vector<int>, std::vector<int>, std::vector<th::Tensor>, std::vector<th::Tensor>>
+std::tuple<std::vector<int>, std::vector<int>, std::vector<int>, std::vector<py::object>, std::vector<th::Tensor>>
 getArgs(const GenerateOutputs& outputs) {
     std::vector<int>        input_len_list, output_len_list, reuse_len_list;
-    std::vector<th::Tensor> all_probs_list, output_ids_list;
+    std::vector<py::object> all_probs_list;
+    std::vector<th::Tensor> output_ids_list;
     for (const auto& output : outputs.generate_outputs) {
         const auto& aux_info = output.aux_info;
         input_len_list.push_back(aux_info.input_len);
         output_len_list.push_back(aux_info.output_len);
         reuse_len_list.push_back(aux_info.reuse_len);
-        if (aux_info.all_probs.has_value()) {
-            all_probs_list.push_back(aux_info.all_probs.value());
+        if (aux_info.logprob_token_ids.has_value()) {
+            py::dict compact;
+            compact["token_ids"] = py::cast(aux_info.logprob_token_ids.value());
+            compact["logprobs"]  = py::cast(aux_info.logprob_values.value());
+            all_probs_list.push_back(compact);
+        } else if (aux_info.all_probs.has_value()) {
+            all_probs_list.push_back(py::cast(aux_info.all_probs.value()));
         } else {
-            all_probs_list.push_back(th::empty({0}));
+            all_probs_list.push_back(py::cast(th::empty({0})));
         }
         output_ids_list.push_back(output.output_ids);
     }
