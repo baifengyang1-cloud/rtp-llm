@@ -187,6 +187,80 @@ def _submit_concurrently(
 
 
 class MMSchedulerTest(TestCase):
+    def test_completed_work_item_released_without_gc_while_idle(self):
+        sched = MMScheduler(_FakeMMPart(), batch_wait_ms=0, max_batch_size=1)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+
+            def submit():
+                item = _FakeWorkItem()
+                item_ref = weakref.ref(item)
+                sched.submit_and_wait([item])
+                self.assertIsNotNone(item.embedding_result)
+                return item_ref
+
+            item_ref = submit()
+            deadline = time.monotonic() + 2.0
+            while item_ref() is not None and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertIsNone(
+                item_ref(), "idle scheduler retains a completed request without GC"
+            )
+        finally:
+            sched.close()
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_rejected_work_item_released_without_gc(self):
+        sched = MMScheduler(_FakeMMPart(), batch_wait_ms=0)
+        sched.close()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+
+            def submit():
+                item = _FakeWorkItem()
+                item_ref = weakref.ref(item)
+                with self.assertRaisesRegex(RuntimeError, "closed"):
+                    sched.submit_and_wait([item])
+                return item_ref
+
+            self.assertIsNone(submit()(), "rejected request requires cyclic GC")
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_timed_out_inflight_work_survives_until_forward_finishes(self):
+        release = threading.Event()
+        fake = _FakeMMPart(block_until=release)
+        sched = MMScheduler(fake, batch_wait_ms=0, max_batch_size=1)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+
+            def submit():
+                item = _FakeWorkItem(timeout_ms=100)
+                item_ref = weakref.ref(item)
+                tensor_ref = weakref.ref(item.preprocess_result)
+                with self.assertRaisesRegex(TimeoutError, "timeout"):
+                    sched.submit_and_wait([item])
+                return item_ref, tensor_ref
+
+            item_ref, tensor_ref = submit()
+            self.assertTrue(fake.forward_entered.is_set())
+            self.assertIsNotNone(item_ref(), "in-flight work was released too early")
+            self.assertIsNotNone(tensor_ref())
+            release.set()
+            self.assertTrue(sched.close())
+            self.assertIsNone(item_ref(), "cancelled request requires cyclic GC")
+            self.assertIsNone(tensor_ref())
+        finally:
+            release.set()
+            sched.close()
+            if gc_was_enabled:
+                gc.enable()
+
     def test_multi_request_batching(self):
         """Several concurrent submissions are merged into one forward."""
         fake = _FakeMMPart()

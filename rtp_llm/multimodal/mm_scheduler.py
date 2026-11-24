@@ -529,6 +529,25 @@ class MMScheduler:
         if not work_items:
             return
         req = _EmbeddingRequest(work_items)
+        try:
+            self._submit_and_wait(req)
+        finally:
+            # Chunks point back to their request. Break the owning links on
+            # success, rejection and cancellation, without waiting for cyclic
+            # GC to release completed work items and their tensors. A queued or
+            # running chunk keeps its own work_items until the executor is done.
+            with self._lock:
+                if not req.future.done():
+                    req.cancelled = True
+                    req.future.cancel()
+                    self._admitted_requests.discard(req)
+                req.chunks = []
+                req.work_items = []
+            # An exception traceback can retain this frame after we return.
+            work_items = []
+
+    def _submit_and_wait(self, req: _EmbeddingRequest) -> None:
+        work_items = req.work_items
         self._build_chunks(req)
 
         # mm_timeout_ms is normally a positive int (server default 120000), but
@@ -672,6 +691,11 @@ class MMScheduler:
                         torch.cuda.empty_cache()
                     if batch:
                         self._fail_chunks(batch, error)
+                finally:
+                    # Do not retain the last completed batch while the next
+                    # _collect_batch() waits for traffic on an idle worker.
+                    batch = None
+                    claimed = None
         finally:
             self._fail_all_queued()
 
