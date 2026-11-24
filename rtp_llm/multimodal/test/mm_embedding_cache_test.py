@@ -1,11 +1,79 @@
 import concurrent.futures
+import gc
 import threading
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
 
-from rtp_llm.multimodal.mm_embedding_cache import MMEmbeddingCache, MMHashKeyCache
+from rtp_llm.multimodal.mm_embedding_cache import (
+    MMEmbeddingCache,
+    MMHashKeyCache,
+    _copy_result_to_devices,
+    _embedding_result_cost,
+    _tensor_tier_bytes,
+)
+
+
+class EmbeddingTraversalLifetimeTest(unittest.TestCase):
+    def test_accounting_scratch_sets_released_without_gc(self):
+        refs = []
+
+        def scratch_set():
+            value = set()
+            refs.append(weakref.ref(value))
+            return value
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with patch(
+                "rtp_llm.multimodal.mm_embedding_cache.set", scratch_set, create=True
+            ):
+                for helper in (_tensor_tier_bytes, _embedding_result_cost):
+                    with self.subTest(helper=helper.__name__):
+                        refs.clear()
+                        helper(([torch.ones(2, 4)], None))
+                        self.assertTrue(refs)
+                        self.assertTrue(
+                            all(ref() is None for ref in refs),
+                            "accounting scratch state requires cyclic GC",
+                        )
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_copied_tensors_released_without_gc(self):
+        value = torch.ones(4)
+        target = torch.device("meta")
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            copied = _copy_result_to_devices(
+                ([value, value], {"none": None}),
+                ([target, target], {"none": None}),
+            )
+            self.assertIs(copied[0][0], copied[0][1])
+            self.assertEqual(copied[0][0].device, target)
+            self.assertIsNone(copied[1]["none"])
+            copied_ref = weakref.ref(copied[0][0])
+            del copied
+            self.assertIsNone(copied_ref(), "copy scratch state retains its tensors")
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_nested_accounting_preserves_storage_and_token_semantics(self):
+        backing = torch.arange(100, dtype=torch.float32)
+        view = backing[:8].reshape(2, 4)
+        result = (
+            [view, view, torch.empty(0, 8), torch.ones(3), torch.tensor(4.0)],
+            torch.ones(2, dtype=torch.int64),
+            {"alias": view, "none": None},
+        )
+        self.assertEqual(_tensor_tier_bytes(result), (0, 432))
+        self.assertEqual(_embedding_result_cost(result), (6, 432))
 
 
 class EmbeddingCapacityTest(unittest.TestCase):

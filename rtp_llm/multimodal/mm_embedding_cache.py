@@ -7,7 +7,7 @@ import time
 import uuid
 from collections import OrderedDict
 from itertools import chain, islice
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -33,7 +33,9 @@ def _tensor_tier_bytes(result: Any, devices: Any = None) -> Tuple[int, int]:
     sizes = [0, 0]
     seen = set()
 
-    def visit(value: Any, target: Any) -> None:
+    pending = [(result, devices)]
+    while pending:
+        value, target = pending.pop()
         if isinstance(value, torch.Tensor):
             device = value.device if target is None else target
             if device == value.device:
@@ -49,40 +51,49 @@ def _tensor_tier_bytes(result: Any, devices: Any = None) -> Tuple[int, int]:
                 sizes[device.type == "cpu"] += size
         elif isinstance(value, (list, tuple)):
             for i, item in enumerate(value):
-                visit(item, target[i] if target is not None else None)
+                pending.append((item, target[i] if target is not None else None))
         elif isinstance(value, dict):
             for key, item in value.items():
-                visit(item, target[key] if target is not None else None)
+                pending.append((item, target[key] if target is not None else None))
 
-    visit(result, devices)
     return tuple(sizes)
 
 
 def _copy_result_to_devices(result: Any, devices: Any) -> Any:
     """Copy without mutating a result that an active request may still hold."""
-    copied = {}
+    return _copy_result_value_to_devices(result, devices, {})
 
-    def visit(value: Any, target: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            if value.device == target:
-                return value
-            identity = (id(value), target)
-            if identity not in copied:
-                copied[identity] = value.detach().to(
-                    device=target,
-                    non_blocking=False,
-                    memory_format=torch.contiguous_format,
-                )
-            return copied[identity]
-        if isinstance(value, tuple):
-            return tuple(visit(item, target[i]) for i, item in enumerate(value))
-        if isinstance(value, list):
-            return [visit(item, target[i]) for i, item in enumerate(value)]
-        if isinstance(value, dict):
-            return {key: visit(item, target[key]) for key, item in value.items()}
-        return value
 
-    return visit(result, devices)
+def _copy_result_value_to_devices(value: Any, target: Any, copied: Dict) -> Any:
+    # Keep recursion at module scope: a recursive local function captures itself
+    # and would keep `copied` (including transferred tensors) alive until GC.
+    if isinstance(value, torch.Tensor):
+        if value.device == target:
+            return value
+        identity = (id(value), target)
+        if identity not in copied:
+            copied[identity] = value.detach().to(
+                device=target,
+                non_blocking=False,
+                memory_format=torch.contiguous_format,
+            )
+        return copied[identity]
+    if isinstance(value, tuple):
+        return tuple(
+            _copy_result_value_to_devices(item, target[i], copied)
+            for i, item in enumerate(value)
+        )
+    if isinstance(value, list):
+        return [
+            _copy_result_value_to_devices(item, target[i], copied)
+            for i, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _copy_result_value_to_devices(item, target[key], copied)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _report(metric, value, tags=None):
@@ -92,45 +103,32 @@ def _report(metric, value, tags=None):
         logging.exception("Failed to report embedding cache metric: %s", error)
 
 
+def _iter_result_tensors(value: Any) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_result_tensors(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_result_tensors(item)
+
+
 def _embedding_result_cost(result: Any) -> Tuple[int, int]:
     """Return ``(output_tokens, tensor_bytes)`` retained by one cache value."""
-
-    seen_storages = set()
-
-    def tensor_bytes(value: Any) -> int:
-        if isinstance(value, torch.Tensor):
-            # A slice keeps its entire backing allocation alive. Counting its
-            # logical numel would undercharge batched outputs retained as views.
-            storage = value.untyped_storage()
-            storage_id = (value.device, storage.data_ptr())
-            if storage_id in seen_storages:
-                return 0
-            seen_storages.add(storage_id)
-            return storage.nbytes()
-        if isinstance(value, (list, tuple)):
-            return sum(tensor_bytes(item) for item in value)
-        if isinstance(value, dict):
-            return sum(tensor_bytes(item) for item in value.values())
-        return 0
-
-    def output_tokens(value: Any) -> int:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return 0
-            if value.ndim >= 2 and value.shape[-1] > 0:
-                return value.numel() // value.shape[-1]
-            # A one-dimensional embedding is one token vector, not a sequence
-            # of scalar tokens. Keep this consistent with the request-level
-            # embedding length metric.
-            return 1
-        if isinstance(value, (list, tuple)):
-            return sum(output_tokens(item) for item in value)
-        if isinstance(value, dict):
-            return sum(output_tokens(item) for item in value.values())
-        return 0
-
     primary = result[0] if isinstance(result, tuple) and result else result
-    return output_tokens(primary), tensor_bytes(result)
+    output_tokens = 0
+    for tensor in _iter_result_tensors(primary):
+        if tensor.numel() == 0:
+            continue
+        if tensor.ndim >= 2 and tensor.shape[-1] > 0:
+            output_tokens += tensor.numel() // tensor.shape[-1]
+        else:
+            # A one-dimensional embedding is one token vector, not a sequence
+            # of scalar tokens. Keep the request-level embedding length policy.
+            output_tokens += 1
+    # Charge backing storage once, including storage retained by small views.
+    return output_tokens, sum(_tensor_tier_bytes(result))
 
 
 class MMEmbeddingCacheEntry:
