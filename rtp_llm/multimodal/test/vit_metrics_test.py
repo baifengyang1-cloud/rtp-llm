@@ -1,10 +1,15 @@
+import json
+from io import BytesIO
 from types import SimpleNamespace
 from unittest import TestCase, main
 from unittest.mock import MagicMock, patch
 
+from PIL import Image
+
 from rtp_llm.metrics.kmonitor_metric_reporter import GaugeMetrics
 from rtp_llm.multimodal.vit_metrics import (
     collect_vit_preprocess_metrics,
+    image_preprocess_timing,
     record_vit_preprocess_value,
     video_resized_pixel_count,
     vit_preprocess_timer,
@@ -26,6 +31,19 @@ class VitMetricsTest(TestCase):
 
     def test_video_resized_pixel_count_includes_all_frames(self):
         self.assertEqual(video_resized_pixel_count(8, 336, 448), 8 * 336 * 448)
+
+    def test_image_failure_logs_request_and_preserves_exception(self):
+        with self.assertLogs(level="INFO") as logs:
+            with self.assertRaisesRegex(ValueError, "decode failed"):
+                with collect_vit_preprocess_metrics(request_id=42):
+                    with image_preprocess_timing("https://example.com/image?secret=1"):
+                        raise ValueError("decode failed")
+
+        record = json.loads(logs.records[0].getMessage().split(" ", 1)[1])
+        self.assertEqual(record["request_id"], 42)
+        self.assertEqual(record["outcome"], "error")
+        self.assertEqual(record["error"], "ValueError")
+        self.assertNotIn("secret", logs.records[0].getMessage())
 
     def test_qwen3_video_preprocess_passes_metrics_tags_to_loader(self):
         import torch
@@ -88,7 +106,9 @@ class VitMetricsTest(TestCase):
         from rtp_llm.multimodal.multimodal_mixins import qwen3_vl_mixin
         from rtp_llm.utils.base_model_datatypes import MMUrlType
 
-        image = object()
+        image_data = BytesIO()
+        Image.new("RGB", (32, 48), (11, 22, 33)).save(image_data, format="PNG")
+        image_data.seek(0)
         mm_input = SimpleNamespace(
             mm_type=MMUrlType.IMAGE,
             url="memory://image",
@@ -110,13 +130,31 @@ class VitMetricsTest(TestCase):
             )
         )
 
+        original_processor = processor.image_processor.return_value
+
+        def process_decoded_image(image, **kwargs):
+            self.assertIsNone(image.fp)
+            self.assertEqual(image.getpixel((0, 0)), (11, 22, 33))
+            return original_processor
+
+        processor.image_processor.side_effect = process_decoded_image
         with patch.object(
-            qwen3_vl_mixin, "get_bytes_io_from_url", return_value=b"image"
-        ) as get_bytes, patch.object(qwen3_vl_mixin.Image, "open", return_value=image):
-            with collect_vit_preprocess_metrics() as metrics:
+            qwen3_vl_mixin, "get_bytes_io_from_url", return_value=image_data
+        ) as get_bytes, self.assertLogs(level="INFO") as logs:
+            with collect_vit_preprocess_metrics(request_id=42) as metrics:
                 qwen3_vl_mixin.Qwen3_VLImageEmbedding.preprocess_input(
                     [mm_input], vit_config, processor
                 )
+
+        record = json.loads(logs.records[0].getMessage().split(" ", 1)[1])
+        self.assertEqual(record["request_id"], 42)
+        self.assertEqual(record["original_width"], 32)
+        self.assertEqual(record["original_height"], 48)
+        self.assertEqual(record["image_bytes"], image_data.getbuffer().nbytes)
+        self.assertEqual(record["device"], "cpu")
+        self.assertEqual(record["image_grid_thw"], [[1, 1, 1]])
+        for field in ("fetch_ms", "decode_ms", "processor_ms", "preprocess_ms"):
+            self.assertGreaterEqual(record[field], 0)
 
         get_bytes.assert_called_once_with(
             "memory://image",

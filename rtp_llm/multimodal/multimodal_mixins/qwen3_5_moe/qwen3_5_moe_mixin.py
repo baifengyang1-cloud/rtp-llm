@@ -22,6 +22,7 @@ from rtp_llm.multimodal.multimodal_mixins.qwen3_vl_mixin import (
     Qwen3_VLMixin,
 )
 from rtp_llm.multimodal.multimodal_util import get_bytes_io_from_url
+from rtp_llm.multimodal.qwen_image_preprocess import vision_pixel_values
 from rtp_llm.ops import MMPreprocessConfig, MultimodalInput
 from rtp_llm.utils.base_model_datatypes import MMUrlType
 from rtp_llm.utils.database import CkptDatabase
@@ -65,11 +66,13 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
         return {
             "processor": self.mm_processor,
             "factor": self.visual.spatial_merge_size * self.visual.patch_size,
+            "defer_pixel_processing": os.getenv("RTP_LLM_QWEN35_GPU_PREPROCESS", "0")
+            == "1",
         }
 
     @torch.inference_mode()
     def embedding(self, data, **kwargs):
-        pixel_values = data[0].to(self._device).to(self._data_type)
+        pixel_values = vision_pixel_values(data[0], self._device, self._data_type)
         grid_thw = data[1].cpu()
         vision_output = self.visual(
             pixel_values, grid_thw=grid_thw, return_dict=True, **kwargs
@@ -90,11 +93,11 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
         pixel_values_list = []
         grid_thw_list = []
         for data, mm_type in zip(data_list, mm_types):
-            pixel_values_list.append(data[0])
+            pixel_values_list.append(
+                vision_pixel_values(data[0], self._device, self._data_type)
+            )
             grid_thw_list.append(data[1])
-        pixel_values = (
-            torch.concat(pixel_values_list, dim=0).to(self._device).to(self._data_type)
-        )
+        pixel_values = torch.concat(pixel_values_list, dim=0)
         grid_thw = torch.concat(grid_thw_list, dim=0).cpu()
         vision_output = self.visual(
             pixel_values, grid_thw=grid_thw, return_dict=True, **kwargs
