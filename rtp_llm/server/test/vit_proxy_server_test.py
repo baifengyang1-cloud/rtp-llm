@@ -29,6 +29,7 @@ from rtp_llm.multimodal.mm_scheduler import (
     MMSchedulerTimeoutError,
 )
 from rtp_llm.multimodal.transport.proxy_router import MMOutputProxyRouter
+from rtp_llm.server.vit_metadata_proxy import VitRequestRouter
 from rtp_llm.server.vit_proxy_server import (
     DEFAULT_PROXY_RPC_TIMEOUT_SECONDS,
     STATUS_CHECK_TIMEOUT_SEC,
@@ -813,6 +814,33 @@ class VitProxyRpcServerStatusTest(TestCase):
 
 
 class VitProxyRpcServerForwardingTest(TestCase):
+    def test_metadata_binding_controls_rpc_worker_and_is_released(self):
+        first, second = MagicMock(), MagicMock()
+        first.RemoteMultimodalEmbedding.future.return_value = FakeGrpcFuture(
+            response=MultimodalOutputPB()
+        )
+        server = self._make_server({"first": first, "second": second})
+        server.request_router = VitRequestRouter(server.load_balancer)
+        server.request_router.reserve(123)
+        server.RemoteMultimodalEmbedding(
+            MultimodalInputsPB(request_id=123), FakeContext()
+        )
+        first.RemoteMultimodalEmbedding.future.assert_called_once()
+        second.RemoteMultimodalEmbedding.future.assert_not_called()
+        self.assertIsNone(server.request_router.lookup(123))
+
+    def test_metadata_bound_rpc_does_not_fail_over(self):
+        first, second = MagicMock(), MagicMock()
+        first.RemoteMultimodalEmbedding.future.side_effect = RpcUnavailable()
+        server = self._make_server({"first": first, "second": second})
+        server.request_router = VitRequestRouter(server.load_balancer)
+        server.request_router.reserve(123)
+        with self.assertRaises(AbortCalled):
+            server.RemoteMultimodalEmbedding(
+                MultimodalInputsPB(request_id=123), FakeContext()
+            )
+        second.RemoteMultimodalEmbedding.future.assert_not_called()
+
     def _make_status_stub(self, worker_status=None, error=None, done=True):
         stub = MagicMock()
         stub.GetWorkerStatus.future.return_value = FakeGrpcFuture(

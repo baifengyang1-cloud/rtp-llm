@@ -11,7 +11,6 @@ import grpc
 import grpc.aio
 import orjson
 
-from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.exceptions import (
     AdmissionRejectReason,
     ExceptionType,
@@ -36,6 +35,7 @@ from rtp_llm.server.host_service import HostService
 from rtp_llm.server.worker_status import _coerce_role_type
 from rtp_llm.telemetry import attributes as trace_attrs
 from rtp_llm.telemetry import start_client_span
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.utils.base_model_datatypes import GenerateInput
 
 route_logger = logging.getLogger("route_logger")
@@ -367,7 +367,7 @@ class MasterClient:
         request_id = getattr(input, "request_id", None)
         metadata = await self._post_vit_metadata(
             address,
-            {"keys": unique_keys},
+            {"keys": unique_keys, "request_id": request_id or 0},
             DEFAULT_REQUEST_TIMEOUT_SEC,
             trace_id=request_id,
         )

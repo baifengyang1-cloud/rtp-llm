@@ -1,8 +1,8 @@
 import asyncio
-import time
 import logging
 import socket
 import threading
+import time
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
@@ -12,12 +12,10 @@ from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from google.protobuf.json_format import ParseDict, ParseError
-from pydantic import BaseModel, Field
 from typing_extensions import override
 from uvicorn import Config, Server
 from uvicorn.loops.auto import auto_loop_setup
 
-from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.engine_config import EngineConfig
 from rtp_llm.config.exceptions import FtRuntimeException
 from rtp_llm.config.py_config_modules import PyEnvConfigs
@@ -32,16 +30,11 @@ from rtp_llm.model_factory import ModelFactory
 from rtp_llm.multimodal.mm_process_engine import MMProcessEngine, vit_request_owner
 from rtp_llm.multimodal.multimodal_util import trans_mm_input
 from rtp_llm.ops import RoleType
+from rtp_llm.server.vit_metadata_proxy import MMCacheMetadataRequest
 from rtp_llm.server.vit_rpc_server import MultimodalRpcServer, create_rpc_server
+from rtp_llm.utils import vit_diagnostics as diag
 
 MM_CACHE_SNAPSHOT_MAX_KEYS = 100000
-
-
-class MMCacheMetadataRequest(BaseModel):
-    keys: List[str] = Field(max_length=256)
-    inputs: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=256)
-    request_id: int = 0
-    timeout_ms: int = Field(default=120000, gt=0)
 
 
 def _get_hash_key_cache(engine: MMProcessEngine):
@@ -53,7 +46,8 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
     @app.get("/mm_cache/keys")
     @app.post("/mm_cache/keys")
     def cache_keys():
-        if engine is None or engine.is_proxy_mode:
+        # Proxy-mode children own real local caches; only the parent has no engine.
+        if engine is None:
             raise HTTPException(status_code=501, detail="worker-local cache required")
         hash_key_cache = _get_hash_key_cache(engine)
         if hash_key_cache is None:
@@ -99,7 +93,7 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
 
     async def resolve_metadata(request, raw_request, trace_id):
         started = time.monotonic()
-        if engine is None or engine.is_proxy_mode:
+        if engine is None:
             raise HTTPException(status_code=501, detail="worker-local cache required")
         if any(not key or len(key) > 4096 for key in request.keys):
             raise HTTPException(status_code=400, detail="invalid multimodal cache key")
@@ -151,11 +145,7 @@ def register_mm_cache_routes(app: FastAPI, engine: MMProcessEngine) -> None:
                     remaining -= int((time.monotonic() - started) * 1000)
                 if remaining <= 0:
                     raise TimeoutError("ViT metadata deadline expired")
-                kwargs = (
-                    {"cancellation_event": cancelled}
-                    if isolated
-                    else {}
-                )
+                kwargs = {"cancellation_event": cancelled} if isolated else {}
                 return engine.get_embedding_result(
                     [inputs[key] for key in missing_keys],
                     request_id=request_id,

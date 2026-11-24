@@ -35,6 +35,7 @@ from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
 from rtp_llm.multimodal.mm_profiler import MMProfiler
 from rtp_llm.multimodal.transport.proxy_router import MMOutputProxyRouter
+from rtp_llm.server.vit_metadata_proxy import VitRequestRouter
 
 # Proxy forwarding includes transport and serialization after the worker's
 # preprocessing budget. The margin lets the worker return its own timeout error;
@@ -360,12 +361,14 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
         connection_pool: WorkerConnectionPool,
         default_rpc_timeout_seconds: float = DEFAULT_PROXY_RPC_TIMEOUT_SECONDS,
         transport_config=None,
+        request_router=None,
     ):
         self.load_balancer = load_balancer
         self.connection_pool = connection_pool
         self.default_rpc_timeout_seconds = default_rpc_timeout_seconds
         self.profiler = MMProfiler()
         self._transport_router = MMOutputProxyRouter(connection_pool, transport_config)
+        self.request_router = request_router
         kmonitor.init()
         self._status_probes: dict[str, _WorkerStatusProbe] = {}
         self._status_probes_lock = threading.Lock()
@@ -435,7 +438,7 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
         worker_address = None
         request_failed = False
         try:
-            worker_address = self.load_balancer.get_worker()
+            worker_address = self._request_worker(request.request_id)
             self.load_balancer.increment_connections(worker_address)
             stub = self.connection_pool.get_stub(worker_address)
             timeout_s = _resolve_rpc_timeout_seconds(
@@ -476,7 +479,7 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
         worker_address = None
         request_failed = False
         try:
-            worker_address = self.load_balancer.get_worker()
+            worker_address = self._request_worker(request.request_id)
             self.load_balancer.increment_connections(worker_address)
             stub = self.connection_pool.get_stub(worker_address)
             return stub.AsyncSubmitEmbedding(request, timeout=5.0)
@@ -529,7 +532,13 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
         attempted_workers: set[str] = set()
         last_error: Optional[Exception] = None
         exhausted_workers = False
+        pinned_worker = None
         try:
+            if self.request_router is not None:
+                try:
+                    pinned_worker = self.request_router.lookup(request.request_id)
+                except RuntimeError as error:
+                    self._abort_unavailable(context, str(error))
             request_timeout_s = _resolve_rpc_timeout_seconds(
                 request, self.default_rpc_timeout_seconds
             )
@@ -546,7 +555,9 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
                     break
                 worker_address = None
                 try:
-                    worker_address = self.load_balancer.get_worker(attempted_workers)
+                    worker_address = pinned_worker or self.load_balancer.get_worker(
+                        attempted_workers
+                    )
                 except RuntimeError as e:
                     last_error = e
                     break
@@ -558,6 +569,10 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
                         stub = self.connection_pool.get_stub(worker_address)
                     except Exception as e:
                         last_error = e
+                        if pinned_worker:
+                            self._abort_unavailable(
+                                context, "Bound ViT worker connection unavailable"
+                            )
                         logging.error(
                             "Error getting stub for worker %s: %s",
                             worker_address,
@@ -628,6 +643,8 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
                     )
                     if worker_address and _is_retryable_worker_rpc_error(e):
                         self.load_balancer.set_worker_alive(worker_address, False)
+                        if pinned_worker:
+                            self._abort_with_worker_status(context, e)
                         continue
                     # Non-retryable (e.g. RESOURCE_EXHAUSTED overload): propagate the
                     # worker's exact status to our caller instead of a bare re-raise
@@ -678,8 +695,17 @@ class VitProxyRpcServer(MultimodalRpcServiceServicer):
                 )
             raise
         finally:
+            if pinned_worker and self.request_router is not None:
+                self.request_router.release(request.request_id, pinned_worker)
             if not callback_added:
                 _report_lifecycle()
+
+    def _request_worker(self, request_id):
+        if self.request_router is not None:
+            worker = self.request_router.lookup(request_id)
+            if worker is not None:
+                return worker
+        return self.load_balancer.get_worker()
 
     def _report_worker_counts(self):
         with self._worker_count_metric_lock:
@@ -933,6 +959,7 @@ class VitProxyServer:
         self.worker_addresses = worker_addresses
         self.external_grpc_port = external_grpc_port
         self.load_balancer = LoadBalancer(worker_addresses, load_balance_strategy)
+        self.request_router = VitRequestRouter(self.load_balancer)
         self.connection_pool = WorkerConnectionPool(worker_addresses)
         self.default_rpc_timeout_seconds = default_rpc_timeout_seconds
         self.transport_config = transport_config
@@ -957,6 +984,7 @@ class VitProxyServer:
             self.connection_pool,
             self.default_rpc_timeout_seconds,
             self.transport_config,
+            request_router=self.request_router,
         )
         add_MultimodalRpcServiceServicer_to_server(self.proxy_servicer, self.rpc_server)
 

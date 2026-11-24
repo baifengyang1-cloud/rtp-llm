@@ -30,6 +30,7 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import StatusVersionPB
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import (
     MultimodalRpcServiceStub,
 )
+from rtp_llm.server.vit_metadata_proxy import register_proxy_metadata_routes
 from rtp_llm.server.vit_proxy_server import (
     VitProxyServer,
     resolve_default_rpc_timeout_seconds,
@@ -192,6 +193,9 @@ def create_proxy_app(
         )
     ]
     app = FastAPI(middleware=middleware)
+    register_proxy_metadata_routes(
+        app, proxy_server.request_router, worker_http_addresses
+    )
 
     @app.get("/health")
     @app.post("/health")

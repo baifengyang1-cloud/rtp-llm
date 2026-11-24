@@ -260,7 +260,10 @@ class MMCacheRoutingIntegrationTest(unittest.IsolatedAsyncioTestCase):
             [e["feature_hashes"] for e in result["entries"]], [[-10, 11], [21, 22, 23]]
         )
         calls = client._post_vit_metadata.call_args_list
-        self.assertEqual(calls[0].args[1], {"keys": keys[:2]})
+        self.assertEqual(
+            calls[0].args[1],
+            {"keys": keys[:2], "request_id": self.request.request_id},
+        )
         payload = calls[1].args[1]
         self.assertEqual(payload["keys"], keys[1:2])
         self.assertEqual(payload["request_id"], self.request.request_id)
@@ -283,7 +286,10 @@ class MMCacheRoutingIntegrationTest(unittest.IsolatedAsyncioTestCase):
             ready,
         )
         client._post_vit_metadata.assert_awaited_once()
-        self.assertEqual(client._post_vit_metadata.call_args.args[1], {"keys": keys})
+        self.assertEqual(
+            client._post_vit_metadata.call_args.args[1],
+            {"keys": keys, "request_id": self.request.request_id},
+        )
         client._post_vit_metadata = AsyncMock(
             side_effect=[
                 {"worker_instance": "epoch", "feature_hash_version": 1, "entries": []},
@@ -592,7 +598,7 @@ class MMCacheApiTest(unittest.TestCase):
             ],
         }
         engine = SimpleNamespace(
-            is_proxy_mode=False,
+            is_proxy_mode=True,
             _embedding_cache=MMEmbeddingCache(gpu_max_bytes=0, cpu_max_bytes=0),
             _hash_key_cache=MMHashKeyCache(max_bytes=0),
             get_embedding_result=Mock(
@@ -676,7 +682,7 @@ class MMCacheApiTest(unittest.TestCase):
             SimpleNamespace(
                 _embedding_cache=cache,
                 _hash_key_cache=hash_keys,
-                is_proxy_mode=False,
+                is_proxy_mode=True,
             ),
         )
         with TestClient(app) as client:
