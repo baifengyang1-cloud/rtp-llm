@@ -1,5 +1,6 @@
 import gc
 import logging
+import os
 import time
 
 from setproctitle import setproctitle
@@ -82,10 +83,14 @@ def vit_start_server(
     collected = gc.collect()
     gc.freeze()
     logging.info(
-        "vit_gc_freeze server_id=%s collected=%d frozen=%d elapsed_ms=%.3f",
+        "vit_gc_freeze server_id=%s pid=%d collected=%d frozen=%d "
+        "gc_enabled=%s gc_threshold=%s elapsed_ms=%.3f",
         server_id,
+        os.getpid(),
         collected,
         gc.get_freeze_count(),
+        gc.isenabled(),
+        gc.get_threshold(),
         (time.monotonic() - started) * 1000,
     )
     app.start(
