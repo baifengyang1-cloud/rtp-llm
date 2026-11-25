@@ -59,6 +59,12 @@ py_test(
 )
 
 py_test(
+    name = "vit_embedding_timing_test",
+    srcs = ["vit_embedding_timing_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
     name = "vit_metrics_test",
     srcs = [
         "vit_metrics_test.py",

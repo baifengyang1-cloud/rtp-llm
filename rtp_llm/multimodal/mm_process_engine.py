@@ -53,6 +53,7 @@ from rtp_llm.multimodal.multimodal_util import (
     url_data_cache_,
     vit_emb_cache_,
 )
+from rtp_llm.multimodal.vit_embedding_timing import embedding_stage_timing
 from rtp_llm.multimodal.vit_metrics import (
     VitMetricSample,
     collect_vit_preprocess_metrics,
@@ -650,25 +651,39 @@ class MMWorkItem:
         return self.embedding_result is None and not self.waiting_for_cache
 
     def complete_cache(self, result: Any, force: bool = False) -> None:
-        if self.feature_hashes is None:
-            self.feature_hashes = _feature_hashes_from_result(result)
-        if (
-            (self.defer_cache_complete and not force)
-            or self.embedding_cache is None
-            or self.cache_key is None
-            or self.cache_entry is None
-        ):
-            return
-        self.embedding_cache.complete(
-            self.cache_key, self.cache_entry, result, self.feature_hashes
+        fields = dict(
+            request_id=getattr(self, "trace_request_id", 0),
+            image_ids=[image_log_id(item.url) for item in self.mm_inputs if item.url],
+            force=force,
         )
-        if (
-            self.hash_key_cache is not None
-            and self.embedding_cache.peek(self.cache_key) is self.cache_entry
-        ):
-            self.hash_key_cache.put(
-                self.cache_key, self.feature_hashes or [], self.cache_entry.generation
+        with embedding_stage_timing("feature_hash", **fields) as timing:
+            if self.feature_hashes is None:
+                # Includes first-use native library loading and any existing
+                # device-to-host/synchronization cost in the hash operation.
+                self.feature_hashes = _feature_hashes_from_result(result)
+            else:
+                timing.update(outcome="skipped", reason="already_computed")
+        with embedding_stage_timing("cache_complete", **fields) as timing:
+            if self.defer_cache_complete and not force:
+                timing.update(outcome="skipped", reason="deferred")
+                return
+            if (
+                self.embedding_cache is None
+                or self.cache_key is None
+                or self.cache_entry is None
+            ):
+                timing.update(outcome="skipped", reason="no_cache_claim")
+                return
+            self.embedding_cache.complete(
+                self.cache_key, self.cache_entry, result, self.feature_hashes
             )
+            if (
+                self.hash_key_cache is not None
+                and self.embedding_cache.peek(self.cache_key) is self.cache_entry
+            ):
+                self.hash_key_cache.put(
+                    self.cache_key, self.feature_hashes or [], self.cache_entry.generation
+                )
 
     def fail_cache(self, error: Exception) -> None:
         if (

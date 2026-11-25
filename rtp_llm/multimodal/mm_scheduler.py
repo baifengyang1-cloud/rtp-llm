@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import queue
 import threading
 import time
@@ -22,6 +23,11 @@ from rtp_llm.multimodal.multimodal_mixins.multimodal_common import (
     MMWorkEstimate,
     MultiModalEmbeddingInterface,
 )
+from rtp_llm.multimodal.vit_embedding_timing import (
+    embedding_batch_context,
+    embedding_stage_timing,
+)
+from rtp_llm.multimodal.vit_metrics import image_log_id
 from rtp_llm.utils.time_util import Timer, current_time_ms
 
 if TYPE_CHECKING:
@@ -84,6 +90,28 @@ def _run_embedding(
     mm_part: MultiModalEmbeddingInterface,
     items: List[MMWorkItem],
 ) -> None:
+    # A new identifier for every forward attempt (including OOM retries).
+    batch_id = f"{os.getpid()}:{time.monotonic_ns()}"
+    with embedding_batch_context(
+        batch_id,
+        request_ids=list(
+            dict.fromkeys(getattr(wi, "trace_request_id", 0) for wi in items)
+        ),
+        image_ids=[
+            image_log_id(mm_input.url)
+            for wi in items
+            for mm_input in wi.mm_inputs
+            if getattr(mm_input, "url", "")
+        ],
+    ):
+        _run_embedding_impl(mm_part, items, batch_id)
+
+
+def _run_embedding_impl(
+    mm_part: MultiModalEmbeddingInterface,
+    items: List[MMWorkItem],
+    batch_id: str,
+) -> None:
     """Run one GPU forward over `items` and write results back.
 
     Performs the batched forward, guards the output count, writes
@@ -97,7 +125,6 @@ def _run_embedding(
     if diag.SAMPLE_EVERY:
         traced = {getattr(item, "trace_request_id", 0) for item in items}
         traced = {rid for rid in traced if diag.selected(rid)}
-    batch_id = time.monotonic_ns() if traced else None
     for rid in traced:
         diag.event(
             rid, "vit.gpu_forward", phase="begin", batch_id=batch_id, items=len(items)
@@ -105,7 +132,8 @@ def _run_embedding(
     with Timer() as route_timer:
         with torch.profiler.record_function("batched_embedding"):
             try:
-                batch_outputs = mm_part.batched_embedding(data_list, type_list)
+                with embedding_stage_timing("embedding_forward", items=len(items)):
+                    batch_outputs = mm_part.batched_embedding(data_list, type_list)
             except BaseException as error:
                 for rid in traced:
                     diag.event(
