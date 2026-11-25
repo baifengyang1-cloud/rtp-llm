@@ -552,6 +552,10 @@ py_library(
     name = "rtp_llm_frontend_lib",
     deps = [
         ":utils",
+        # Frontend and DashSc resolve model classes when creating ModelConfig.
+        # Lazy registration does not make those modules optional in the wheel.
+        ":models",
+        ":async_model",
         ":eplb",
         ":ops",
         ":pipeline",
