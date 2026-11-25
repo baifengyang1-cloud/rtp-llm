@@ -63,6 +63,12 @@ py_test(
 )
 
 py_test(
+    name = "vit_proxy_startup_test",
+    srcs = ["vit_proxy_startup_test.py"],
+    deps = ["//rtp_llm:testlib", "//rtp_llm/server:server"],
+)
+
+py_test(
     name = "master_client_test",
     srcs = ["master_client_test.py"],
     deps = [

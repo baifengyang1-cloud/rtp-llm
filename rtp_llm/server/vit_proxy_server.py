@@ -966,8 +966,10 @@ class VitProxyServer:
         self.rpc_server = None
         self.proxy_servicer: Optional[VitProxyRpcServer] = None
 
-    def start(self):
-        """启动代理服务器"""
+    def prepare(self):
+        """Initialize gRPC objects without accepting requests."""
+        if self.rpc_server is not None:
+            return
         self.rpc_server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=200),
             options=[
@@ -989,6 +991,10 @@ class VitProxyServer:
         add_MultimodalRpcServiceServicer_to_server(self.proxy_servicer, self.rpc_server)
 
         self.rpc_server.add_insecure_port(f"0.0.0.0:{self.external_grpc_port}")
+
+    def start(self):
+        """启动代理服务器"""
+        self.prepare()
         self.rpc_server.start()
 
         logging.info(

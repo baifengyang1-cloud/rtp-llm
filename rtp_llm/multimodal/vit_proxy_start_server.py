@@ -4,10 +4,13 @@ VIT Proxy Server 启动模块
 """
 
 import asyncio
+import gc
 import json
 import logging
+import os
 import socket
 import threading
+import time
 import urllib.request
 from functools import partial
 from typing import Optional
@@ -94,6 +97,26 @@ def vit_proxy_start_server(
     )
 
     try:
+        # Initialize both interfaces before freezing process-lifetime objects.
+        # Neither interface may accept requests until the freeze is complete.
+        proxy_server.prepare()
+        app = create_proxy_app(
+            proxy_server, worker_addresses, worker_http_addresses or []
+        )
+        started = time.monotonic()
+        collected = gc.collect()
+        gc.freeze()
+        logging.info(
+            "vit_proxy_gc_freeze pid=%d collected=%d frozen=%d "
+            "gc_enabled=%s gc_threshold=%s elapsed_ms=%.3f",
+            os.getpid(),
+            collected,
+            gc.get_freeze_count(),
+            gc.isenabled(),
+            gc.get_threshold(),
+            (time.monotonic() - started) * 1000,
+        )
+
         # 启动 gRPC 服务器
         proxy_server.start()
         logging.info(
@@ -101,9 +124,6 @@ def vit_proxy_start_server(
         )
 
         # 创建并启动 HTTP 服务器
-        app = create_proxy_app(
-            proxy_server, worker_addresses, worker_http_addresses or []
-        )
         start_http_server(app, http_port, py_env_configs, proxy_server)
 
     except KeyboardInterrupt:
