@@ -91,6 +91,12 @@ py_test(
 )
 
 py_test(
+    name = "qwen_image_decode_test",
+    srcs = ["qwen_image_decode_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
     name = "mm_scheduler_test",
     srcs = [
         "mm_scheduler_test.py",

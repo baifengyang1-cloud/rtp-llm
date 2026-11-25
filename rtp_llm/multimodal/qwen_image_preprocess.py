@@ -194,16 +194,12 @@ class QwenImagePixels:
             return patches.reshape(gh * gw, -1)
 
 
-def prepare_device_pixels(image, processor):
-    """Return a deferred payload only for the supported RGB Qwen contract."""
-    if image.mode != "RGB":
-        return None
+def device_pixel_parameters(processor):
+    """Resolve the shared normalization and patch contract without decoding."""
     patch = getattr(processor, "patch_size", None)
     merge = getattr(processor, "merge_size", None)
     temporal = getattr(processor, "temporal_patch_size", None)
     if any(type(x) is not int or x <= 0 for x in (patch, merge, temporal)):
-        return None
-    if image.height % (patch * merge) or image.width % (patch * merge):
         return None
     rescale = getattr(processor, "do_rescale", None)
     normalize = getattr(processor, "do_normalize", None)
@@ -220,8 +216,7 @@ def prepare_device_pixels(image, processor):
         return None
     if not all(math.isfinite(x) for x in (*mean, *std)) or min(std) <= 0:
         return None
-    pixels = QwenImagePixels(
-        torch.from_numpy(np.array(image)),
+    return (
         _normalization_table(
             rescale,
             scale,
@@ -238,6 +233,19 @@ def prepare_device_pixels(image, processor):
         merge,
         temporal,
     )
+
+
+def prepare_device_pixels(image, processor):
+    """Return a deferred payload only for the supported RGB Qwen contract."""
+    if image.mode != "RGB":
+        return None
+    parameters = device_pixel_parameters(processor)
+    if parameters is None:
+        return None
+    _, patch, merge, _ = parameters
+    if image.height % (patch * merge) or image.width % (patch * merge):
+        return None
+    pixels = QwenImagePixels(torch.from_numpy(np.array(image)), *parameters)
     grid = torch.tensor(
         [[1, image.height // patch, image.width // patch]], device="cpu"
     )
@@ -245,6 +253,11 @@ def prepare_device_pixels(image, processor):
 
 
 def vision_pixel_values(data, device, dtype):
+    # Imported lazily so CPU workers never import a device decoder extension.
+    from rtp_llm.multimodal.qwen_image_decode import QwenJpegBytes
+
+    if isinstance(data, QwenJpegBytes):
+        return data.to_patches(device, dtype)
     if isinstance(data, QwenImagePixels):
         return data.to_patches(device, dtype)
     return data.to(device=device, dtype=dtype)
