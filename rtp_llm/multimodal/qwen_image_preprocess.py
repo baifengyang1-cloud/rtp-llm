@@ -10,14 +10,7 @@ import torch
 from PIL import Image
 
 
-def default_resize_size(image, processor, factor):
-    """Resolve the existing HF policy, without imposing a new pixel budget."""
-    if os.getenv("RTP_LLM_QWEN_IMAGE_EARLY_RESIZE", "1") != "1":
-        return None
-    if image.mode != "RGB" or not getattr(processor, "do_resize", False):
-        return None
-    if getattr(processor, "resample", None) != Image.Resampling.BICUBIC:
-        return None
+def _processor_pixel_limits(processor):
     minimum = getattr(processor, "min_pixels", None)
     maximum = getattr(processor, "max_pixels", None)
     if type(minimum) is not int or type(maximum) is not int:
@@ -29,8 +22,72 @@ def default_resize_size(image, processor, factor):
             maximum = getattr(size, "longest_edge", None)
     if type(minimum) is not int or type(maximum) is not int:
         return None
-    if min(minimum, maximum) <= 0:
+    if min(minimum, maximum) <= 0 or minimum > maximum:
         return None
+    return minimum, maximum
+
+
+def service_image_max_pixels(factor):
+    """Zero preserves the model policy; a positive value caps every image."""
+    name = "RTP_LLM_QWEN_IMAGE_MAX_PIXELS"
+    raw = os.getenv(name, "0")
+    try:
+        maximum = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from error
+    if maximum != 0 and maximum < factor * factor:
+        raise ValueError(f"{name} must be 0 or at least {factor * factor}")
+    return maximum
+
+
+def limit_image_size(image, processor, factor, target_hw):
+    """Apply the service cap after resolving model/request sizing policy."""
+    maximum = service_image_max_pixels(factor)
+    if maximum == 0:
+        return target_hw
+    minimum = 0
+    if target_hw is None:
+        # Also cover non-RGB images and the legacy CPU processor path. Keep a
+        # stricter model budget and its small-image policy when available.
+        target_hw = image.height, image.width
+        limits = _processor_pixel_limits(processor)
+        if getattr(processor, "do_resize", False) and limits is not None:
+            minimum, model_maximum = limits
+            maximum = min(maximum, model_maximum)
+            minimum = min(minimum, maximum)
+    elif target_hw[0] * target_hw[1] <= maximum:
+        return target_hw
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+    height, width = smart_resize(
+        *target_hw, factor=factor, min_pixels=minimum, max_pixels=maximum
+    )
+    if height * width > maximum:
+        # A model minimum conflicting with the service cap can round upward.
+        height, width = smart_resize(
+            height, width, factor=factor, min_pixels=0, max_pixels=maximum
+        )
+    if height * width > maximum:
+        # Extremely small caps may not fit the aspect ratio on the patch grid.
+        if height >= width:
+            height = maximum // (width * factor) * factor
+        else:
+            width = maximum // (height * factor) * factor
+    return height, width
+
+
+def default_resize_size(image, processor, factor):
+    """Resolve the existing HF policy, without imposing a new pixel budget."""
+    if os.getenv("RTP_LLM_QWEN_IMAGE_EARLY_RESIZE", "1") != "1":
+        return None
+    if image.mode != "RGB" or not getattr(processor, "do_resize", False):
+        return None
+    if getattr(processor, "resample", None) != Image.Resampling.BICUBIC:
+        return None
+    limits = _processor_pixel_limits(processor)
+    if limits is None:
+        return None
+    minimum, maximum = limits
     patch = getattr(processor, "patch_size", None)
     merge = getattr(processor, "merge_size", None)
     if type(patch) is not int or type(merge) is not int or patch * merge != factor:

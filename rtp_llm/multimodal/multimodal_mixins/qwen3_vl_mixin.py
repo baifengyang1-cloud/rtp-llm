@@ -28,9 +28,11 @@ from rtp_llm.multimodal.multimodal_mixins.qwen2_5_vl.qwen2_5_vl_mixin import (
 from rtp_llm.multimodal.multimodal_util import get_bytes_io_from_url
 from rtp_llm.multimodal.qwen_image_preprocess import (
     default_resize_size,
+    limit_image_size,
     maybe_draft_jpeg,
     prepare_device_pixels,
     resize_qwen_image,
+    service_image_max_pixels,
 )
 from rtp_llm.multimodal.vit_metrics import (
     image_preprocess_timing,
@@ -139,6 +141,14 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
                             image, processor.image_processor, factor
                         )
                         processor_resize = True
+                    service_maximum = service_image_max_pixels(factor)
+                    policy_target = target_hw
+                    target_hw = limit_image_size(
+                        image, processor.image_processor, factor, target_hw
+                    )
+                    if service_maximum:
+                        timing["service_max_pixels"] = service_maximum
+                        timing["service_pixel_cap_applied"] = target_hw != policy_target
                     timing["jpeg_draft"] = maybe_draft_jpeg(image, target_hw)
                     timing.update(
                         decoded_width=image.width, decoded_height=image.height

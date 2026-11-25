@@ -11,9 +11,11 @@ from transformers import Qwen2VLImageProcessor
 
 from rtp_llm.multimodal.qwen_image_preprocess import (
     default_resize_size,
+    limit_image_size,
     maybe_draft_jpeg,
     prepare_device_pixels,
     resize_qwen_image,
+    service_image_max_pixels,
     vision_pixel_values,
 )
 
@@ -27,6 +29,60 @@ class QwenImagePreprocessTest(unittest.TestCase):
             min_pixels=1024,
             max_pixels=262144,
         )
+
+    def test_service_pixel_cap_preserves_disabled_policy(self):
+        image = Image.new("RGB", (2048, 2048))
+        with patch.dict(os.environ, {"RTP_LLM_QWEN_IMAGE_MAX_PIXELS": "0"}):
+            self.assertIsNone(limit_image_size(image, self.processor, 32, None))
+            self.assertEqual(
+                limit_image_size(image, self.processor, 32, (4096, 4096)),
+                (4096, 4096),
+            )
+
+    def test_service_pixel_cap_bounds_request_and_model_sizes(self):
+        image = Image.new("RGB", (32, 32))
+        with patch.dict(os.environ, {"RTP_LLM_QWEN_IMAGE_MAX_PIXELS": "2000000"}):
+            # A square is floored to a legal grid, below the decimal 2MP cap.
+            self.assertEqual(
+                limit_image_size(image, self.processor, 32, (4096, 4096)),
+                (1408, 1408),
+            )
+            self.assertEqual(
+                limit_image_size(image, self.processor, 32, (1024, 1024)),
+                (1024, 1024),
+            )
+            for size in [(6144, 8192), (8192, 6144), (1408, 1440)]:
+                h, w = limit_image_size(image, self.processor, 32, size)
+                self.assertLessEqual(h * w, 2000000)
+                self.assertEqual((h % 32, w % 32), (0, 0))
+
+    def test_service_pixel_cap_also_covers_cpu_fallback(self):
+        with patch.dict(os.environ, {"RTP_LLM_QWEN_IMAGE_MAX_PIXELS": "2000000"}):
+            processor = Qwen2VLImageProcessor(
+                patch_size=16, merge_size=2, min_pixels=1024, max_pixels=16777216
+            )
+            for mode in ["RGB", "RGBA", "L"]:
+                image = Image.new(mode, (1600, 1600))
+                self.assertEqual(
+                    limit_image_size(image, processor, 32, None), (1408, 1408)
+                )
+                self.assertEqual(
+                    limit_image_size(image, self.processor, 32, None), (512, 512)
+                )
+
+    def test_service_pixel_cap_rejects_invalid_configuration(self):
+        for value in ["-1", "1023", "bad", "2.5"]:
+            with patch.dict(os.environ, {"RTP_LLM_QWEN_IMAGE_MAX_PIXELS": value}):
+                with self.assertRaises(ValueError):
+                    service_image_max_pixels(32)
+
+    def test_service_pixel_cap_wins_over_model_minimum(self):
+        processor = Qwen2VLImageProcessor(
+            patch_size=16, merge_size=2, min_pixels=4000000, max_pixels=16777216
+        )
+        with patch.dict(os.environ, {"RTP_LLM_QWEN_IMAGE_MAX_PIXELS": "2000000"}):
+            target = limit_image_size(Image.new("RGB", (640, 640)), processor, 32, None)
+        self.assertEqual(target, (1408, 1408))
 
     def test_early_resize_preserves_hf_pixels_and_grid(self):
         rng = np.random.default_rng(17)
