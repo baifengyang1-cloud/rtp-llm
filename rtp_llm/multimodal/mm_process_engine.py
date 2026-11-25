@@ -8,16 +8,15 @@ import os
 import signal
 import threading
 import time
+from contextlib import nullcontext
 from functools import partial
 from io import BytesIO
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.profiler
 
-from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.access_logger.access_logger import MMAccessLogger
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.log_config import get_log_path
@@ -44,13 +43,13 @@ from rtp_llm.multimodal.multimodal_mixins.multimodal_common import (
     MultiModalEmbeddingInterface,
 )
 from rtp_llm.multimodal.multimodal_util import (
-    collect_download_timing,
-    check_prepared_image_deadline,
-    use_prepared_image,
     _get_http_heads,
+    check_prepared_image_deadline,
+    collect_download_timing,
     maybe_tensor_to_list,
     trans_mm_input,
     url_data_cache_,
+    use_prepared_image,
     vit_emb_cache_,
 )
 from rtp_llm.multimodal.vit_embedding_timing import embedding_stage_timing
@@ -59,7 +58,12 @@ from rtp_llm.multimodal.vit_metrics import (
     collect_vit_preprocess_metrics,
     image_log_id,
 )
+from rtp_llm.multimodal.vit_request_deadline import (
+    current_vit_deadline,
+    use_vit_deadline,
+)
 from rtp_llm.ops import MMPreprocessConfig, MultimodalInput, get_multimodal_feature_hash
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.utils.base_model_datatypes import MMUrlType
 from rtp_llm.utils.time_util import Timer, timer_wrapper
 
@@ -450,7 +454,9 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
             return
 
         try:
-            payload = work_item.future.get(timeout=work_item.mm_timeout_ms / 1000.0)
+            payload = work_item.future.get(
+                timeout=max(0.0, work_item.deadline() - time.monotonic())
+            )
             (
                 work_item.preprocess_result,
                 preprocess_time,
@@ -596,6 +602,8 @@ class MMWorkItem:
             for input in self.mm_inputs
         )
         self.mm_type = self.mm_inputs[0].mm_type
+        deadline = time.monotonic() + self.mm_timeout_ms / 1000.0
+        self.deadline = current_vit_deadline() or (lambda: deadline)
 
         self.preprocess_result: Optional[Any] = None
         self.embedding_result: Optional[Any] = None
@@ -682,7 +690,9 @@ class MMWorkItem:
                 and self.embedding_cache.peek(self.cache_key) is self.cache_entry
             ):
                 self.hash_key_cache.put(
-                    self.cache_key, self.feature_hashes or [], self.cache_entry.generation
+                    self.cache_key,
+                    self.feature_hashes or [],
+                    self.cache_entry.generation,
                 )
 
     def fail_cache(self, error: Exception) -> None:
@@ -708,6 +718,7 @@ class MMProcessEngine:
         server_id: int = 0,
         is_proxy_mode: bool = False,
         device: str = "cuda:0",
+        startup_warmup: bool = False,
     ):
         """
         Initialize the multimodal process engine.
@@ -799,10 +810,26 @@ class MMProcessEngine:
 
         try:
             scheduler_args = vit_config.embedding_scheduler_args()
+            startup_timeout = float(os.getenv("RTP_LLM_VIT_WARMUP_TIMEOUT_S", "600"))
+            if startup_timeout <= 0:
+                raise ValueError("RTP_LLM_VIT_WARMUP_TIMEOUT_S must be positive")
+            startup_callback = None
+            if startup_warmup and os.getenv("RTP_LLM_VIT_STARTUP_WARMUP", "1") == "1":
+                from rtp_llm.multimodal.vit_warmup import warmup_vit
+
+                startup_callback = partial(
+                    warmup_vit,
+                    mm_part,
+                    self.device,
+                    scheduler_args["max_batch_images"],
+                    startup_timeout,
+                )
             self._scheduler = MMScheduler(
                 mm_part=mm_part,
                 device=self.device,
                 forward_profiler=self.profiler.profile_forward,
+                startup_callback=startup_callback,
+                startup_timeout_s=startup_timeout,
                 **scheduler_args,
             )
         except Exception:
@@ -1372,6 +1399,7 @@ class MMProcessEngine:
         )
 
         work_items = []
+        started = time.monotonic()
         for index in range(0, len(mm_inputs), batch_size):
             batch = mm_inputs[index : index + batch_size]
             work_item = MMWorkItem(
@@ -1383,6 +1411,14 @@ class MMProcessEngine:
                 defer_cache_complete=defer_cache_complete,
             )
             work_item.trace_request_id = request_id
+            if current_vit_deadline() is None:
+                deadline = started + work_item.mm_timeout_ms / 1000.0
+                work_item.deadline = lambda end=deadline: end
+            if work_item.deadline() <= time.monotonic():
+                error = TimeoutError("ViT request timeout before preprocessing")
+                for expired_item in work_items + [work_item]:
+                    expired_item.fail_cache(error)
+                raise error
             work_items.append(work_item)
             diag.event(
                 request_id,
@@ -1401,12 +1437,7 @@ class MMProcessEngine:
         """Wait for all preprocessing tasks to complete."""
         for work_item in work_items:
             if work_item.waiting_for_cache:
-                timeout_s = (
-                    work_item.mm_timeout_ms / 1000.0
-                    if work_item.mm_timeout_ms is not None
-                    and work_item.mm_timeout_ms > 0
-                    else 120.0
-                )
+                timeout_s = max(0.0, work_item.deadline() - time.monotonic())
                 work_item.embedding_result = work_item.cache_entry.wait(
                     timeout=timeout_s
                 )
@@ -1584,10 +1615,8 @@ class MMProcessEngine:
         keyed_inputs = [(item, item.cache_key()) for item in mm_inputs]
         if any(not item.url for item, _ in keyed_inputs):
             raise ValueError("async embedding requires non-empty url for each input")
-        owner_deadline = None
-        if getattr(self, "_image_downloads", None) is not None:
-            owner_timeout = self._image_timeout_ms(mm_inputs, queue_timeout_ms)
-            owner_deadline = time.monotonic() + owner_timeout / 1000
+        owner_timeout = self._image_timeout_ms(mm_inputs, queue_timeout_ms)
+        owner_deadline = time.monotonic() + owner_timeout / 1000
         # Claim, capacity reservation and executor handoff are one transaction
         # with respect to joiners and cancellation. submit() only enqueues;
         # no media I/O or embedding wait is performed while holding this lock.
@@ -1619,8 +1648,9 @@ class MMProcessEngine:
                         merged |= bool(task.request_ids - {request_id})
                         task.request_ids.add(request_id)
                         if owner_deadline is not None:
-                            task.deadlines[request_id] = max(
-                                task.deadlines.get(request_id, 0), owner_deadline
+                            task.deadlines[request_id] = min(
+                                task.deadlines.get(request_id, owner_deadline),
+                                owner_deadline,
                             )
                         self._async_request_tasks.setdefault(request_id, set()).add(
                             entry
@@ -1887,7 +1917,14 @@ class MMProcessEngine:
             diag.event(request_id, "vit.compute_worker_start", entry=id(entry))
             if source is not None:
                 deadline = source[3]()
-        if time.monotonic() >= deadline:
+
+        def owner_deadline():
+            with self._async_task_lock:
+                # task is retained even after cancellation removes the table
+                # entry; its empty owner set must invalidate queued GPU work.
+                return max(task.deadlines.values(), default=0) if task else deadline
+
+        if time.monotonic() >= owner_deadline():
             error = FtRuntimeException(
                 ExceptionType.GENERATE_TIMEOUT,
                 "ViT queue wait timed out before execution",
@@ -1899,7 +1936,7 @@ class MMProcessEngine:
             )
             self._fail_async_compute(cache_key, entry, error)
             return
-        with use_prepared_image(source):
+        with use_prepared_image(source), use_vit_deadline(owner_deadline):
             self._async_compute(mm_inputs, cache_key, entry, request_id)
 
     def _dispatch_image_batch(self, pending, request_id, queue_timeout_ms):

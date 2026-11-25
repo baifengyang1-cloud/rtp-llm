@@ -71,6 +71,11 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
             == "1",
         }
 
+    def get_warmup_batches(self, max_batch_images):
+        from rtp_llm.multimodal.qwen_vit_warmup import qwen_warmup_batches
+
+        return qwen_warmup_batches(self, max_batch_images)
+
     @torch.inference_mode()
     def embedding(self, data, **kwargs):
         pixel_values = vision_pixel_values(data[0], self._device, self._data_type)

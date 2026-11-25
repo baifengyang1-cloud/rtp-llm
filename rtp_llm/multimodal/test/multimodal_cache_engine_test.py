@@ -869,6 +869,40 @@ class VitErrorReportingTest(TestCase):
 
 
 class AsyncSubmitGetEmbeddingTest(TestCase):
+    def test_same_owner_does_not_restart_deadline_and_joiner_can_extend(self):
+        engine = self._make_engine()
+        media = self._make_input("fake://deadline")
+        futures = []
+
+        def enqueue(*args):
+            future = concurrent.futures.Future()
+            futures.append(future)
+            return future
+
+        try:
+            with patch.object(
+                engine._async_compute_executor, "submit", side_effect=enqueue
+            ):
+                engine._claim_and_submit_async(
+                    [media], request_id=901, queue_timeout_ms=1000
+                )
+                task = next(iter(engine._async_tasks.values()))
+                original = task.deadlines[901]
+                engine._claim_and_submit_async(
+                    [media], request_id=901, queue_timeout_ms=5000
+                )
+                self.assertEqual(task.deadlines[901], original)
+                engine._claim_and_submit_async(
+                    [media], request_id=902, queue_timeout_ms=5000
+                )
+                self.assertGreater(task.deadlines[902], original)
+                engine.cancel_queued_request(901)
+                self.assertEqual(set(task.deadlines), {902})
+                self.assertFalse(futures[0].cancelled())
+                engine.cancel_queued_request(902)
+                self.assertTrue(futures[0].cancelled())
+        finally:
+            engine.stop()
 
     def test_admission_metrics_use_mapping_tags_and_are_best_effort(self):
         engine = self._make_engine()
@@ -888,10 +922,13 @@ class AsyncSubmitGetEmbeddingTest(TestCase):
                     for call in report.call_args_list:
                         if len(call.args) > 2:
                             self.assertIsInstance(call.args[2], dict)
-                with patch(
-                    "rtp_llm.multimodal.mm_process_engine.kmonitor.report",
-                    side_effect=RuntimeError("telemetry unavailable"),
-                ), patch("logging.exception"):
+                with (
+                    patch(
+                        "rtp_llm.multimodal.mm_process_engine.kmonitor.report",
+                        side_effect=RuntimeError("telemetry unavailable"),
+                    ),
+                    patch("logging.exception"),
+                ):
                     self.assertEqual(
                         engine.async_submit([media], 802, pretrigger=True),
                         [media.cache_key()],
