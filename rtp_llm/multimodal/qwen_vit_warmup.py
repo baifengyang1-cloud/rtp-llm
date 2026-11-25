@@ -8,7 +8,11 @@ from io import BytesIO
 from PIL import Image
 
 from rtp_llm.multimodal.qwen_image_decode import prepare_device_jpeg
-from rtp_llm.multimodal.qwen_image_preprocess import prepare_device_pixels
+from rtp_llm.multimodal.qwen_image_preprocess import (
+    _processor_pixel_limits,
+    prepare_device_pixels,
+    service_image_max_pixels,
+)
 from rtp_llm.utils.base_model_datatypes import MMUrlType
 
 # Observed hot image shapes, plus common multi-image forward compositions.
@@ -55,13 +59,11 @@ def warmup_shapes(factor, max_batch_images, max_pixels):
 def qwen_warmup_batches(mm_part, max_batch_images):
     processor = mm_part.mm_processor.image_processor
     factor = mm_part.visual.patch_size * mm_part.visual.spatial_merge_size
-    model_max = getattr(processor, "max_pixels", 1408**2)
-    model_max = getattr(processor, "size", {}).get("longest_edge", model_max)
-    max_pixels = min(
-        model_max, int(os.getenv("RTP_LLM_QWEN_IMAGE_MAX_PIXELS", str(model_max)))
-    )
-    if max_pixels <= 0:
-        raise ValueError("ViT warmup pixel budget must be positive")
+    limits = _processor_pixel_limits(processor)
+    max_pixels = limits[1] if limits is not None else 1408**2
+    service_max = service_image_max_pixels(factor)
+    if service_max:
+        max_pixels = min(max_pixels, service_max)
     budget = mm_part.get_batch_work_budget(max_batch_images)
     for shapes in warmup_shapes(factor, max_batch_images, max_pixels):
         data = []

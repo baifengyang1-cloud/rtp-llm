@@ -145,3 +145,26 @@ class VitWarmupTest(TestCase):
         self.assertEqual(shapes, [[64, 96]] * 2)
         self.assertEqual(data[0][0].to_patches("cpu", torch.float32).shape, (24, 1536))
         self.assertEqual(data[0][1].tolist(), [[1, 4, 6]])
+
+    def test_zero_service_cap_preserves_model_budget(self):
+        from transformers import Qwen2VLImageProcessor
+
+        processor = Qwen2VLImageProcessor(
+            patch_size=16, temporal_patch_size=2, merge_size=2
+        )
+        part = SimpleNamespace(
+            mm_processor=SimpleNamespace(image_processor=processor),
+            visual=SimpleNamespace(patch_size=16, spatial_merge_size=2),
+            get_batch_work_budget=lambda _: None,
+            estimate_work=lambda *_: None,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RTP_LLM_VIT_WARMUP_BATCHES": "[[[64,96]]]",
+                "RTP_LLM_QWEN_IMAGE_MAX_PIXELS": "0",
+                "RTP_LLM_QWEN35_GPU_PREPROCESS": "1",
+                "RTP_LLM_QWEN_IMAGE_GPU_DECODE": "0",
+            },
+        ):
+            self.assertEqual(len(list(qwen_warmup_batches(part, 8))), 1)
