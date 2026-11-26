@@ -10,10 +10,10 @@ from itertools import chain, islice
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
-
 from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
 from rtp_llm.multimodal.greennet_hook import GreenNetVerdict
+from rtp_llm.multimodal.mm_error_messages import MMErrorSnapshot
 
 
 def _map_tensors(value: Any, fn: Callable[[torch.Tensor], Any]) -> Any:
@@ -153,7 +153,7 @@ class MMEmbeddingCacheEntry:
         self._on_fail = on_fail
         self._on_read = on_read
         self.result: Optional[Any] = None
-        self.error: Optional[Exception] = None
+        self._error: Optional[MMErrorSnapshot] = None
         self.generation = uuid.uuid4().hex
         # Error telemetry may be observed from several places (the producer
         # callback, a cache waiter, and an RPC handler). Keep one atomic claim
@@ -171,6 +171,14 @@ class MMEmbeddingCacheEntry:
         self.ready_events: List[Any] = []
         self._greennet_event = threading.Event()
         self._greennet_verdict: Optional[GreenNetVerdict] = None
+
+    @property
+    def error(self) -> Optional[Exception]:
+        return self._error.exception() if self._error is not None else None
+
+    @error.setter
+    def error(self, error: Optional[Exception]) -> None:
+        self._error = MMErrorSnapshot.capture(error) if error is not None else None
 
     def claim_pretrigger_reuse(self) -> bool:
         with self._state_lock:
@@ -201,8 +209,8 @@ class MMEmbeddingCacheEntry:
         """Wait for completion without promoting an offloaded embedding."""
         if not self._event.wait(timeout=timeout):
             raise TimeoutError("Waiting for embedding result timed out")
-        if self.error is not None:
-            raise self.error
+        if self._error is not None:
+            raise self._error.exception() from None
 
     def complete(
         self,
@@ -658,7 +666,9 @@ class MMEmbeddingCache:
             with self._lock:
                 if self._entries.get(cache_key) is not entry:
                     return
-                if not self.enabled:
+                if not self.enabled or gpu_bytes + cpu_bytes == 0:
+                    # Complete current waiters, but never retain unlimited
+                    # empty values that consume no tensor byte budget.
                     self._remove_entry_locked(cache_key)
                     return
             if gpu_bytes > self._gpu_max_bytes:

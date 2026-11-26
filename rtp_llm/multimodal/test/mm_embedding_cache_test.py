@@ -6,14 +6,166 @@ import weakref
 from unittest.mock import patch
 
 import torch
-
+from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.multimodal.mm_embedding_cache import (
     MMEmbeddingCache,
+    MMEmbeddingCacheEntry,
     MMHashKeyCache,
     _copy_result_to_devices,
     _embedding_result_cost,
     _tensor_tier_bytes,
 )
+from rtp_llm.multimodal.mm_scheduler import MMSchedulerExecutionError
+
+
+class EmbeddingFailureLifetimeTest(unittest.TestCase):
+    def test_producer_and_consumer_frames_release_without_gc(self):
+        def run(consumer):
+            entry = MMEmbeddingCacheEntry()
+            ref = weakref.ref(entry)
+            if consumer:
+                entry.fail(ValueError("bad image"))
+                try:
+                    entry.wait_ready()
+                except ValueError:
+                    pass
+            else:
+                try:
+                    raise ValueError("bad image")
+                except ValueError as error:
+                    entry.fail(error)
+            return ref
+
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            for consumer in (False, True):
+                with self.subTest(consumer=consumer):
+                    refs = [run(consumer) for _ in range(32)]
+                    self.assertTrue(all(ref() is None for ref in refs))
+        finally:
+            if enabled:
+                gc.enable()
+
+    def test_each_waiter_gets_independent_runtime_error(self):
+        entry = MMEmbeddingCacheEntry()
+        error = FtRuntimeException(ExceptionType.MM_DOWNLOAD_FAILED, "download timeout")
+        error._vit_error_qps_reported = True
+        entry.fail(error)
+
+        def consume():
+            try:
+                entry.wait_ready(1)
+            except FtRuntimeException as caught:
+                return caught
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            errors = list(executor.map(lambda _: consume(), range(8)))
+        self.assertEqual(len({id(error) for error in errors}), 8)
+        for caught in errors:
+            self.assertEqual(caught.exception_type, ExceptionType.MM_DOWNLOAD_FAILED)
+            self.assertEqual(caught.message, "download timeout")
+            self.assertTrue(caught._vit_error_qps_reported)
+            self.assertIsNot(caught, error)
+        self.assertIsNone(entry.error.__traceback__)
+
+    def test_custom_scheduler_error_fields_survive(self):
+        entry = MMEmbeddingCacheEntry()
+        entry.fail(MMSchedulerExecutionError("OutOfMemoryError", "GPU full", True))
+        with self.assertRaises(MMSchedulerExecutionError) as caught:
+            entry.wait_ready(1)
+        self.assertEqual(caught.exception.source_type, "OutOfMemoryError")
+        self.assertEqual(caught.exception.source_message, "GPU full")
+        self.assertTrue(caught.exception.is_oom)
+
+    def test_native_error_messages_and_fields_survive(self):
+        for error in (
+            TimeoutError("download deadline"),
+            FileNotFoundError(2, "missing image", "/missing/image"),
+            torch.OutOfMemoryError("GPU full"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                entry = MMEmbeddingCacheEntry()
+                entry.fail(error)
+                copied = entry.error
+                self.assertIs(type(copied), type(error))
+                self.assertEqual(str(copied), str(error))
+                self.assertEqual(copied.args, error.args)
+                if isinstance(error, OSError):
+                    self.assertEqual(copied.errno, error.errno)
+                    self.assertEqual(copied.filename, error.filename)
+
+    def test_failure_snapshot_does_not_retain_exception_payload(self):
+        class Payload:
+            pass
+
+        entry = MMEmbeddingCacheEntry()
+        payload = Payload()
+        ref = weakref.ref(payload)
+        error = RuntimeError("failure")
+        error.request = payload
+        error.__cause__ = ValueError("cause")
+        entry.fail(error)
+        del payload, error
+        self.assertIsNone(ref())
+        self.assertIsNone(entry.error.__cause__)
+        self.assertFalse(hasattr(entry.error, "request"))
+
+    def test_completion_callback_failure_does_not_retain_entry(self):
+        def run():
+            def fail_publish(entry, result):
+                raise ValueError("cannot publish")
+
+            entry = MMEmbeddingCacheEntry(on_complete=fail_publish)
+            ref = weakref.ref(entry)
+            try:
+                entry.complete(None)
+            except ValueError:
+                pass
+            try:
+                entry.wait_ready(1)
+            except ValueError:
+                pass
+            return ref
+
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            self.assertIsNone(run()())
+        finally:
+            if enabled:
+                gc.enable()
+
+
+class EmptyEmbeddingCacheTest(unittest.TestCase):
+    def test_empty_results_complete_waiters_without_residency(self):
+        cache = MMEmbeddingCache(gpu_max_bytes=64, cpu_max_bytes=64)
+        for value in (([], []), (torch.empty(0), None), None):
+            with self.subTest(value=value):
+                _, entry = cache.try_acquire("empty")
+                self.assertIs(cache.try_acquire("empty")[1], entry)
+                self.assertTrue(entry.complete(value))
+                self.assertIs(entry.wait(1), value)
+                self.assertIsNone(cache.peek("empty"))
+                self.assertEqual(cache.stats()["resident_entries"], 0)
+                self.assertEqual(cache.stats()["resident_bytes"], 0)
+                self.assertEqual(cache.try_acquire("empty")[0], "miss")
+                cache.clear()
+
+    def test_unique_empty_results_do_not_accumulate_or_evict_valid_value(self):
+        cache = MMEmbeddingCache(gpu_max_bytes=0, cpu_max_bytes=64)
+        hashes = MMHashKeyCache(4096)
+        _, valid = cache.try_acquire("valid")
+        valid.complete((torch.ones(2, 4), None))
+        for i in range(256):
+            key = str(i)
+            _, entry = cache.try_acquire(key)
+            cache.complete(key, entry, ([], []), [], hash_key_cache=hashes)
+        self.assertIs(cache.peek("valid"), valid)
+        self.assertEqual(cache.stats()["resident_entries"], 1)
+        self.assertEqual(cache.stats()["resident_bytes"], 32)
+        self.assertEqual(cache.stats()["pending_entries"], 0)
+        self.assertEqual(hashes.stats()["resident_entries"], 0)
 
 
 class EmbeddingTraversalLifetimeTest(unittest.TestCase):

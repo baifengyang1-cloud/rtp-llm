@@ -8,16 +8,14 @@ import os
 import signal
 import threading
 import time
+from contextlib import nullcontext
 from functools import partial
 from io import BytesIO
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.profiler
-
-from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.access_logger.access_logger import MMAccessLogger
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.log_config import get_log_path
@@ -44,13 +42,13 @@ from rtp_llm.multimodal.multimodal_mixins.multimodal_common import (
     MultiModalEmbeddingInterface,
 )
 from rtp_llm.multimodal.multimodal_util import (
-    collect_download_timing,
-    check_prepared_image_deadline,
-    use_prepared_image,
     _get_http_heads,
+    check_prepared_image_deadline,
+    collect_download_timing,
     maybe_tensor_to_list,
     trans_mm_input,
     url_data_cache_,
+    use_prepared_image,
     vit_emb_cache_,
 )
 from rtp_llm.multimodal.vit_metrics import (
@@ -58,6 +56,7 @@ from rtp_llm.multimodal.vit_metrics import (
     collect_vit_preprocess_metrics,
 )
 from rtp_llm.ops import MMPreprocessConfig, MultimodalInput, get_multimodal_feature_hash
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.utils.base_model_datatypes import MMUrlType
 from rtp_llm.utils.time_util import Timer, timer_wrapper
 
@@ -73,7 +72,10 @@ def _run_preprocess_task(
     preprocess_params: dict,
 ) -> Tuple[Any, float, float, List[VitMetricSample]]:
     """Run preprocessing and return total and media-load durations in ms."""
-    with collect_vit_preprocess_metrics() as samples, collect_download_timing() as download_timing:
+    with (
+        collect_vit_preprocess_metrics() as samples,
+        collect_download_timing() as download_timing,
+    ):
         with Timer() as route_timer:
             result = preprocess_func(mm_inputs, vit_config, **preprocess_params)
     return (
@@ -1868,8 +1870,9 @@ class MMProcessEngine:
                 pending, request_id=request_id, queue_timeout_ms=queue_timeout_ms
             )
 
-        from internal_source.rtp_llm.utils.image_downloads import DownloadBusy
         from rtp_llm.multimodal.mm_error_messages import MMErr
+
+        from internal_source.rtp_llm.utils.image_downloads import DownloadBusy
 
         ready = []
         admission_error = None
@@ -1908,8 +1911,10 @@ class MMProcessEngine:
                     request_id=request_id,
                     started=start,
                     on_done=partial(
-                        self._image_download_done, (item, key, entry),
-                        start=start, owner_deadline=owner_deadline,
+                        self._image_download_done,
+                        (item, key, entry),
+                        start=start,
+                        owner_deadline=owner_deadline,
                     ),
                 )
                 task.download = fut
@@ -1927,16 +1932,19 @@ class MMProcessEngine:
         if admission_error is not None:
             raise admission_error
         if ready:
-            self._submit_async_compute_batch(ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms)
+            self._submit_async_compute_batch(
+                ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms
+            )
 
     def _image_download_done(self, pending, future, start, owner_deadline):
         timing = future.download_timing
         timing.callback_enter = time.monotonic()
+        from rtp_llm.multimodal.mm_error_messages import MMErr
+
         from internal_source.rtp_llm.utils.image_downloads import (
             DownloadBusy,
             ImageTooLarge,
         )
-        from rtp_llm.multimodal.mm_error_messages import MMErr
 
         item, key, entry = pending
         timing.lock_start = time.monotonic()
@@ -1967,7 +1975,9 @@ class MMProcessEngine:
                 )
                 url_data_cache_.insert_cache(item.url, BytesIO(body))
                 self._submit_async_compute_batch(
-                    [pending], request_id=next(iter(task.request_ids)), queue_timeout_ms=left_ms
+                    [pending],
+                    request_id=next(iter(task.request_ids)),
+                    queue_timeout_ms=left_ms,
                 )
                 return
             except FtRuntimeException as e:
@@ -1988,9 +1998,14 @@ class MMProcessEngine:
                 error = FtRuntimeException(
                     ExceptionType.MM_DOWNLOAD_FAILED, MMErr.DL_FAILED
                 )
-            if entry in self._async_tasks:
-                self._forget_async_task_locked(entry)
-                self._fail_async_compute(key, entry, error)
+            try:
+                if entry in self._async_tasks:
+                    self._forget_async_task_locked(entry)
+                    self._fail_async_compute(key, entry, error)
+            finally:
+                # The error's traceback may include this callback. Do not
+                # retain it through a local after publishing its snapshot.
+                error = None
 
     def _submit_async_compute_batch(
         self,
