@@ -1,17 +1,17 @@
-"""Defer supported JPEGs to the ViT device without touching CUDA in workers."""
+"""Decode PNGs in workers; defer supported image resizing to the ViT device."""
 
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from io import BytesIO
 from typing import Tuple
 
 import numpy as np
 import torch
 from PIL import Image
-
 from rtp_llm.multimodal.qwen_image_preprocess import (
     QwenImagePixels,
     device_pixel_parameters,
@@ -53,6 +53,179 @@ def _decode_device_jpeg(encoded, device):
     # torchvision requires compressed bytes on CPU even for device decoding.
     data = torch.frombuffer(bytearray(encoded), dtype=torch.uint8)
     return decode_jpeg(data, mode="RGB", device=device)
+
+
+@lru_cache(maxsize=1)
+def _png_decoder():
+    """Probe once: some PPU wheels expose decode_png without libPNG support."""
+    try:
+        from torchvision.io import decode_png
+
+        buffer = BytesIO()
+        Image.new("RGB", (1, 1)).save(buffer, format="PNG")
+        decode_png(
+            torch.frombuffer(bytearray(buffer.getvalue()), dtype=torch.uint8),
+            mode="RGB",
+        )
+        return decode_png
+    except torch.OutOfMemoryError:
+        raise
+    except (ImportError, OSError, RuntimeError):
+        return None
+
+
+@dataclass
+class QwenPngPixels:
+    """Decoded CPU pixels, with resizing deferred to the device scheduler.
+
+    PNG has no CUDA decoder in the deployed torchvision runtime. Keep its
+    CPU decode off the GPU scheduler thread, and transport uint8 pixels
+    rather than full-resolution float normalization buffers.
+    """
+
+    pixels: torch.Tensor
+    lookup: torch.Tensor
+    patch_size: int
+    merge_size: int
+    temporal_patch_size: int
+    target_hw: Tuple[int, int]
+    torchvision_resize: bool
+    request_id: int = 0
+    image_id: str = ""
+    decode_backend: str = "pillow_cpu"
+
+    def _cpu_resize(self):
+        if tuple(self.pixels.shape[-2:]) == self.target_hw:
+            return self.pixels
+        if self.torchvision_resize:
+            from torchvision.transforms.v2.functional import InterpolationMode, resize
+
+            return resize(
+                self.pixels.unsqueeze(0),
+                list(self.target_hw),
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )[0]
+        image = Image.fromarray(self.pixels.permute(1, 2, 0).numpy())
+        image = image.resize(self.target_hw[::-1], Image.Resampling.BICUBIC)
+        return torch.from_numpy(np.array(image)).permute(2, 0, 1)
+
+    def to_patches(self, device, dtype):
+        device = torch.device(device)
+        record = {
+            "request_id": self.request_id,
+            "image_id": self.image_id,
+            "image_format": "PNG",
+            "decode_backend": self.decode_backend,
+            "resize_backend": "cpu",
+            "device": str(device),
+            "outcome": "ok",
+        }
+        started = time.monotonic_ns()
+        try:
+            step = time.monotonic_ns()
+            if device.type == "cuda":
+                try:
+                    pixels = _resize_device_rgb(self.pixels.to(device), self.target_hw)
+                    record["resize_backend"] = "device"
+                except torch.OutOfMemoryError:
+                    raise
+                except (ImportError, OSError, RuntimeError) as error:
+                    record["fallback_reason"] = type(error).__name__
+                    pixels = self._cpu_resize()
+            else:
+                pixels = self._cpu_resize()
+            record["resize_host_ms"] = (time.monotonic_ns() - step) / 1e6
+            step = time.monotonic_ns()
+            result = QwenImagePixels(
+                pixels.permute(1, 2, 0),
+                self.lookup,
+                self.patch_size,
+                self.merge_size,
+                self.temporal_patch_size,
+            ).to_patches(device, dtype)
+            record["pack_host_ms"] = (time.monotonic_ns() - step) / 1e6
+            return result
+        except BaseException as error:
+            record.update(outcome="error", error=type(error).__name__)
+            raise
+        finally:
+            record["total_host_ms"] = (time.monotonic_ns() - started) / 1e6
+            logging.info(
+                "vit_image_device_preprocess_timing %s",
+                json.dumps(record, separators=(",", ":")),
+            )
+
+
+def prepare_device_png(image, encoded, processor, target_hw, processor_resize, timing):
+    """Decode lossless RGB8 PNGs on CPU, preserving the existing sizing policy.
+
+    Alpha/palette, 16-bit and animated images retain the original Pillow path;
+    their color conversion/compositing is not equivalent to RGB tensor resize.
+    No CUDA API is called by this function or by worker transport.
+    """
+    if os.getenv("RTP_LLM_QWEN_IMAGE_PNG_GPU_RESIZE", "1") != "1":
+        return None
+    if image.format != "PNG" or image.mode != "RGB":
+        return None
+    if len(encoded) < 33 or encoded[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    if encoded[24:26] != bytes((8, 2)) or getattr(image, "is_animated", False):
+        return None
+    maximum = int(os.getenv("RTP_LLM_QWEN_IMAGE_GPU_DECODE_MAX_PIXELS", "33554432"))
+    if maximum <= 0:
+        raise ValueError("RTP_LLM_QWEN_IMAGE_GPU_DECODE_MAX_PIXELS must be positive")
+    if image.height * image.width > maximum:
+        return None
+    if target_hw is None:
+        if getattr(processor, "do_resize", False):
+            return None
+        target_hw = image.height, image.width
+    if getattr(processor, "resample", None) != Image.Resampling.BICUBIC:
+        return None
+    parameters = device_pixel_parameters(processor)
+    if parameters is None:
+        return None
+    _, patch, merge, _ = parameters
+    height, width = target_hw
+    if min(height, width) <= 0 or height % (patch * merge) or width % (patch * merge):
+        return None
+    try:
+        decoder = _png_decoder()
+        pixels = (
+            decoder(torch.frombuffer(bytearray(encoded), dtype=torch.uint8), mode="RGB")
+            if decoder is not None
+            else None
+        )
+        if pixels is None:
+            image.load()
+            pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1)
+        timing["decode_backend"] = "libpng_cpu" if decoder is not None else "pillow_cpu"
+        if (
+            pixels.device.type != "cpu"
+            or pixels.dtype != torch.uint8
+            or tuple(pixels.shape) != (3, image.height, image.width)
+        ):
+            raise RuntimeError("PNG decoder returned invalid pixels")
+    except torch.OutOfMemoryError:
+        raise
+    except (ImportError, OSError, RuntimeError) as error:
+        timing["png_decoder_fallback"] = type(error).__name__
+        # A native decoder may reject an otherwise valid PNG. Keep resizing
+        # deferred even when decoding falls back to Pillow.
+        image.load()
+        pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1)
+        timing["decode_backend"] = "pillow_cpu"
+    payload = QwenPngPixels(
+        pixels,
+        *parameters,
+        (height, width),
+        processor_resize and getattr(processor, "backend", None) == "torchvision",
+        timing.get("request_id", 0),
+        timing.get("image_id", ""),
+        timing["decode_backend"],
+    )
+    return payload, torch.tensor([[1, height // patch, width // patch]], device="cpu")
 
 
 @dataclass

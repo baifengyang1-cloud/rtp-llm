@@ -254,9 +254,9 @@ def prepare_device_pixels(image, processor):
 
 def vision_pixel_values(data, device, dtype):
     # Imported lazily so CPU workers never import a device decoder extension.
-    from rtp_llm.multimodal.qwen_image_decode import QwenJpegBytes
+    from rtp_llm.multimodal.qwen_image_decode import QwenJpegBytes, QwenPngPixels
 
-    if isinstance(data, QwenJpegBytes):
+    if isinstance(data, (QwenJpegBytes, QwenPngPixels)):
         return data.to_patches(device, dtype)
     if isinstance(data, QwenImagePixels):
         return data.to_patches(device, dtype)

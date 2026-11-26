@@ -26,7 +26,7 @@ from rtp_llm.multimodal.multimodal_mixins.qwen2_5_vl.qwen2_5_vl_mixin import (
     smart_resize,
 )
 from rtp_llm.multimodal.multimodal_util import get_bytes_io_from_url
-from rtp_llm.multimodal.qwen_image_decode import prepare_device_jpeg
+from rtp_llm.multimodal.qwen_image_decode import prepare_device_jpeg, prepare_device_png
 from rtp_llm.multimodal.qwen_image_preprocess import (
     default_resize_size,
     limit_image_size,
@@ -151,6 +151,31 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
                         timing["service_max_pixels"] = service_maximum
                         timing["service_pixel_cap_applied"] = target_hw != policy_target
                     if defer_pixel_processing:
+                        prepared = prepare_device_png(
+                            image,
+                            image_data.getvalue(),
+                            processor.image_processor,
+                            target_hw,
+                            processor_resize,
+                            timing,
+                        )
+                        if prepared is not None:
+                            timing.update(
+                                decode_deferred=False,
+                                resize_deferred=True,
+                                pixel_processing_deferred=True,
+                                decoded_width=image.width,
+                                decoded_height=image.height,
+                                processor_input_height=prepared[0].target_hw[0],
+                                processor_input_width=prepared[0].target_hw[1],
+                                image_grid_thw=prepared[1].tolist(),
+                            )
+                            record_vit_preprocess_value(
+                                GaugeMetrics.VIT_RESIZED_PIXEL_COUNT_METRIC,
+                                prepared[0].target_hw[0] * prepared[0].target_hw[1],
+                                tags,
+                            )
+                            return prepared
                         prepared = prepare_device_jpeg(
                             image,
                             image_data.getvalue(),
