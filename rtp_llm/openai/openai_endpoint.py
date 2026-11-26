@@ -296,6 +296,7 @@ class OpenaiEndpoint(object):
         if request.logprobs != None:
             if not request.logprobs:
                 config.return_all_probs = ReturnAllProbsMode.NONE
+                config.logprobs_top_k = -1
             # Priority: if extra_configs.return_all_probs is already set to
             # something non-NONE (typically ORIGINAL), honor that — caller has
             # explicitly opted into a specific mode. Only fall through to
@@ -305,6 +306,16 @@ class OpenaiEndpoint(object):
                     config.return_all_probs = ReturnAllProbsMode.ORIGINAL
                 else:
                     config.return_all_probs = ReturnAllProbsMode.DEFAULT
+                # Explicit full-vocabulary requests retain their existing response.
+                # An explicit -1 in extra_configs is also a compact-path opt-out.
+                if "logprobs_top_k" not in config.model_fields_set:
+                    top_k = request.top_logprobs or 1
+                    if not 0 <= top_k <= 1024:
+                        raise FtRuntimeException(
+                            ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                            "top_logprobs must be in [0, 1024]",
+                        )
+                    config.logprobs_top_k = top_k
         if request.logprobs or request.functions:
             config.is_streaming = True
         if request.prompt_logprobs is not None:

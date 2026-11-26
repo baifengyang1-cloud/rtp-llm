@@ -112,6 +112,11 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     generate_config->force_disable_sp_run     = config_proto->force_disable_sp_run();
     generate_config->force_sp_accept          = config_proto->force_sp_accept();
     generate_config->return_cum_log_probs     = config_proto->return_cum_log_probs();
+    if (config_proto->has_logprobs_top_k()) {
+        const auto top_k = config_proto->logprobs_top_k().value();
+        RTP_LLM_CHECK_WITH_INFO(top_k >= -1 && top_k <= 1024, "invalid logprobs_top_k: %d", top_k);
+        generate_config->logprobs_top_k = top_k;
+    }
     if (config_proto->return_all_probs_mode() != 0) {
         // new client: explicit mode (offset 1). Clamp out-of-range values to NONE
         // so a malformed client can't synthesize an undefined ReturnAllProbsMode.
@@ -430,6 +435,10 @@ void QueryConverter::transResponse(GenerateOutputsPB*     outputs,
             }
             if (response.aux_info.softmax_probs.has_value()) {
                 transTensorPB(aux_info->mutable_softmax_probs(), response.aux_info.softmax_probs.value());
+            }
+            if (response.aux_info.logprob_token_ids.has_value()) {
+                transTensorPB(aux_info->mutable_logprob_token_ids(), response.aux_info.logprob_token_ids.value());
+                transTensorPB(aux_info->mutable_logprob_values(), response.aux_info.logprob_values.value());
             }
         }
     }

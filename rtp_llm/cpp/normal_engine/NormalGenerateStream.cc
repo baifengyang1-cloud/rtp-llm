@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/normal_engine/CompactLogprobs.h"
 
 #include <algorithm>
 #include <chrono>
@@ -177,7 +178,12 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
                 if (!update_info.all_probs.defined()) {
                     throw std::runtime_error("all_probs is not while generate_config return_all_probs is true");
                 }
-                generate_output.aux_info.all_probs = all_probs_.narrow(0, i, 1).clone();
+                if (logprob_token_ids_.defined()) {
+                    generate_output.aux_info.logprob_token_ids = logprob_token_ids_.narrow(0, i, 1).clone();
+                    generate_output.aux_info.logprob_values    = logprob_values_.narrow(0, i, 1).clone();
+                } else {
+                    generate_output.aux_info.all_probs = all_probs_.narrow(0, i, 1).clone();
+                }
             }
         }
         // hidden_states post process
@@ -250,7 +256,21 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
         cum_log_probs_ = update_info.cum_log_probs.cpu();
     }
     if (update_info.all_probs.defined()) {
-        all_probs_ = update_info.all_probs.cpu();
+        const auto top_k = generate_input_->generate_config->logprobs_top_k;
+        // Multi-token/speculative and beam-layout updates retain the dense path.
+        // Restricted output vocabularies need an ID mapping and also fall back.
+        if (top_k >= 0 && update_info.num_new_tokens == 1 && update_info.new_tokens.dim() == 2
+            && update_info.new_tokens.size(1) == 1 && update_info.all_probs.dim() == 2
+            && update_info.new_tokens.size(0) == update_info.all_probs.size(0) && outputVocabSize() == 0) {
+            auto compact       = gatherCompactLogprobs(update_info.all_probs, update_info.new_tokens, top_k);
+            logprob_token_ids_ = compact.first.cpu();
+            logprob_values_    = compact.second.cpu();
+            all_probs_         = torch::Tensor();
+        } else {
+            all_probs_         = update_info.all_probs.cpu();
+            logprob_token_ids_ = torch::Tensor();
+            logprob_values_    = torch::Tensor();
+        }
     }
 
     // TODO: move it to better position

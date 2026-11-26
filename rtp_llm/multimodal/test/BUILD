@@ -69,6 +69,18 @@ py_test(
 )
 
 py_test(
+    name = "vit_embedding_timing_test",
+    srcs = ["vit_embedding_timing_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
+    name = "vit_warmup_test",
+    srcs = ["vit_warmup_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
     name = "vit_metrics_test",
     srcs = [
         "vit_metrics_test.py",
@@ -91,6 +103,18 @@ py_test(
 py_test(
     name = "qwen35_vision_metadata_test",
     srcs = ["qwen35_vision_metadata_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
+    name = "qwen_image_preprocess_test",
+    srcs = ["qwen_image_preprocess_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
+    name = "qwen_image_decode_test",
+    srcs = ["qwen_image_decode_test.py"],
     deps = ["//rtp_llm:testlib"],
 )
 

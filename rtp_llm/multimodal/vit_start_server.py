@@ -71,6 +71,7 @@ def vit_start_server(
         device=f"cuda:{local_rank}",
         server_id=server_id,
         is_proxy_mode=is_proxy_mode,
+        startup_warmup=True,
     )
 
     logging.info(

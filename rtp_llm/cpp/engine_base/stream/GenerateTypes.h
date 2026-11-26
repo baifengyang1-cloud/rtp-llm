@@ -135,6 +135,8 @@ struct AuxInfo {
     std::string                  generation_prefill_cuda_graph_status = "not_requested";
     std::optional<torch::Tensor> cum_log_probs;
     std::optional<torch::Tensor> all_probs;
+    std::optional<torch::Tensor> logprob_token_ids;
+    std::optional<torch::Tensor> logprob_values;
     std::optional<torch::Tensor> softmax_probs;
     std::map<int, int>           multimodal_lengths = {};
 };

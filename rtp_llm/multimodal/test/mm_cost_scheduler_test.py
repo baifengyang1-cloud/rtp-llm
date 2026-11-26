@@ -141,6 +141,31 @@ def _submit_concurrently(
 
 
 class MMSchedulerTest(TestCase):
+    def test_expired_chunk_does_not_requeue_or_hash_after_forward(self):
+        fake = _FakeMMPart(work_budget=MMWorkEstimate(input_patches=8))
+        end = [time.monotonic() + 5]
+        original = fake.batched_embedding
+
+        def forward(*args, **kwargs):
+            result = original(*args, **kwargs)
+            end[0] = 0
+            return result
+
+        fake.batched_embedding = forward
+        items = [_FakeWorkItem(input_patches=6) for _ in range(2)]
+        for item in items:
+            item.deadline = lambda: end[0]
+            item.complete_cache = mock.Mock()
+        scheduler = MMScheduler(fake, batch_wait_ms=0, max_batch_size=1)
+        try:
+            with self.assertRaises(TimeoutError):
+                scheduler.submit_and_wait(items)
+            self.assertEqual(fake.calls, [1])
+            for item in items:
+                item.complete_cache.assert_not_called()
+        finally:
+            scheduler.close()
+
     def test_queue_metrics_report_depth_and_wait(self):
         """Queue gauges expose backlog depth and time before a forward starts."""
         fake = _FakeMMPart(delay=0.2)

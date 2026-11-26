@@ -41,6 +41,7 @@ class MultimodalMixinFactory:
         device: str = "cuda:0",
         server_id: int = 0,
         is_proxy_mode: bool = False,
+        startup_warmup: bool = False,
     ) -> MMProcessEngine:
         mm_mixin = MultimodalMixinFactory._create_multimodal_mixin(
             model_config=model_config,
@@ -56,4 +57,5 @@ class MultimodalMixinFactory:
             server_id,
             is_proxy_mode,
             device=device,
+            startup_warmup=startup_warmup,
         )

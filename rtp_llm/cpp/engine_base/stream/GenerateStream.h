@@ -929,6 +929,8 @@ protected:
 
     torch::Tensor                            cum_log_probs_;
     torch::Tensor                            all_probs_;
+    torch::Tensor                            logprob_token_ids_;
+    torch::Tensor                            logprob_values_;
     torch::Tensor                            softmax_probs_;
     torch::Tensor                            loss_;
     torch::Tensor                            last_hidden_states_;

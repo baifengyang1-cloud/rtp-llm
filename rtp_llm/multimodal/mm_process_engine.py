@@ -8,16 +8,15 @@ import os
 import signal
 import threading
 import time
+from contextlib import nullcontext
 from functools import partial
 from io import BytesIO
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.profiler
 
-from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.access_logger.access_logger import MMAccessLogger
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.log_config import get_log_path
@@ -44,20 +43,27 @@ from rtp_llm.multimodal.multimodal_mixins.multimodal_common import (
     MultiModalEmbeddingInterface,
 )
 from rtp_llm.multimodal.multimodal_util import (
-    collect_download_timing,
-    check_prepared_image_deadline,
-    use_prepared_image,
     _get_http_heads,
+    check_prepared_image_deadline,
+    collect_download_timing,
     maybe_tensor_to_list,
     trans_mm_input,
     url_data_cache_,
+    use_prepared_image,
     vit_emb_cache_,
 )
+from rtp_llm.multimodal.vit_embedding_timing import embedding_stage_timing
 from rtp_llm.multimodal.vit_metrics import (
     VitMetricSample,
     collect_vit_preprocess_metrics,
+    image_log_id,
+)
+from rtp_llm.multimodal.vit_request_deadline import (
+    current_vit_deadline,
+    use_vit_deadline,
 )
 from rtp_llm.ops import MMPreprocessConfig, MultimodalInput, get_multimodal_feature_hash
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.utils.base_model_datatypes import MMUrlType
 from rtp_llm.utils.time_util import Timer, timer_wrapper
 
@@ -71,15 +77,35 @@ def _run_preprocess_task(
     mm_inputs: List[MultimodalInput],
     vit_config: VitConfig,
     preprocess_params: dict,
+    request_id: int = 0,
 ) -> Tuple[Any, float, float, List[VitMetricSample]]:
     """Run preprocessing and return total and media-load durations in ms."""
-    with collect_vit_preprocess_metrics() as samples, collect_download_timing() as download_timing:
-        with Timer() as route_timer:
-            result = preprocess_func(mm_inputs, vit_config, **preprocess_params)
+    with (
+        collect_vit_preprocess_metrics(request_id) as samples,
+        collect_download_timing() as download_timing,
+    ):
+        outcome = "error"
+        try:
+            with Timer() as route_timer:
+                result = preprocess_func(mm_inputs, vit_config, **preprocess_params)
+            outcome = "ok"
+        finally:
+            total_ms = route_timer.cost_ms() + download_timing.prefetched_ms
+            download_ms = download_timing.elapsed_ms
+            logging.info(
+                "vit_preprocess_timing request_id=%s image_ids=%s outcome=%s "
+                "total_ms=%.3f download_ms=%.3f preprocess_ms=%.3f",
+                request_id,
+                ",".join(image_log_id(item.url) for item in mm_inputs),
+                outcome,
+                total_ms,
+                download_ms,
+                max(0.0, total_ms - download_ms),
+            )
     return (
         result,
-        route_timer.cost_ms() + download_timing.prefetched_ms,
-        download_timing.elapsed_ms,
+        total_ms,
+        download_ms,
         samples.samples,
     )
 
@@ -150,6 +176,7 @@ def _worker_process_task(
             mm_inputs,
             _worker_vit_config,
             _worker_preprocess_params,
+            request_id=request_id,
         )
 
 
@@ -258,6 +285,7 @@ class LocalPreprocessExecutor(PreprocessExecutor):
                     work_item.mm_inputs,
                     self.vit_config,
                     self.preprocess_params,
+                    request_id=getattr(work_item, "trace_request_id", 0),
                 )
             result, preprocess_time, download_time = _unpack_preprocess_result(payload)
             work_item.preprocess_result = result
@@ -426,7 +454,9 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
             return
 
         try:
-            payload = work_item.future.get(timeout=work_item.mm_timeout_ms / 1000.0)
+            payload = work_item.future.get(
+                timeout=max(0.0, work_item.deadline() - time.monotonic())
+            )
             (
                 work_item.preprocess_result,
                 preprocess_time,
@@ -572,6 +602,8 @@ class MMWorkItem:
             for input in self.mm_inputs
         )
         self.mm_type = self.mm_inputs[0].mm_type
+        deadline = time.monotonic() + self.mm_timeout_ms / 1000.0
+        self.deadline = current_vit_deadline() or (lambda: deadline)
 
         self.preprocess_result: Optional[Any] = None
         self.embedding_result: Optional[Any] = None
@@ -627,22 +659,37 @@ class MMWorkItem:
         return self.embedding_result is None and not self.waiting_for_cache
 
     def complete_cache(self, result: Any, force: bool = False) -> None:
-        if self.feature_hashes is None:
-            self.feature_hashes = _feature_hashes_from_result(result)
-        if (
-            (self.defer_cache_complete and not force)
-            or self.embedding_cache is None
-            or self.cache_key is None
-            or self.cache_entry is None
-        ):
-            return
-        self.embedding_cache.complete(
-            self.cache_key,
-            self.cache_entry,
-            result,
-            self.feature_hashes,
-            hash_key_cache=self.hash_key_cache,
+        fields = dict(
+            request_id=getattr(self, "trace_request_id", 0),
+            image_ids=[image_log_id(item.url) for item in self.mm_inputs if item.url],
+            force=force,
         )
+        with embedding_stage_timing("feature_hash", **fields) as timing:
+            if self.feature_hashes is None:
+                # Includes first-use native library loading and any existing
+                # device-to-host/synchronization cost in the hash operation.
+                self.feature_hashes = _feature_hashes_from_result(result)
+            else:
+                timing.update(outcome="skipped", reason="already_computed")
+        with embedding_stage_timing("cache_complete", **fields) as timing:
+            if self.defer_cache_complete and not force:
+                timing.update(outcome="skipped", reason="deferred")
+                return
+            if (
+                self.embedding_cache is None
+                or self.cache_key is None
+                or self.cache_entry is None
+            ):
+                timing.update(outcome="skipped", reason="no_cache_claim")
+                return
+            # Keep hash publication inside cache completion, before waiters wake.
+            self.embedding_cache.complete(
+                self.cache_key,
+                self.cache_entry,
+                result,
+                self.feature_hashes,
+                hash_key_cache=self.hash_key_cache,
+            )
 
     def fail_cache(self, error: Exception) -> None:
         if (
@@ -667,6 +714,7 @@ class MMProcessEngine:
         server_id: int = 0,
         is_proxy_mode: bool = False,
         device: str = "cuda:0",
+        startup_warmup: bool = False,
     ):
         """
         Initialize the multimodal process engine.
@@ -758,10 +806,26 @@ class MMProcessEngine:
 
         try:
             scheduler_args = vit_config.embedding_scheduler_args()
+            startup_timeout = float(os.getenv("RTP_LLM_VIT_WARMUP_TIMEOUT_S", "600"))
+            if startup_timeout <= 0:
+                raise ValueError("RTP_LLM_VIT_WARMUP_TIMEOUT_S must be positive")
+            startup_callback = None
+            if startup_warmup and os.getenv("RTP_LLM_VIT_STARTUP_WARMUP", "1") == "1":
+                from rtp_llm.multimodal.vit_warmup import warmup_vit
+
+                startup_callback = partial(
+                    warmup_vit,
+                    mm_part,
+                    self.device,
+                    scheduler_args["max_batch_images"],
+                    startup_timeout,
+                )
             self._scheduler = MMScheduler(
                 mm_part=mm_part,
                 device=self.device,
                 forward_profiler=self.profiler.profile_forward,
+                startup_callback=startup_callback,
+                startup_timeout_s=startup_timeout,
                 **scheduler_args,
             )
         except Exception:
@@ -1331,6 +1395,7 @@ class MMProcessEngine:
         )
 
         work_items = []
+        started = time.monotonic()
         for index in range(0, len(mm_inputs), batch_size):
             batch = mm_inputs[index : index + batch_size]
             work_item = MMWorkItem(
@@ -1342,6 +1407,14 @@ class MMProcessEngine:
                 defer_cache_complete=defer_cache_complete,
             )
             work_item.trace_request_id = request_id
+            if current_vit_deadline() is None:
+                deadline = started + work_item.mm_timeout_ms / 1000.0
+                work_item.deadline = lambda end=deadline: end
+            if work_item.deadline() <= time.monotonic():
+                error = TimeoutError("ViT request timeout before preprocessing")
+                for expired_item in work_items + [work_item]:
+                    expired_item.fail_cache(error)
+                raise error
             work_items.append(work_item)
             diag.event(
                 request_id,
@@ -1360,12 +1433,7 @@ class MMProcessEngine:
         """Wait for all preprocessing tasks to complete."""
         for work_item in work_items:
             if work_item.waiting_for_cache:
-                timeout_s = (
-                    work_item.mm_timeout_ms / 1000.0
-                    if work_item.mm_timeout_ms is not None
-                    and work_item.mm_timeout_ms > 0
-                    else 120.0
-                )
+                timeout_s = max(0.0, work_item.deadline() - time.monotonic())
                 work_item.embedding_result = work_item.cache_entry.wait(
                     timeout=timeout_s
                 )
@@ -1543,10 +1611,8 @@ class MMProcessEngine:
         keyed_inputs = [(item, item.cache_key()) for item in mm_inputs]
         if any(not item.url for item, _ in keyed_inputs):
             raise ValueError("async embedding requires non-empty url for each input")
-        owner_deadline = None
-        if getattr(self, "_image_downloads", None) is not None:
-            owner_timeout = self._image_timeout_ms(mm_inputs, queue_timeout_ms)
-            owner_deadline = time.monotonic() + owner_timeout / 1000
+        owner_timeout = self._image_timeout_ms(mm_inputs, queue_timeout_ms)
+        owner_deadline = time.monotonic() + owner_timeout / 1000
         # Claim, capacity reservation and executor handoff are one transaction
         # with respect to joiners and cancellation. submit() only enqueues;
         # no media I/O or embedding wait is performed while holding this lock.
@@ -1578,8 +1644,9 @@ class MMProcessEngine:
                         merged |= bool(task.request_ids - {request_id})
                         task.request_ids.add(request_id)
                         if owner_deadline is not None:
-                            task.deadlines[request_id] = max(
-                                task.deadlines.get(request_id, 0), owner_deadline
+                            task.deadlines[request_id] = min(
+                                task.deadlines.get(request_id, owner_deadline),
+                                owner_deadline,
                             )
                         self._async_request_tasks.setdefault(request_id, set()).add(
                             entry
@@ -1846,7 +1913,14 @@ class MMProcessEngine:
             diag.event(request_id, "vit.compute_worker_start", entry=id(entry))
             if source is not None:
                 deadline = source[3]()
-        if time.monotonic() >= deadline:
+
+        def owner_deadline():
+            with self._async_task_lock:
+                # task is retained even after cancellation removes the table
+                # entry; its empty owner set must invalidate queued GPU work.
+                return max(task.deadlines.values(), default=0) if task else deadline
+
+        if time.monotonic() >= owner_deadline():
             error = FtRuntimeException(
                 ExceptionType.GENERATE_TIMEOUT,
                 "ViT queue wait timed out before execution",
@@ -1858,7 +1932,7 @@ class MMProcessEngine:
             )
             self._fail_async_compute(cache_key, entry, error)
             return
-        with use_prepared_image(source):
+        with use_prepared_image(source), use_vit_deadline(owner_deadline):
             self._async_compute(mm_inputs, cache_key, entry, request_id)
 
     def _dispatch_image_batch(self, pending, request_id, queue_timeout_ms):
@@ -1908,8 +1982,10 @@ class MMProcessEngine:
                     request_id=request_id,
                     started=start,
                     on_done=partial(
-                        self._image_download_done, (item, key, entry),
-                        start=start, owner_deadline=owner_deadline,
+                        self._image_download_done,
+                        (item, key, entry),
+                        start=start,
+                        owner_deadline=owner_deadline,
                     ),
                 )
                 task.download = fut
@@ -1927,7 +2003,9 @@ class MMProcessEngine:
         if admission_error is not None:
             raise admission_error
         if ready:
-            self._submit_async_compute_batch(ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms)
+            self._submit_async_compute_batch(
+                ready, request_id=request_id, queue_timeout_ms=queue_timeout_ms
+            )
 
     def _image_download_done(self, pending, future, start, owner_deadline):
         timing = future.download_timing
@@ -1967,7 +2045,9 @@ class MMProcessEngine:
                 )
                 url_data_cache_.insert_cache(item.url, BytesIO(body))
                 self._submit_async_compute_batch(
-                    [pending], request_id=next(iter(task.request_ids)), queue_timeout_ms=left_ms
+                    [pending],
+                    request_id=next(iter(task.request_ids)),
+                    queue_timeout_ms=left_ms,
                 )
                 return
             except FtRuntimeException as e:

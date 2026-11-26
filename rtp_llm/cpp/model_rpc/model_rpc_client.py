@@ -575,6 +575,10 @@ def trans_input(input_py: GenerateInput):
     _rapm = input_py.generate_config.return_all_probs
     generate_config_pb.return_all_probs = _rapm != ReturnAllProbsMode.NONE
     generate_config_pb.return_all_probs_mode = _rapm + 1
+    if input_py.generate_config.logprobs_top_k >= 0:
+        generate_config_pb.logprobs_top_k.value = (
+            input_py.generate_config.logprobs_top_k
+        )
     generate_config_pb.return_softmax_probs = (
         input_py.generate_config.return_softmax_probs
     )
@@ -923,6 +927,16 @@ def trans_output(
 
         if all_all_probs is not None:
             output_py.all_probs = all_all_probs[i]
+
+        if i < len(output_pb.aux_info):
+            aux_pb = output_pb.aux_info[i]
+            if aux_pb.HasField("logprob_token_ids") and aux_pb.HasField(
+                "logprob_values"
+            ):
+                output_py.compact_logprobs = {
+                    "token_ids": trans_tensor(aux_pb.logprob_token_ids),
+                    "logprobs": trans_tensor(aux_pb.logprob_values),
+                }
 
         if prompt_logits_data is not None:
             output_py.prompt_logits = prompt_logits_data

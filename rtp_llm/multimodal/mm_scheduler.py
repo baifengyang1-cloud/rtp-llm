@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import queue
 import threading
 import time
@@ -14,7 +15,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 import torch.profiler
 
-from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.config.py_config_modules import VitConfig
 from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
@@ -22,6 +22,12 @@ from rtp_llm.multimodal.multimodal_mixins.multimodal_common import (
     MMWorkEstimate,
     MultiModalEmbeddingInterface,
 )
+from rtp_llm.multimodal.vit_embedding_timing import (
+    embedding_batch_context,
+    embedding_stage_timing,
+)
+from rtp_llm.multimodal.vit_metrics import image_log_id
+from rtp_llm.utils import vit_diagnostics as diag
 from rtp_llm.utils.time_util import Timer, current_time_ms
 
 if TYPE_CHECKING:
@@ -84,6 +90,28 @@ def _run_embedding(
     mm_part: MultiModalEmbeddingInterface,
     items: List[MMWorkItem],
 ) -> None:
+    # A new identifier for every forward attempt (including OOM retries).
+    batch_id = f"{os.getpid()}:{time.monotonic_ns()}"
+    with embedding_batch_context(
+        batch_id,
+        request_ids=list(
+            dict.fromkeys(getattr(wi, "trace_request_id", 0) for wi in items)
+        ),
+        image_ids=[
+            image_log_id(mm_input.url)
+            for wi in items
+            for mm_input in wi.mm_inputs
+            if getattr(mm_input, "url", "")
+        ],
+    ):
+        _run_embedding_impl(mm_part, items, batch_id)
+
+
+def _run_embedding_impl(
+    mm_part: MultiModalEmbeddingInterface,
+    items: List[MMWorkItem],
+    batch_id: str,
+) -> None:
     """Run one GPU forward over `items` and write results back.
 
     Performs the batched forward, guards the output count, writes
@@ -97,7 +125,6 @@ def _run_embedding(
     if diag.SAMPLE_EVERY:
         traced = {getattr(item, "trace_request_id", 0) for item in items}
         traced = {rid for rid in traced if diag.selected(rid)}
-    batch_id = time.monotonic_ns() if traced else None
     for rid in traced:
         diag.event(
             rid, "vit.gpu_forward", phase="begin", batch_id=batch_id, items=len(items)
@@ -105,7 +132,8 @@ def _run_embedding(
     with Timer() as route_timer:
         with torch.profiler.record_function("batched_embedding"):
             try:
-                batch_outputs = mm_part.batched_embedding(data_list, type_list)
+                with embedding_stage_timing("embedding_forward", items=len(items)):
+                    batch_outputs = mm_part.batched_embedding(data_list, type_list)
             except BaseException as error:
                 for rid in traced:
                     diag.event(
@@ -138,6 +166,13 @@ def _run_embedding(
 
     for wi, result in zip(items, batch_outputs):
         wi.embedding_result = result
+        deadline = getattr(wi, "deadline", None)
+        if deadline is not None and deadline() <= time.monotonic():
+            logging.info(
+                "vit_scheduler_skip reason=deadline_expired_after_forward request_id=%s",
+                getattr(wi, "trace_request_id", 0),
+            )
+            continue
         complete_cache = getattr(wi, "complete_cache", None)
         if complete_cache is not None:
             complete_cache(result)
@@ -161,6 +196,7 @@ class _EmbeddingRequest:
         "done",
         "cancelled",
         "future",
+        "deadline",
     )
 
     def __init__(self, work_items: List[MMWorkItem]):
@@ -172,6 +208,9 @@ class _EmbeddingRequest:
         self.done = threading.Event()
         self.cancelled = False
         self.future = Future()
+        # Work items retain their original deadline through preprocessing.
+        # A live getter lets shared cache work follow the last active owner.
+        self.deadline = None
 
 
 class _EmbeddingChunk:
@@ -232,6 +271,8 @@ class MMScheduler:
         max_queue_size: int = 1024,
         device: Optional[str] = None,
         forward_profiler: Optional[Callable] = None,
+        startup_callback: Optional[Callable] = None,
+        startup_timeout_s: float = 600.0,
     ):
         if batch_wait_ms < 0:
             raise ValueError(f"batch_wait_ms must be >= 0, got {batch_wait_ms}")
@@ -245,6 +286,7 @@ class MMScheduler:
         self._max_queue_size = max_queue_size
         self._device = device
         self._forward_profiler = forward_profiler
+        self._startup_callback = startup_callback
         self._admitted_requests = set()
         self._mm_part = mm_part
         self._batch_wait_ms = batch_wait_ms
@@ -280,10 +322,12 @@ class MMScheduler:
             target=self._executor_loop, daemon=True, name="mm-scheduler"
         )
         self._executor.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout=startup_timeout_s):
+            self._stopped.set()
+            raise TimeoutError("MMScheduler startup preload/warmup timed out")
         if self._init_error is not None:
             raise RuntimeError(
-                f"MMScheduler failed to bind device {self._device!r}"
+                f"MMScheduler failed to initialize device {self._device!r}"
             ) from self._init_error
 
     @property
@@ -559,6 +603,12 @@ class MMScheduler:
             if wi.mm_timeout_ms is not None and wi.mm_timeout_ms > 0
         ]
         timeout_s = max(positive_timeouts, default=_DEFAULT_MM_TIMEOUT_MS) / 1000.0
+        fallback_deadline = time.monotonic() + timeout_s
+        getters = [getattr(wi, "deadline", None) for wi in work_items]
+        req.deadline = lambda: max(
+            (getter() if getter is not None else fallback_deadline)
+            for getter in getters
+        )
 
         submit_ms = current_time_ms()
 
@@ -567,6 +617,10 @@ class MMScheduler:
         with self._lock:
             if self._stopped.is_set():
                 raise RuntimeError("MMScheduler is closed, request rejected")
+            if self._expire_request(req):
+                raise MMSchedulerTimeoutError(
+                    "ViT deadline expired before GPU admission"
+                )
             if len(self._admitted_requests) >= self._max_queue_size + 1:
                 kmonitor.report(AccMetrics.VIT_EMBEDDING_OVERLOAD_QPS_METRIC, 1)
                 raise MMSchedulerOverloadError(
@@ -576,7 +630,18 @@ class MMScheduler:
             self._enqueue_chunk(req.chunks[0])
 
         try:
-            req.future.result(timeout=timeout_s)
+            while True:
+                remaining = req.deadline() - time.monotonic()
+                if remaining <= 0:
+                    raise FutureTimeoutError()
+                try:
+                    req.future.result(timeout=min(remaining, 0.05))
+                    break
+                except FutureTimeoutError:
+                    # Deadlines may change when owners join or cancel shared
+                    # work. Poll the getter rather than fixing a new timeout.
+                    if req.future.done():
+                        raise
         except MMSchedulerExecutionError:
             req.work_items = []
             for chunk in req.chunks:
@@ -590,7 +655,7 @@ class MMScheduler:
                 req.future.cancel()
                 self._admitted_requests.discard(req)
             raise MMSchedulerTimeoutError(
-                f"MMScheduler: embedding wait timeout after {timeout_s * 1000:.0f}ms"
+                "MMScheduler: embedding wait timeout at original ViT request deadline"
             ) from None
 
         # Success only: keep the latency gauge clean (failures are tracked by the
@@ -633,7 +698,7 @@ class MMScheduler:
     def _complete_chunk(self, chunk):
         request = chunk.request
         with self._lock:
-            if request.cancelled or request.future.done():
+            if self._expire_request(request) or request.future.done():
                 return
             request.remaining_chunks -= 1
             if request.remaining_chunks == 0:
@@ -661,6 +726,8 @@ class MMScheduler:
                 device = torch.device(self._device)
                 if device.type == "cuda" and device.index is not None:
                     torch.cuda.set_device(device.index)
+            if self._startup_callback is not None:
+                self._startup_callback()
         except Exception as error:
             self._init_error = error
             self._stopped.set()
@@ -706,12 +773,36 @@ class MMScheduler:
             return [
                 chunk
                 for chunk in batch
-                if not chunk.request.cancelled
+                if not self._expire_request(chunk.request)
+                and not chunk.request.future.done()
                 and (
                     chunk.request.future.running()
                     or chunk.request.future.set_running_or_notify_cancel()
                 )
             ]
+
+    def _expire_request(self, request):
+        """Caller holds _lock. Never start more GPU work for an expired owner."""
+        if request.cancelled:
+            return True
+        if request.deadline is None or time.monotonic() < request.deadline():
+            return False
+        request.cancelled = True
+        self._admitted_requests.discard(request)
+        if not request.future.done():
+            request.future.set_exception(
+                MMSchedulerTimeoutError("ViT deadline expired while queued")
+            )
+        request.done.set()
+        logging.info(
+            "vit_scheduler_skip reason=deadline_expired request_ids=%s",
+            [getattr(wi, "trace_request_id", 0) for wi in request.work_items],
+        )
+        return True
+
+    def _is_expired(self, request):
+        with self._lock:
+            return self._expire_request(request)
 
     def _fail_all_queued(self):
         queued = [self._pending] if self._pending else []
@@ -761,7 +852,7 @@ class MMScheduler:
                 except queue.Empty:
                     continue
                 self._report_queue_depth()
-            if not first.request.cancelled:
+            if not self._is_expired(first.request):
                 break
         batch = [first]
         n_images = first.n_images
@@ -772,7 +863,9 @@ class MMScheduler:
         while len(batch) < self._max_batch_size and n_images < self._max_batch_images:
             if self._stopped.is_set():
                 break
-            remaining = deadline - time.monotonic()
+            remaining = (
+                min(deadline, *(c.request.deadline() for c in batch)) - time.monotonic()
+            )
             if remaining <= 0:
                 break
             try:
@@ -780,7 +873,7 @@ class MMScheduler:
             except queue.Empty:
                 continue
             self._report_queue_depth()
-            if chunk.request.cancelled:
+            if self._is_expired(chunk.request):
                 continue  # caller already timed out; don't spend budget on it
 
             image_overflow = n_images + chunk.n_images > self._max_batch_images
@@ -800,8 +893,10 @@ class MMScheduler:
 
         return batch
 
-    def _run_items_with_oom_split(self, items: List[MMWorkItem]) -> None:
+    def _run_items_with_oom_split(self, items: List[MMWorkItem], request=None) -> None:
         """Run one chunk, recursively halving its items after a CUDA OOM."""
+        if request is not None and self._is_expired(request):
+            return
         try:
             profiler = (
                 self._forward_profiler() if self._forward_profiler else nullcontext()
@@ -822,14 +917,14 @@ class MMScheduler:
                 midpoint,
                 len(items) - midpoint,
             )
-            self._run_items_with_oom_split(items[:midpoint])
-            self._run_items_with_oom_split(items[midpoint:])
+            self._run_items_with_oom_split(items[:midpoint], request)
+            self._run_items_with_oom_split(items[midpoint:], request)
 
     def _execute_batch(self, batch: List[_EmbeddingChunk]) -> None:
         """Run a batch, isolating CUDA OOMs by binary split and retry."""
         # Callers may time out during the failed forward. Recheck on every
         # recursive retry, not only when the scheduler initially claims work.
-        batch = [chunk for chunk in batch if not chunk.request.cancelled]
+        batch = [chunk for chunk in batch if not self._is_expired(chunk.request)]
         if not batch:
             return
 
@@ -877,8 +972,12 @@ class MMScheduler:
             if len(chunk.work_items) > 1:
                 midpoint = len(chunk.work_items) // 2
                 try:
-                    self._run_items_with_oom_split(chunk.work_items[:midpoint])
-                    self._run_items_with_oom_split(chunk.work_items[midpoint:])
+                    self._run_items_with_oom_split(
+                        chunk.work_items[:midpoint], chunk.request
+                    )
+                    self._run_items_with_oom_split(
+                        chunk.work_items[midpoint:], chunk.request
+                    )
                 except Exception as retry_error:
                     logging.error(
                         "MMScheduler: single request OOM retry failed: " "%s: %s",

@@ -18,6 +18,7 @@ from rtp_llm.multimodal.mm_scheduler import (
     MMScheduler,
     MMSchedulerExecutionError,
     MMSchedulerOverloadError,
+    MMSchedulerTimeoutError,
     OutputCountMismatchError,
 )
 from rtp_llm.utils.base_model_datatypes import MMUrlType
@@ -121,6 +122,146 @@ class _FakeWorkItem:
         self.embedding_result: Optional[Any] = None
         self.need_check_cache = False
         self.cache_key = None
+
+
+class SchedulerStartupDeadlineTest(TestCase):
+    def test_startup_runs_on_executor_before_constructor_returns(self):
+        observations = []
+
+        def startup():
+            observations.append(threading.current_thread().name)
+
+        sched = MMScheduler(_FakeMMPart(), startup_callback=startup)
+        try:
+            self.assertEqual(observations, ["mm-scheduler"])
+        finally:
+            sched.close()
+
+    def test_startup_failure_prevents_ready(self):
+        def startup():
+            raise ValueError("warmup failed")
+
+        with self.assertRaisesRegex(RuntimeError, "initialize") as caught:
+            MMScheduler(_FakeMMPart(), startup_callback=startup)
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
+
+    def test_startup_timeout_does_not_start_serving_loop(self):
+        release = threading.Event()
+        fake = _FakeMMPart()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "startup"):
+                MMScheduler(
+                    fake,
+                    startup_callback=lambda: release.wait(1),
+                    startup_timeout_s=0.02,
+                )
+        finally:
+            release.set()
+        self.assertEqual(fake.calls, [])
+
+    def test_expired_before_admission_never_runs(self):
+        fake = _FakeMMPart()
+        sched = MMScheduler(fake, batch_wait_ms=0)
+        item = _FakeWorkItem()
+        item.deadline = lambda: time.monotonic() - 1
+        try:
+            with self.assertRaises(MMSchedulerTimeoutError):
+                sched.submit_and_wait([item])
+            self.assertEqual(fake.calls, [])
+            self.assertEqual(len(sched._admitted_requests), 0)
+        finally:
+            sched.close()
+
+    def test_preprocessing_does_not_reset_queue_budget(self):
+        release = threading.Event()
+        fake = _FakeMMPart(block_until=release)
+        sched = MMScheduler(fake, batch_wait_ms=0, max_batch_size=1)
+        first = threading.Thread(
+            target=lambda: sched.submit_and_wait([_FakeWorkItem()])
+        )
+        first.start()
+        self.assertTrue(fake.forward_entered.wait(1))
+        second = _FakeWorkItem(timeout_ms=5000)
+        deadline = time.monotonic() + 0.06
+        second.deadline = lambda: deadline
+        try:
+            started = time.monotonic()
+            with self.assertRaises(MMSchedulerTimeoutError):
+                sched.submit_and_wait([second])
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            release.set()
+            first.join(2)
+            sched.close()
+        self.assertEqual(fake.calls, [1])
+
+    def test_shared_owner_extension_is_seen_while_queued(self):
+        release = threading.Event()
+        fake = _FakeMMPart(block_until=release)
+        sched = MMScheduler(fake, batch_wait_ms=0, max_batch_size=1)
+        first = threading.Thread(
+            target=lambda: sched.submit_and_wait([_FakeWorkItem()])
+        )
+        first.start()
+        self.assertTrue(fake.forward_entered.wait(1))
+        end = [time.monotonic() + 0.07]
+        item = _FakeWorkItem()
+        item.deadline = lambda: end[0]
+        errors = []
+
+        def submit():
+            try:
+                sched.submit_and_wait([item])
+            except Exception as error:
+                errors.append(error)
+
+        second = threading.Thread(target=submit)
+        second.start()
+        try:
+            end[0] = time.monotonic() + 2
+            time.sleep(0.1)
+            self.assertTrue(second.is_alive())
+        finally:
+            release.set()
+            first.join(2)
+            second.join(2)
+            sched.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(fake.calls, [1, 1])
+
+    def test_cancelling_last_owner_skips_queued_forward(self):
+        release = threading.Event()
+        fake = _FakeMMPart(block_until=release)
+        sched = MMScheduler(fake, batch_wait_ms=0, max_batch_size=1)
+        first = threading.Thread(
+            target=lambda: sched.submit_and_wait([_FakeWorkItem()])
+        )
+        first.start()
+        self.assertTrue(fake.forward_entered.wait(1))
+        end = [time.monotonic() + 5]
+        item = _FakeWorkItem()
+        item.deadline = lambda: end[0]
+        errors = []
+
+        def submit():
+            try:
+                sched.submit_and_wait([item])
+            except Exception as error:
+                errors.append(error)
+
+        second = threading.Thread(target=submit)
+        second.start()
+        try:
+            end[0] = 0
+            second.join(1)
+            self.assertFalse(second.is_alive())
+            self.assertIsInstance(errors[0], MMSchedulerTimeoutError)
+        finally:
+            release.set()
+            first.join(2)
+            second.join(2)
+            sched.close()
+        self.assertEqual(fake.calls, [1])
 
 
 class _BlockingClaimFuture(Future):
@@ -401,10 +542,7 @@ class MMSchedulerTest(TestCase):
             all(isinstance(e, MMSchedulerExecutionError) for e in errors), errors
         )
         self.assertTrue(
-            all(
-                e.source_type == torch.cuda.OutOfMemoryError.__name__
-                for e in errors
-            ),
+            all(e.source_type == torch.cuda.OutOfMemoryError.__name__ for e in errors),
             errors,
         )
         self.assertTrue(all(e.is_oom for e in errors), errors)
@@ -428,11 +566,14 @@ class MMSchedulerTest(TestCase):
             cleanup_order.append("empty_cache")
 
         try:
-            with mock.patch(
-                "rtp_llm.multimodal.mm_scheduler.gc.collect", side_effect=collect
-            ), mock.patch(
-                "rtp_llm.multimodal.mm_scheduler.torch.cuda.empty_cache",
-                side_effect=empty_cache,
+            with (
+                mock.patch(
+                    "rtp_llm.multimodal.mm_scheduler.gc.collect", side_effect=collect
+                ),
+                mock.patch(
+                    "rtp_llm.multimodal.mm_scheduler.torch.cuda.empty_cache",
+                    side_effect=empty_cache,
+                ),
             ):
                 barrier = threading.Barrier(3)
                 errors = _submit_concurrently(
@@ -764,10 +905,11 @@ class MMSchedulerTest(TestCase):
         """A set_device failure in the executor thread must fail construction
         fast (fail-fast handshake), not leave requests to time out."""
         fake = _FakeMMPart()
-        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
-            "torch.cuda.set_device", side_effect=RuntimeError("bad device")
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.set_device", side_effect=RuntimeError("bad device")),
         ):
-            with self.assertRaisesRegex(RuntimeError, "failed to bind device"):
+            with self.assertRaisesRegex(RuntimeError, "failed to initialize device"):
                 MMScheduler(fake, device="cuda:7")
 
     def test_device_cuda_no_index_skips_bind(self):
@@ -775,9 +917,10 @@ class MMSchedulerTest(TestCase):
         passes) must NOT call set_device — binding a bare cuda device raises — so
         startup succeeds and uses the current device."""
         fake = _FakeMMPart()
-        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
-            "torch.cuda.set_device"
-        ) as set_device:
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.set_device") as set_device,
+        ):
             sched = MMScheduler(fake, device="cuda")
             sched.close()
         set_device.assert_not_called()
@@ -785,9 +928,10 @@ class MMSchedulerTest(TestCase):
     def test_device_cuda_index_binds(self):
         """device='cuda:N' pins that exact index (non-zero local rank coverage)."""
         fake = _FakeMMPart()
-        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
-            "torch.cuda.set_device"
-        ) as set_device:
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.set_device") as set_device,
+        ):
             sched = MMScheduler(fake, device="cuda:3")
             sched.close()
         set_device.assert_called_once_with(3)

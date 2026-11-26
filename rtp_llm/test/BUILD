@@ -1,4 +1,14 @@
 py_test(
+    name = "compact_logprobs_test",
+    srcs = ["compact_logprobs_test.py"],
+    data = ["//rtp_llm:sdk"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
+    ],
+)
+
+py_test(
     name = "kv_cache_specs_test",
     srcs = [
         "kv_cache_specs_test.py",

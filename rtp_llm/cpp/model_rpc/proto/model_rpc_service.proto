@@ -153,6 +153,8 @@ message GenerateConfigPB {
     ThinkingModePB thinking_mode = 73;
     // 请求级 L3 写入开关；RPC 缺失时为 false。
     bool enable_disk_cache = 74;
+    // Missing means legacy dense output. Zero requests only the selected token.
+    google.protobuf.Int32Value logprobs_top_k = 75;
 }
 
 message MMPreprocessConfigPB {
@@ -304,6 +306,9 @@ message AuxInfoPB {
     int32 disk_reuse_len = 31;
     int32 prefill_disk_reuse_len = 32;
     int32 decode_disk_reuse_len = 33;
+    // [1, k+1]: selected token first, followed by sorted top-k candidates.
+    TensorPB logprob_token_ids = 34;
+    TensorPB logprob_values = 35;
 }
 
 message PromptLogitsOutputPB {

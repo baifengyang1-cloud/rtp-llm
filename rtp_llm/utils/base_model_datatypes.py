@@ -155,6 +155,7 @@ class GenerateOutput:
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     all_probs: Optional[torch.Tensor] = None
+    compact_logprobs: Optional[Dict[str, torch.Tensor]] = None
     prompt_logits: Optional[Dict[str, Any]] = None
 
     class Config:

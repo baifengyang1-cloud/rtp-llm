@@ -5,10 +5,31 @@
 #include <gtest/gtest.h>
 
 #include "rtp_llm/cpp/normal_engine/NormalOutputDispatcher.h"
+#include "rtp_llm/cpp/normal_engine/CompactLogprobs.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 
 namespace rtp_llm {
 namespace {
+
+TEST(NormalOutputDispatcherTest, CompactLogprobsRetainSelectedTokensOutsideTopK) {
+    auto probs    = torch::tensor({{0.1f, 0.6f, 0.3f, 0.0f}, {0.0f, 0.2f, 0.3f, 0.5f}});
+    auto selected = torch::tensor({{0}, {1}}, torch::kInt32);
+    auto result   = gatherCompactLogprobs(probs, selected, 2);
+    EXPECT_TRUE(torch::equal(result.first, torch::tensor({{0, 1, 2}, {1, 3, 2}}, torch::kInt32)));
+    EXPECT_TRUE(torch::allclose(result.second.exp(), torch::tensor({{0.1f, 0.6f, 0.3f}, {0.2f, 0.5f, 0.3f}})));
+}
+
+TEST(NormalOutputDispatcherTest, CompactLogprobsHandleZeroMassAndSelectedOnly) {
+    auto probs    = torch::tensor({{0.0f, 1.0f, 0.0f}});
+    auto selected = torch::tensor({{1}}, torch::kInt32);
+    auto result   = gatherCompactLogprobs(probs, selected, 8);
+    EXPECT_EQ(result.first.size(1), 4);
+    EXPECT_FLOAT_EQ(result.second[0][0].item<float>(), 0.0f);
+    EXPECT_EQ(torch::isneginf(result.second).sum().item<int>(), 2);
+    auto selected_only = gatherCompactLogprobs(probs, selected, 0);
+    EXPECT_EQ(selected_only.first.size(1), 1);
+    EXPECT_FLOAT_EQ(selected_only.second[0][0].item<float>(), 0.0f);
+}
 
 TEST(NormalOutputDispatcherTest, ProcessorErrorsUseSamplerInputCoordinatesAfterBeamExpansion) {
     SamplerOutput sampler_output;
