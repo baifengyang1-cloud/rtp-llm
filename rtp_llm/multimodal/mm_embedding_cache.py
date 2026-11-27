@@ -169,8 +169,9 @@ class MMEmbeddingCacheEntry:
         self.original_devices: Any = None
         self.offloaded = False
         self.ready_events: List[Any] = []
-        self._greennet_event = threading.Event()
-        self._greennet_verdict: Optional[GreenNetVerdict] = None
+        self._greennet_event: Optional[threading.Event] = None
+        self._greennet_decided = False
+        self._greennet_verdict: GreenNetVerdict
 
     @property
     def error(self) -> Optional[Exception]:
@@ -233,6 +234,7 @@ class MMEmbeddingCacheEntry:
             self.error = error
             raise
         finally:
+            self._on_complete = self._on_fail = None
             self._event.set()
         return True
 
@@ -246,6 +248,7 @@ class MMEmbeddingCacheEntry:
             if self._on_fail is not None:
                 self._on_fail(self, error)
         finally:
+            self._on_complete = self._on_fail = None
             self._event.set()
         return True
 
@@ -260,17 +263,28 @@ class MMEmbeddingCacheEntry:
         return None
 
     def set_greennet_verdict(self, verdict: GreenNetVerdict) -> None:
-        self._greennet_verdict = verdict
-        self._greennet_event.set()
+        with self._state_lock:
+            self._greennet_verdict = verdict
+            self._greennet_decided = True
+            if self._greennet_event is not None:
+                self._greennet_event.set()
+                self._greennet_event = None
 
     def wait_greennet(self, timeout: Optional[float] = None) -> GreenNetVerdict:
-        if not self._greennet_event.wait(timeout=timeout):
+        with self._state_lock:
+            if self._greennet_decided:
+                return self._greennet_verdict
+            if self._greennet_event is None:
+                self._greennet_event = threading.Event()
+            event = self._greennet_event
+        if not event.wait(timeout=timeout):
             raise TimeoutError("Waiting for greennet verdict timed out")
         return self._greennet_verdict
 
     @property
     def is_greennet_decided(self) -> bool:
-        return self._greennet_event.is_set()
+        with self._state_lock:
+            return self._greennet_decided
 
 
 class MMHashKeyCache:

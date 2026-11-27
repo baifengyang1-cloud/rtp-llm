@@ -3,10 +3,11 @@ import gc
 import threading
 import unittest
 import weakref
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.multimodal.greennet_hook import GreenNetVerdict
 from rtp_llm.multimodal.mm_embedding_cache import (
     MMEmbeddingCache,
     MMEmbeddingCacheEntry,
@@ -16,6 +17,67 @@ from rtp_llm.multimodal.mm_embedding_cache import (
     _tensor_tier_bytes,
 )
 from rtp_llm.multimodal.mm_scheduler import MMSchedulerExecutionError
+
+
+class EmbeddingEntryLifetimeTest(unittest.TestCase):
+    def test_terminal_callbacks_released_even_if_publication_raises(self):
+        for complete in (True, False):
+            for raises in (True, False):
+                with self.subTest(complete=complete, raises=raises):
+                    on_complete, on_fail, on_read = Mock(), Mock(), Mock()
+                    entry = MMEmbeddingCacheEntry(on_complete, on_fail, on_read)
+                    callback = on_complete if complete else on_fail
+                    transition = entry.complete if complete else entry.fail
+                    value = "result" if complete else ValueError("bad image")
+                    if raises:
+                        callback.side_effect = RuntimeError("callback failed")
+                        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+                            transition(value)
+                    else:
+                        self.assertTrue(transition(value))
+                    self.assertFalse(transition(value))
+                    callback.assert_called_once_with(entry, value)
+                    self.assertIsNone(entry._on_complete)
+                    self.assertIsNone(entry._on_fail)
+                    if complete and not raises:
+                        self.assertIs(entry.wait(0), on_read.return_value)
+                    else:
+                        expected_error = RuntimeError if complete else ValueError
+                        with self.assertRaises(expected_error):
+                            entry.wait_ready(0)
+
+    def test_early_verdict_never_allocates_an_event(self):
+        entry = MMEmbeddingCacheEntry()
+        verdict = GreenNetVerdict(passed=False)
+        with patch.object(threading, "Event", side_effect=AssertionError):
+            self.assertIsNone(entry._greennet_event)
+            self.assertFalse(entry.is_greennet_decided)
+            entry.set_greennet_verdict(verdict)
+            self.assertTrue(entry.is_greennet_decided)
+            self.assertIs(entry.wait_greennet(0), verdict)
+
+    def test_pending_waiters_share_event_and_release_it_after_verdict(self):
+        entry = MMEmbeddingCacheEntry()
+        with self.assertRaises(TimeoutError):
+            entry.wait_greennet(0)
+        event = entry._greennet_event
+        wait = event.wait
+        registered = threading.Barrier(3, timeout=5)
+
+        def wait_together(timeout):
+            registered.wait()
+            return wait(timeout)
+
+        verdict = GreenNetVerdict(passed=True)
+        with patch.object(event, "wait", side_effect=wait_together):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(entry.wait_greennet, 5) for _ in range(2)]
+                registered.wait()
+                entry.set_greennet_verdict(verdict)
+                for future in futures:
+                    self.assertIs(future.result(timeout=5), verdict)
+        self.assertIsNone(entry._greennet_event)
+        self.assertIs(entry.wait_greennet(0), verdict)
 
 
 class EmbeddingFailureLifetimeTest(unittest.TestCase):
