@@ -171,7 +171,9 @@ class _EmbeddingRequest:
         self.exception: Optional[Exception] = None
         self.done = threading.Event()
         self.cancelled = False
-        self.future = Future()
+        # None signals success. A failure carries only the fields needed to
+        # construct the caller's exception, so the Future cannot own its traceback.
+        self.future: Future[Optional[tuple[str, str, bool]]] = Future()
 
 
 class _EmbeddingChunk:
@@ -576,14 +578,7 @@ class MMScheduler:
             self._enqueue_chunk(req.chunks[0])
 
         try:
-            req.future.result(timeout=timeout_s)
-        except MMSchedulerExecutionError:
-            req.work_items = []
-            for chunk in req.chunks:
-                chunk.work_items = []
-            req.chunks = []
-            work_items = []
-            raise
+            failure = req.future.result(timeout=timeout_s)
         except FutureTimeoutError:
             with self._lock:
                 req.cancelled = True
@@ -592,6 +587,14 @@ class MMScheduler:
             raise MMSchedulerTimeoutError(
                 f"MMScheduler: embedding wait timeout after {timeout_s * 1000:.0f}ms"
             ) from None
+
+        if failure is not None:
+            req.work_items = []
+            for chunk in req.chunks:
+                chunk.work_items = []
+            req.chunks = []
+            work_items = []
+            raise MMSchedulerExecutionError(*failure)
 
         # Success only: keep the latency gauge clean (failures are tracked by the
         # engine's VIT_ERROR_QPS_METRIC). Mirrors VIT_EMBEDDING_RT_METRIC, which is
@@ -619,7 +622,7 @@ class MMScheduler:
             if request.future.done():
                 continue
             request.cancelled = True
-            failure = MMSchedulerExecutionError(
+            failure = (
                 type(error).__name__,
                 str(error),
                 isinstance(error, torch.cuda.OutOfMemoryError),
@@ -627,7 +630,7 @@ class MMScheduler:
             with self._lock:
                 self._admitted_requests.discard(request)
                 if not request.future.done():
-                    request.future.set_exception(failure)
+                    request.future.set_result(failure)
             request.done.set()
 
     def _complete_chunk(self, chunk):
@@ -644,10 +647,8 @@ class MMScheduler:
             if self._stopped.is_set():
                 self._admitted_requests.discard(request)
                 request.cancelled = True
-                request.future.set_exception(
-                    MMSchedulerExecutionError(
-                        "RuntimeError", "MMScheduler closed before request completed"
-                    )
+                request.future.set_result(
+                    ("RuntimeError", "MMScheduler closed before request completed", False)
                 )
                 request.done.set()
                 return

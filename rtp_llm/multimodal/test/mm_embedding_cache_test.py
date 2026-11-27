@@ -359,7 +359,40 @@ class EmbeddingHashPublicationTest(unittest.TestCase):
                 self.complete(entry)
         with self.assertRaisesRegex(RuntimeError, "publish"):
             entry.wait_ready(1)
+        self.assertIsNone(self.cache.peek("image"))
+        self.assertEqual(self.cache.stats()["resident_bytes"], 0)
+        self.assertEqual(self.cache.stats()["resident_entries"], 0)
         self.assertEqual(self.cache.try_acquire("image")[0], "miss")
+
+    def test_failed_admission_releases_result_while_waiter_holds_entry(self):
+        _, entry = self.cache.try_acquire("image")
+        _, waiter = self.cache.try_acquire("image")
+        result = torch.ones(4)
+        ref = weakref.ref(result)
+
+        def fail_recording(_):
+            raise RuntimeError("event recording failed")
+
+        with patch.object(self.cache, "_record_ready_events", fail_recording):
+            with self.assertRaisesRegex(RuntimeError, "event recording failed"):
+                entry.complete(result)
+        del result
+        self.assertIsNone(self.cache.peek("image"))
+        self.assertIsNone(ref())
+        with self.assertRaisesRegex(RuntimeError, "event recording failed"):
+            waiter.wait(0)
+
+    def test_failed_old_producer_preserves_replacement(self):
+        _, old = self.cache.try_acquire("image")
+        self.cache.remove("image")
+        _, current = self.cache.try_acquire("image")
+        self.assertTrue(self.complete(current))
+        with patch.object(self.cache, "_record_ready_events", side_effect=ValueError):
+            with self.assertRaises(ValueError):
+                self.complete(old)
+        self.assertIs(self.cache.peek("image"), current)
+        self.assertIs(current.wait(0), self.value)
+        self.assertIsNotNone(self.hashes.get("image", current.generation))
 
     def test_disabled_or_oversized_sidecar_still_completes(self):
         for budget in (0, 1):

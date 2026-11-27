@@ -187,6 +187,34 @@ def _submit_concurrently(
 
 
 class MMSchedulerTest(TestCase):
+    def test_failed_forward_releases_future_without_gc(self):
+        futures = []
+
+        def new_future():
+            future = Future()
+            futures.append(weakref.ref(future))
+            return future
+
+        sched = MMScheduler(_FakeMMPart(), batch_wait_ms=0, max_batch_size=1)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with mock.patch("rtp_llm.multimodal.mm_scheduler.Future", new_future):
+                try:
+                    item = _FakeWorkItem(preprocess_result=torch.tensor([-1]))
+                    sched.submit_and_wait([item])
+                except MMSchedulerExecutionError as error:
+                    self.assertEqual(error.source_message, "poison item in batch")
+                else:
+                    self.fail("expected a failed forward")
+            self.assertTrue(sched.close())
+            self.assertEqual(len(futures), 1)
+            self.assertIsNone(futures[0]())
+        finally:
+            sched.close()
+            if gc_was_enabled:
+                gc.enable()
+
     def test_completed_work_item_released_without_gc_while_idle(self):
         sched = MMScheduler(_FakeMMPart(), batch_wait_ms=0, max_batch_size=1)
         gc_was_enabled = gc.isenabled()

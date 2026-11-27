@@ -230,8 +230,17 @@ class MMEmbeddingCacheEntry:
             if before_ready is not None:
                 before_ready()
         except Exception as error:
-            # A waiter must not consume a partially published completion.
+            # fail() cannot transition an already terminal entry. Roll back
+            # under the cache transfer lock before exposing the error to retries.
+            try:
+                if self._on_fail is not None:
+                    self._on_fail(self, error)
+            except Exception:
+                logging.exception("Failed to roll back embedding cache entry")
             self.error = error
+            self.result = None
+            self.original_devices = None
+            self.ready_events = []
             raise
         finally:
             self._on_complete = self._on_fail = None
